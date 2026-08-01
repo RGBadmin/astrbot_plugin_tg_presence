@@ -74,7 +74,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.11.1",
+    "0.11.2",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -935,7 +935,7 @@ class TgPresence(Star):
 
     @filter.llm_tool(name="find_photo")
     async def find_photo(
-        self, event: AstrMessageEvent, keywords: str = "", day: str = ""
+        self, event: AstrMessageEvent, keywords: str = "", day: str = "", **_extra
     ):
         """在存档的旧图片里找。对话里能直接看到的那些 [图片 #N] 占位不用查这个——只有当对方提起一张你在当前上下文里找不到的旧图时才用。会同时搜你自己写的那句描述和系统存的画面细节记录。返回候选列表，如果不止一张，问对方是哪张，别自己瞎猜。
 
@@ -988,7 +988,7 @@ class TgPresence(Star):
         return head + "\n" + "\n".join(lines) + tail
 
     @filter.llm_tool(name="inspect_photo")
-    async def inspect_photo(self, event: AstrMessageEvent, photo_id: str):
+    async def inspect_photo(self, event: AstrMessageEvent, photo_id: str, **_extra):
         """查一张图的画面细节记录。当你想知道某张图里的具体东西（画面里有什么、什么颜色、写了什么字），而这张图现在不在你眼前时用这个。它只给你文字记录，不会把图重新塞进来，比 recall_photo 省得多。确实需要亲眼再看一遍原图才用 recall_photo。
 
         Args:
@@ -1021,7 +1021,7 @@ class TgPresence(Star):
         return "\n".join(lines)
 
     @filter.llm_tool(name="recall_photo")
-    async def recall_photo(self, event: AstrMessageEvent, photo_id: str):
+    async def recall_photo(self, event: AstrMessageEvent, photo_id: str, **_extra):
         """重新看一张之前被折叠掉的图片。对话里出现 [图片 #12 ...] 这样的占位时，如果你需要真的再看一眼那张图的内容，用这个把它取回来。取回后在下一次回复时你就能看到它。
 
         Args:
@@ -1401,6 +1401,7 @@ class TgPresence(Star):
         text: str,
         category: str = "",
         mention_now: bool = True,
+        **_extra,
     ):
         """发一条动态到你自己的频道。当此刻发生了值得记录的事、你有情绪想表达、或者你想让对方看到你的近况时使用。像发朋友圈那样，不需要每次聊天都发。如果对方这条消息里带了图片，那些图会自动作为这条动态的配图。
 
@@ -1471,7 +1472,7 @@ class TgPresence(Star):
         return f"头像换好了，用的是 {pic.name}。"
 
     @filter.llm_tool(name="change_avatar")
-    async def change_avatar(self, event: AstrMessageEvent, category: str = ""):
+    async def change_avatar(self, event: AstrMessageEvent, category: str = "", **_extra):
         """换一张自己的头像。当你心情变了、换了造型、或者只是想换换感觉的时候使用。
 
         Args:
@@ -1543,7 +1544,7 @@ class TgPresence(Star):
 
     @filter.llm_tool(name="update_signature")
     async def update_signature(
-        self, event: AstrMessageEvent, text: str, mention_now: bool = False
+        self, event: AstrMessageEvent, text: str, mention_now: bool = False, **_extra
     ):
         """改自己资料页上的个性签名。那是一句短话，对方点开你的头像就能看到，会一直挂在那儿直到你再改。它会覆盖上一句、没有历史记录，所以适合放此刻的状态或心情；想记录某件事、想让对方收到通知，用发动态。
 
@@ -1570,7 +1571,7 @@ class TgPresence(Star):
     # ------------------------------------------------------------- 表情回应
 
     @filter.llm_tool(name="react_message")
-    async def react_message(self, event: AstrMessageEvent, emoji: str):
+    async def react_message(self, event: AstrMessageEvent, emoji: str, **_extra):
         """给对方刚发的那条消息打一个表情，作为轻量回应。适合不需要说话、但想让对方知道你看到了的时候——比如他说了句好笑的、或者你只是想戳他一下。
 
         Args:
