@@ -95,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.13.1",
+    "0.13.2",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
