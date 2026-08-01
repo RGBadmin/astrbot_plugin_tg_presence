@@ -1,5 +1,6 @@
 ﻿import json
 import random
+import re
 import shutil
 import time
 from datetime import datetime
@@ -18,12 +19,16 @@ MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
 CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
 SIGNATURE_MAX = 120  # setMyShortDescription 的上限
 
+# 角色自己消息的时间戳格式，形如 [08-01 14:30]
+STAMP_FMT = "[%m-%d %H:%M]"
+STAMP_RE = re.compile(r"^\[\d{2}-\d{2} \d{2}:\d{2}\]")
+
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情",
-    "0.3.0",
+    "0.4.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -32,6 +37,8 @@ class TgPresence(Star):
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_tg_presence")
         self.state_path = self.data_dir / "state.json"
         self.state = self._load_state()
+        # 角色最近一次出站的时刻。只在内存里，进程重启丢一次戳无所谓
+        self._pending_sent: float | None = None
 
     # ------------------------------------------------------------------ 状态
 
@@ -179,6 +186,72 @@ class TgPresence(Star):
                 continue
             saved.append(dst)
         return saved
+
+    # ------------------------------------------------------- 角色消息打时间戳
+
+    @filter.after_message_sent()
+    async def record_sent_time(self, event: AstrMessageEvent):
+        """记下角色刚说话的时刻，下次组请求时给那条 assistant 消息补戳。"""
+        self._pending_sent = time.time()
+
+    @filter.on_llm_request()
+    async def stamp_assistant(self, event: AstrMessageEvent, req: ProviderRequest):
+        """给角色自己的消息加时间戳。
+
+        AstrBot 只给 user 消息带时间（datetime_system_prompt 那段 system_reminder
+        会随 content 落库），assistant 消息是模型输出、没有任何时间锚点。
+        主动消息尤其严重——前面没有 user 消息，等于完全没有时间参照。
+
+        这里改的是 req.contexts，而 _save_to_history 保存的正是它派生出的
+        run_context.messages，所以戳会落库、只需要打一次。
+        """
+        if not self.conf.get("stamp_own_messages", True):
+            return
+        sent_at = self._pending_sent
+        if sent_at is None:
+            return
+        self._pending_sent = None
+
+        gap = int(self.conf.get("stamp_min_gap_minutes", 5)) * 60
+        last = self.state.get("last", {}).get("stamp", 0)
+        if gap > 0 and sent_at - last < gap:
+            return  # 距上次打戳不够久，这条不标
+
+        target = next(
+            (m for m in reversed(req.contexts or []) if m.get("role") == "assistant"),
+            None,
+        )
+        if target is None:
+            return
+
+        stamp = datetime.fromtimestamp(sent_at, self._tz()).strftime(STAMP_FMT)
+        if not self._prepend_stamp(target, stamp):
+            return
+
+        self.state["last"]["stamp"] = sent_at
+        self._save_state()
+        logger.debug(f"[tg_presence] 已给角色消息打戳 {stamp}")
+
+    @staticmethod
+    def _prepend_stamp(msg: dict, stamp: str) -> bool:
+        """把时间戳插到 assistant 消息正文最前面。已有戳则跳过，返回是否真的打了。"""
+        content = msg.get("content")
+
+        if isinstance(content, str):
+            if STAMP_RE.match(content.lstrip()):
+                return False
+            msg["content"] = f"{stamp} {content}"
+            return True
+
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text") or ""
+                    if STAMP_RE.match(text.lstrip()):
+                        return False
+                    part["text"] = f"{stamp} {text}"
+                    return True
+        return False
 
     # ------------------------------------------------------- 历史动态注入上下文
 

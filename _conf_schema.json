@@ -74,6 +74,19 @@
     "hint": "签名是资料页上那句会变的话（setMyShortDescription，120 字符以内），点开 bot 头像就能看到。填 0 表示不限制。"
   },
 
+  "stamp_own_messages": {
+    "description": "给角色自己的消息打时间戳",
+    "type": "bool",
+    "default": true,
+    "hint": "AstrBot 只给用户消息带时间，角色自己说的话没有任何时间锚点——主动消息尤其如此。开启后会在角色消息正文前加上形如 [08-01 14:30] 的简略时间戳，随对话历史一起保存。"
+  },
+  "stamp_min_gap_minutes": {
+    "description": "打戳最短间隔（分钟）",
+    "type": "int",
+    "default": 5,
+    "hint": "距上次打戳不足这么久就不再重复打，避免连续对话里每条都是时间戳。填 0 表示每条都打。"
+  },
+
   "enable_reaction": {
     "description": "启用表情回应",
     "type": "bool",
