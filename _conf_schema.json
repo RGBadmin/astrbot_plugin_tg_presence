@@ -67,6 +67,13 @@
     "hint": "Telegram 官方未公布该接口的频率上限，间隔太短可能触发限流。填 0 表示不限制。"
   },
 
+  "signature_cooldown_minutes": {
+    "description": "改签名最短间隔（分钟）",
+    "type": "int",
+    "default": 360,
+    "hint": "签名是资料页上那句会变的话（setMyShortDescription，120 字符以内），点开 bot 头像就能看到。填 0 表示不限制。"
+  },
+
   "enable_reaction": {
     "description": "启用表情回应",
     "type": "bool",

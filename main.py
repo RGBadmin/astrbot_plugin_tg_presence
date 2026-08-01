@@ -1,4 +1,4 @@
-import json
+﻿import json
 import random
 import shutil
 import time
@@ -16,13 +16,14 @@ AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
 CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
+SIGNATURE_MAX = 120  # setMyShortDescription 的上限
 
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
-    "让角色自己发动态到频道、换头像、改简介、对消息点表情",
-    "0.1.0",
+    "让角色自己发动态到频道、换头像、改签名、对消息点表情",
+    "0.3.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -101,6 +102,19 @@ class TgPresence(Star):
 
     # ----------------------------------------------------------------- 工具函数
 
+    @staticmethod
+    def _seal_command(event: AstrMessageEvent) -> None:
+        """让这条指令消息不进对话上下文。
+
+        AstrBot 的 ProcessStage 在指令 handler 没产生输出时，会把原始消息
+        （含未剥离的指令名和附带图片）丢给默认 LLM，并写进 conversation history。
+        指令消息里的图片会以 base64 形式永久留在历史里，之后每轮都重新发给模型，
+        表现就是"角色把你发指令时带的图当成你在聊天里发的照片"。
+
+        should_call_llm 的语义是反的 —— 传 True 才是禁止。
+        """
+        event.should_call_llm(True)
+
     def _client(self, event: AstrMessageEvent):
         """拿底层 telegram ExtBot。telegram 适配器把它挂在 event.client 上。"""
         if event.get_platform_name() != "telegram":
@@ -171,9 +185,11 @@ class TgPresence(Star):
     @filter.on_llm_request()
     async def inject_moments(self, event: AstrMessageEvent, req: ProviderRequest):
         if not self.conf.get("inject_history", True):
+            logger.debug("[tg_presence] 历史动态注入已关闭，跳过")
             return
         moments = self.state.get("moments", [])
         if not moments:
+            logger.debug("[tg_presence] 暂无历史动态可注入")
             return
 
         limit = int(self.conf.get("inject_history_limit", 0) or 0)
@@ -185,15 +201,44 @@ class TgPresence(Star):
             stamp = datetime.fromtimestamp(m["ts"], tz).strftime("%m-%d %H:%M")
             n = len(self._moment_photos(m))
             mark = f"[配图 {n} 张] " if n else ""
-            lines.append(f"{stamp} {mark}{m['text']}")
+            tail = "  ← 这条你发的时候没跟他提" if m.get("quiet") else ""
+            lines.append(f"{stamp} {mark}{m['text']}{tail}")
 
-        req.system_prompt += (
-            "\n\n# 你发过的动态\n"
+        block = (
+            "<your_own_moments>\n"
             "以下是你已经发到自己频道的全部动态，按时间先后排列。\n"
-            "这些是你自己发的，你记得它们。不要重复发内容相近的动态。\n\n"
+            "这些都是你自己发的，你记得它们——包括配图是什么、当时为什么发。\n"
+            "如果对方提起某条动态或者你们聊到相关的事，你是知道来龙去脉的，\n"
+            "不要表现得像第一次看到。也不要重复发内容相近的动态。\n\n"
+            "标着「没跟他提」的那几条，是你发的时候故意没在聊天里说的。\n"
+            "他要是自己刷到来问，你可以说、可以敷衍、也可以过阵子再说——\n"
+            "看你当时什么心情，但要记得自己一直是知情的那个。\n\n"
             + "\n".join(lines)
-            + "\n"
+            + "\n</your_own_moments>"
         )
+        where = self._inject_text(req, block)
+        logger.info(
+            f"[tg_presence] 已注入 {len(selected)} 条历史动态"
+            f"（{len(block)} 字符 → {where}），最后一条：{selected[-1]['text'][:30]}"
+        )
+
+    @staticmethod
+    def _inject_text(req: ProviderRequest, block: str) -> str:
+        """优先塞进 user turn 末尾，回退 system_prompt。返回实际落点，便于排障。
+
+        system_prompt 的追加位置在 TOOL_CALL_PROMPT 之后，离当前问题很远，
+        内容容易被稀释；extra_user_content_parts 贴着当前 user turn，
+        而且 mark_as_temp() 之后不会落进 conversation history。
+        """
+        try:
+            from astrbot.core.agent.message import TextPart
+
+            req.extra_user_content_parts.append(TextPart(text=block).mark_as_temp())
+            return "extra_user_content_parts"
+        except Exception as e:
+            logger.debug(f"[tg_presence] TextPart 不可用，回退 system_prompt: {e}")
+            req.system_prompt += "\n\n" + block + "\n"
+            return "system_prompt"
 
         if not self.conf.get("inject_history_images", False):
             return
@@ -220,8 +265,12 @@ class TgPresence(Star):
         text: str,
         category: str,
         enforce_limits: bool = True,
+        quiet: bool = False,
     ) -> str:
-        """enforce_limits=False 用于手动指令：冷却和每日上限只约束角色自主行为。"""
+        """enforce_limits=False 用于手动指令：冷却和每日上限只约束角色自主行为。
+
+        quiet=True 表示"发了但不主动在聊天里提"，会体现在返回值和历史注入里。
+        """
         client = self._client(event)
         if client is None:
             return "发动态失败：这个功能只能在 Telegram 上用。"
@@ -265,6 +314,7 @@ class TgPresence(Star):
                 "ts": time.time(),
                 "text": text,
                 "photos": [str(p) for p in photos],
+                "quiet": quiet,
             }
         )
         if enforce_limits:
@@ -272,9 +322,14 @@ class TgPresence(Star):
             self._bump_daily("post")
         self._save_state()
 
-        if not photos:
-            return "动态已经发出去了。"
-        return f"动态已经发出去了，带了 {len(photos)} 张{source}图。"
+        # 返回值直接决定她接下来在聊天里的反应，所以要说清"要不要提"
+        detail = f"，带了 {len(photos)} 张{source}图" if photos else ""
+        if quiet:
+            return (
+                f"动态发出去了{detail}。这条你没打算主动说——"
+                "接下来正常聊你的，别提这件事。他要是自己看到来问你，再决定说不说。"
+            )
+        return f"动态发出去了{detail}。可以顺口跟他说一声。"
 
     async def _send_to_channel(self, client, channel: str, text: str, photos: list[Path]):
         """按图片张数选择发送方式。caption 超长时图文分两条发。"""
@@ -309,18 +364,26 @@ class TgPresence(Star):
             await client.send_message(chat_id=channel, text=text)
 
     @filter.llm_tool(name="post_moment")
-    async def post_moment(self, event: AstrMessageEvent, text: str, category: str = ""):
+    async def post_moment(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        category: str = "",
+        mention_now: bool = True,
+    ):
         """发一条动态到你自己的频道。当此刻发生了值得记录的事、你有情绪想表达、或者你想让对方看到你的近况时使用。像发朋友圈那样，不需要每次聊天都发。如果对方这条消息里带了图片，那些图会自动作为这条动态的配图。
 
         Args:
             text(string): 动态的正文，用你自己的口吻写
             category(string): 可选，配图分类名。仅在对方没带图时才用它去图库里挑；留空则发纯文字
+            mention_now(boolean): 发完要不要在这次聊天里主动提这件事。真人不是每条动态都会特意说一嘴——想让他立刻知道就传 true；想让他自己刷到、或者这条你暂时不想解释，就传 false，然后正常聊别的
         """
-        return await self._do_post(event, text, category)
+        return await self._do_post(event, text, category, quiet=not mention_now)
 
     @filter.command("moment")
     async def cmd_moment(self, event: AstrMessageEvent, text: str = ""):
         """手动发一条动态。用法：/moment 正文"""
+        self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。")
             return
@@ -388,11 +451,89 @@ class TgPresence(Star):
     @filter.command("avatar")
     async def cmd_avatar(self, event: AstrMessageEvent, category: str = ""):
         """手动换头像。用法：/avatar [分类]"""
+        self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。")
             return
         yield event.plain_result(
             await self._do_avatar(event, category, enforce_limits=False)
+        )
+
+    # --------------------------------------------------------------- 改签名
+
+    async def _do_signature(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        enforce_limits: bool = True,
+        quiet: bool = False,
+    ) -> str:
+        """签名用 setMyShortDescription —— 它显示在资料页上，点开头像随时能看到。
+
+        注意别用 setMyDescription：那个只在用户还没和 bot 对话过时显示一次，
+        聊过之后永远不再出现，改了没人看得见。
+        """
+        client = self._client(event)
+        if client is None:
+            return "改签名失败：这个功能只能在 Telegram 上用。"
+
+        text = text.strip()
+        if not text:
+            return "改签名失败：内容是空的。"
+        if len(text) > SIGNATURE_MAX:
+            return (
+                f"改签名失败：上限 {SIGNATURE_MAX} 字符，你这条有 {len(text)} 个。"
+                "签名要短，长的内容发动态。"
+            )
+
+        if enforce_limits:
+            wait = self._cooldown_left(
+                "signature", int(self.conf.get("signature_cooldown_minutes", 360))
+            )
+            if wait:
+                return f"刚改过签名，{wait} 分钟内不能再改。"
+
+        try:
+            await client.set_my_short_description(short_description=text)
+        except Exception as e:
+            logger.error(f"[tg_presence] 改签名失败: {e}")
+            return f"改签名失败了：{e}"
+
+        if enforce_limits:
+            self._mark_done("signature")
+            self._save_state()
+
+        if quiet:
+            return (
+                "签名换好了。改签名本来就没有通知，他不点开你资料页是看不到的——"
+                "这条你没打算说，接着聊别的。"
+            )
+        return "签名换好了。可以顺口跟他说一声，或者等他自己发现。"
+
+    @filter.llm_tool(name="update_signature")
+    async def update_signature(
+        self, event: AstrMessageEvent, text: str, mention_now: bool = False
+    ):
+        """改自己资料页上的个性签名。那是一句短话，对方点开你的头像就能看到，会一直挂在那儿直到你再改。它会覆盖上一句、没有历史记录，所以适合放此刻的状态或心情；想记录某件事、想让对方收到通知，用发动态。
+
+        Args:
+            text(string): 新的签名，120 字符以内，一句话就够
+            mention_now(boolean): 要不要在聊天里主动说自己换了签名。默认不说——改签名没有通知，让他自己发现更自然
+        """
+        return await self._do_signature(event, text, quiet=not mention_now)
+
+    @filter.command("signature", alias={"bio"})
+    async def cmd_signature(self, event: AstrMessageEvent, text: str = ""):
+        """手动改签名。用法：/signature 新签名"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+        if not text:
+            yield event.plain_result("用法：/signature 新的签名内容")
+            return
+        yield event.plain_result(
+            await self._do_signature(event, text, enforce_limits=False)
         )
 
     # ------------------------------------------------------------- 表情回应
@@ -435,6 +576,7 @@ class TgPresence(Star):
     @filter.command("presence")
     async def cmd_presence(self, event: AstrMessageEvent):
         """查看插件状态：已发动态数、各项冷却剩余。"""
+        self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。")
             return
@@ -446,6 +588,7 @@ class TgPresence(Star):
             f"今日剩余：{'不限' if post_left < 0 else post_left} 条",
             f"发动态冷却：{self._cooldown_left('post', int(self.conf.get('post_cooldown_minutes', 180)))} 分钟",
             f"换头像冷却：{self._cooldown_left('avatar', int(self.conf.get('avatar_cooldown_minutes', 720)))} 分钟",
+            f"改签名冷却：{self._cooldown_left('signature', int(self.conf.get('signature_cooldown_minutes', 360)))} 分钟",
         ]
         if moments:
             last = moments[-1]
