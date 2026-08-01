@@ -95,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.14.1",
+    "0.15.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -269,23 +269,84 @@ class TgPresence(Star):
     def gallery_search(
         self, keywords: str = "", folder: str = "", limit: int = 8
     ) -> list[sqlite3.Row]:
-        """按关键词和分类找图。关键词取交集，只在已索引的图里找。"""
-        sql = ["SELECT * FROM photos WHERE descr IS NOT NULL"]
+        """按关键词和分类找图，按命中词数排序。
+
+        不用 AND 取交集：一句「酒店里穿灰丝踩红底细高跟」拆出六七个词，
+        只要一个词跟描述里的用词对不上（说「足底」而档案里写「脚底」），
+        交集就是空，整句话什么都搜不到。改成打分——命中 5 个词的图排在
+        命中 2 个的前面，漏词只降排名不至于让图消失。
+        """
+        words = [w for w in keywords.replace("，", " ").split() if w][:8]
         args: list = []
-        for w in [w for w in keywords.replace("，", " ").split() if w][:6]:
-            sql.append("AND descr LIKE ?")
-            args.append(f"%{w}%")
+        if words:
+            score = " + ".join(["(descr LIKE ?)"] * len(words))  # SQLite 里布尔就是 0/1
+            args += [f"%{w}%" for w in words]
+        else:
+            score = "0"
+
+        sql = f"SELECT *, ({score}) AS score FROM photos WHERE descr IS NOT NULL"
         if folder.strip():
-            sql.append("AND folder LIKE ?")
+            sql += " AND folder LIKE ?"
             args.append(f"%{folder.strip()}%")
-        # 最近发过的排后面，免得反复发同一张
-        sql.append("ORDER BY COALESCE(last_sent, 0) ASC, sent ASC, RANDOM() LIMIT ?")
-        args.append(max(1, min(limit, 20)))
+        # 命中多的优先；同分时最近发过的排后面，免得反复发同一张
+        sql += " ORDER BY score DESC, COALESCE(last_sent, 0) ASC, sent ASC, RANDOM() LIMIT ?"
+        args.append(max(1, min(limit, 50)))
+
         try:
-            return self.db().execute(" ".join(sql), args).fetchall()
+            rows = self.db().execute(sql, args).fetchall()
         except sqlite3.Error as e:
             logger.warning(f"[tg_presence] 图库检索失败: {e}")
             return []
+        # 一个词都没中的没意义（没给关键词时例外，那是随手翻）
+        return [r for r in rows if not words or r["score"] > 0]
+
+    async def _pick_best(
+        self, want: str, rows: list[sqlite3.Row], top: int
+    ) -> list[sqlite3.Row]:
+        """把候选的完整描述交给模型精排。失败就原样返回粗筛结果。
+
+        粗筛只会数命中了几个词，分不出「M腿岔开坐在椅子上」和
+        「M腿岔开躺在床上」——词几乎一样，画面完全不同。让模型读完整
+        描述来判断，这一步不看标签，所以标签错位也不影响。
+        """
+        cfg = self._vision_conf()
+        if not cfg or not rows:
+            return rows[:top]
+        model = (self.conf.get("picker_model") or "").strip()
+        cfg = dict(cfg, model=model or cfg["model"], max_tokens=200, stream=False)
+        cfg["system"] = (
+            "你是图片检索助手。只输出编号，用逗号分隔，不要解释、不要输出别的任何字。"
+        )
+
+        blocks = []
+        for i, r in enumerate(rows, 1):
+            blocks.append(f"[{i}] {(r['descr'] or '')[:900]}")
+        prompt = (
+            f"用户想找的画面：\n{want}\n\n"
+            f"下面是 {len(rows)} 张候选图片的描述：\n\n"
+            + "\n\n".join(blocks)
+            + f"\n\n把与用户描述最吻合的挑出来，按吻合程度从高到低排序，"
+            f"最多 {top} 个。明显不符的不要列。\n"
+            "只输出编号，例如：3,7,1"
+        )
+
+        try:
+            raw = await self._api_post(cfg, self._text_payload(cfg, prompt))
+        except VisionError as e:
+            logger.warning(f"[tg_presence] 选图精排失败，退回粗筛结果：{e}")
+            return rows[:top]
+
+        picked, seen = [], set()
+        for n in re.findall(r"\d+", raw or ""):
+            i = int(n) - 1
+            if 0 <= i < len(rows) and i not in seen:
+                seen.add(i)
+                picked.append(rows[i])
+        if not picked:
+            logger.warning(f"[tg_presence] 精排没返回有效编号：{(raw or '')[:80]}")
+            return rows[:top]
+        logger.info(f"[tg_presence] 精排 {len(rows)} -> {len(picked)} 张")
+        return picked[:top]
 
     def gallery_stat(self) -> dict:
         db = self.db()
@@ -871,11 +932,47 @@ class TgPresence(Star):
         mime = mimetypes.guess_type(path)[0] or "image/jpeg"
         return mime, base64.b64encode(raw).decode()
 
+    @staticmethod
+    def _text_payload(cfg: dict, prompt: str) -> dict:
+        """纯文本请求体。选图精排不需要传图，只比对文字描述。"""
+        fmt = cfg["fmt"]
+        if fmt == "anthropic":
+            body = {
+                "model": cfg["model"],
+                "max_tokens": cfg["max_tokens"],
+                "system": cfg["system"],
+                "messages": [{"role": "user", "content": prompt}],
+            }
+        elif fmt == "gemini":
+            body = {
+                "system_instruction": {"parts": [{"text": cfg["system"]}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": cfg["max_tokens"]},
+            }
+        else:
+            body = {
+                "model": cfg["model"],
+                "max_tokens": cfg["max_tokens"],
+                "messages": [
+                    {"role": "system", "content": cfg["system"]},
+                    {"role": "user", "content": prompt},
+                ],
+            }
+        if cfg["stream"] and fmt != "gemini":
+            body["stream"] = True
+        return body
+
     async def _vision_post(self, cfg: dict, mime: str, b64: str) -> str:
-        """发一次请求，返回正文。失败抛 VisionError。"""
+        return await self._api_post(cfg, self._vision_payload(cfg, mime, b64))
+
+    async def _api_post(self, cfg: dict, payload: dict) -> str:
+        """发一次请求，返回正文。失败抛 VisionError。
+
+        三种接口格式的传输、流式拼接、错误分类都在这儿，
+        图片解析和选图精排共用同一条链路。
+        """
         url = self._vision_url(cfg)
         headers = self._vision_headers(cfg)
-        payload = self._vision_payload(cfg, mime, b64)
         fmt = cfg["fmt"]
         timeout = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
 
@@ -1230,29 +1327,40 @@ class TgPresence(Star):
 
     @filter.llm_tool(name="browse_gallery")
     async def browse_gallery(
-        self, event: AstrMessageEvent, keywords: str = "", folder: str = "", **_extra
+        self, event: AstrMessageEvent, keywords: str = "", want: str = "",
+        folder: str = "", **_extra
     ):
-        """在你自己的相册里翻，找一张想发给他的照片。想给他看点什么的时候先用这个挑，再用 send_photo 发出去。不带关键词就是随手翻翻。返回的编号形如 g123。
+        """在你自己的相册里翻，找一张想发给他的照片。想给他看点什么、或者他描述了某个画面让你找的时候用。返回的编号形如 g123，再用 send_photo 发出去。
 
         Args:
-            keywords(string): 想找什么样的，空格分隔，例如「黑丝 高跟」「厨房 做饭」。会取交集
+            keywords(string): 检索词，空格分隔，例如「酒店 灰丝 细高跟 M腿」。词尽量多给几个，命中越多排得越前，个别词没对上也不影响
+            want(string): 可选但强烈建议填：把想找的画面用一句话原样描述出来。给了这个会再让模型逐张比对完整描述，挑出真正吻合的那张
             folder(string): 可选，限定某个相册分类
         """
-        rows = self.gallery_search(keywords, folder, limit=8)
+        pool = max(4, int(self.conf.get("picker_candidates", 20) or 20))
+        rows = self.gallery_search(keywords or want, folder, limit=pool)
         if not rows:
             stat = self.gallery_stat()
             if not stat["indexed"]:
                 return "相册还没建好索引，现在挑不了。"
-            return "没找到合适的。换个说法再翻翻。"
+            return "没找到合适的。换几个词再翻翻，或者把想找的画面整句说出来。"
+
+        picked, reranked = rows[:8], False
+        if want.strip() and self.conf.get("picker_enable", True) and len(rows) > 1:
+            picked = await self._pick_best(want.strip(), rows, top=8)
+            reranked = True
 
         lines = []
-        for r in rows:
+        for r in picked:
             tag = f"[{r['folder']}] " if r["folder"] else ""
             seen = f" · 发过{r['sent']}次" if r["sent"] else ""
             lines.append(f"g{r['id']} · {tag}{(r['descr'] or '')[:70]}{seen}")
-        return (
-            f"翻到 {len(rows)} 张：\n" + "\n".join(lines) + "\n用 send_photo 加编号发出去。"
+        head = (
+            f"从 {len(rows)} 张里挑出这 {len(picked)} 张，最吻合的排在前面："
+            if reranked
+            else f"翻到 {len(picked)} 张："
         )
+        return head + "\n" + "\n".join(lines) + "\n用 send_photo 加编号发出去。"
 
     @filter.llm_tool(name="send_photo")
     async def send_photo(
