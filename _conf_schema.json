@@ -211,6 +211,20 @@
     "hint": "允许角色对你的消息打表情，作为轻量的非文字回应。"
   },
 
+  "director_platform_id": {
+    "description": "控制台平台 ID",
+    "type": "string",
+    "default": "",
+    "hint": "另一个 bot 的适配器 ID（「平台配置」里那个实例名，不是 bot 用户名）。在那个 bot 里发 /say 和 /act，角色就会在她自己的会话里发出对应的话，而你的指令既不进她的上下文、也不出现在你俩的聊天窗口里。留空则禁用。用法：先在角色的私聊里发一次 /link 绑定目标。",
+    "obvious_hint": true
+  },
+  "director_context_turns": {
+    "description": "导演生成时带多少条历史",
+    "type": "int",
+    "default": 40,
+    "hint": "/act 让角色自己组织语言时，往前取多少条对话作为上下文。太少了会接不上最近的话题，太多了费 token。"
+  },
+
   "timezone": {
     "description": "时区",
     "type": "string",

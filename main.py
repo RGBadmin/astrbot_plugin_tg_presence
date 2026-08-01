@@ -95,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.12.0",
+    "0.13.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1939,6 +1939,186 @@ class TgPresence(Star):
                 + ("" if self._vision_ready() else "（未配视觉 API）")
             )
         yield event.plain_result("\n".join(lines))
+
+    # --------------------------------------------------------------- 导演模式
+
+    def _director_id(self) -> str:
+        return (self.conf.get("director_platform_id") or "").strip()
+
+    @staticmethod
+    def _platform_of(event: AstrMessageEvent) -> str:
+        """UMO 第一段就是平台实例 ID，多 bot 靠它区分。"""
+        return event.unified_msg_origin.split(":", 1)[0]
+
+    def _director_guard(self, event: AstrMessageEvent) -> str | None:
+        """校验这条指令来自控制台。返回 None 表示放行，否则是要回的话。"""
+        did = self._director_id()
+        if not did:
+            return "没配控制台。在插件配置里填「控制台平台 ID」，那是另一个 bot 的适配器 ID。"
+        if self._platform_of(event) != did:
+            return "这条指令只能在控制台那个 bot 里发——在这儿发等于当着他的面喊话。"
+        if not (self.state.get("director_target") or "").strip():
+            return "还没绑定目标会话。先去角色那边的私聊里发一次 /link。"
+        return None
+
+    async def _append_assistant(self, umo: str, text: str) -> bool:
+        """把一条角色消息写进目标会话的对话历史。
+
+        导演发出的话必须落进历史，否则她下一轮根本不知道自己说过这句，
+        会接不上茬甚至自相矛盾。
+        """
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None:
+            return False
+        try:
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                logger.warning("[tg_presence] 目标会话还没有对话，历史没写进去")
+                return False
+            conv = await cm.get_conversation(umo, cid)
+            if not conv:
+                return False
+            history = json.loads(conv.history or "[]")
+            if not isinstance(history, list):
+                history = []
+            body = text
+            if self.conf.get("stamp_own_messages", True):
+                body = f"{datetime.now(self._tz()).strftime(STAMP_FMT)} {text}"
+            history.append({"role": "assistant", "content": body})
+            await cm.update_conversation(umo, cid, history=history)
+            return True
+        except Exception as e:
+            logger.error(f"[tg_presence] 写入对话历史失败: {e}")
+            return False
+
+    async def _director_deliver(self, text: str) -> str:
+        """以角色的身份把一段话发到目标会话，并记进她的历史。"""
+        from astrbot.core.message.message_event_result import MessageChain
+
+        target = (self.state.get("director_target") or "").strip()
+        text = (text or "").strip()
+        if not text:
+            return "内容是空的，没发。"
+
+        try:
+            found = await self.context.send_message(
+                target, MessageChain().message(text)
+            )
+        except Exception as e:
+            logger.error(f"[tg_presence] 导演发送失败: {e}")
+            return f"没发出去：{e}"
+        if not found:
+            return f"找不到目标平台 {target.split(':', 1)[0]}，那个 bot 还连着吗？"
+
+        wrote = await self._append_assistant(target, text)
+        logger.info(f"[tg_presence] 导演代发 {len(text)} 字，写历史={wrote}")
+        return ("已发出：\n" + text) + ("" if wrote else "\n⚠️ 但没能写进对话历史，她之后不记得说过这句。")
+
+    async def _director_generate(self, brief: str) -> str:
+        """按导演提示，用角色的人格和历史生成一条主动消息。抛异常给调用方。"""
+        target = (self.state.get("director_target") or "").strip()
+        cm = self.context.conversation_manager
+        cid = await cm.get_curr_conversation_id(target)
+        conv = await cm.get_conversation(target, cid) if cid else None
+
+        history = []
+        if conv:
+            try:
+                history = json.loads(conv.history or "[]")
+            except json.JSONDecodeError:
+                history = []
+        limit = max(2, int(self.conf.get("director_context_turns", 40) or 40))
+
+        system_prompt = ""
+        pm = getattr(self.context, "persona_manager", None)
+        if pm is not None:
+            try:
+                p = None
+                if conv and conv.persona_id:
+                    p = pm.get_persona_v3_by_id(conv.persona_id)
+                if p is None:
+                    p = await pm.get_default_persona_v3(umo=target)
+                system_prompt = getattr(p, "system_prompt", "") or ""
+            except Exception as e:
+                logger.warning(f"[tg_presence] 取人格失败，这次不带人格生成: {e}")
+        if not system_prompt:
+            logger.warning("[tg_presence] 没拿到人格，生成的话可能不像她")
+
+        provider_id = await self.context.get_current_chat_provider_id(target)
+        resp = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            system_prompt=system_prompt,
+            contexts=history[-limit:] if isinstance(history, list) else [],
+            prompt=(
+                "【以下是导演提示，只有你能看到，对方完全不知道这段存在】\n"
+                f"{brief}\n\n"
+                "现在由你主动给他发一条消息。直接写你要发的原话，"
+                "用你平时的语气和分段习惯。不要复述或引用这段提示，"
+                "不要写旁白、解释、心理描写，也不要加引号。"
+            ),
+        )
+        return (getattr(resp, "completion_text", "") or "").strip()
+
+    @filter.command("link")
+    async def cmd_link(self, event: AstrMessageEvent):
+        """在角色的会话里执行，把这个会话设为导演指令的投递目标。"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+        umo = event.unified_msg_origin
+        if self._director_id() and self._platform_of(event) == self._director_id():
+            yield event.plain_result(
+                "这里是控制台。要在角色那个 bot 的私聊里发 /link，绑定的是她跟对方的会话。"
+            )
+            return
+        self.state["director_target"] = umo
+        self._save_state()
+        yield event.plain_result(
+            f"已绑定这个会话：\n{umo}\n\n"
+            "之后在控制台那个 bot 里：\n"
+            "  /say <原话>   她原样发出\n"
+            "  /act <提示>   她自己组织语言再发"
+        )
+
+    @filter.command("say")
+    async def cmd_say(self, event: AstrMessageEvent, *, text: str = ""):
+        """在控制台里用：让角色原样说一句话。用法：/say 内容"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+        if err := self._director_guard(event):
+            yield event.plain_result(err)
+            return
+        yield event.plain_result(await self._director_deliver(text))
+
+    @filter.command("act")
+    async def cmd_act(self, event: AstrMessageEvent, *, brief: str = ""):
+        """在控制台里用：给个方向，让角色自己组织语言发出去。用法：/act 跟他说你今天加班到很晚"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+        if err := self._director_guard(event):
+            yield event.plain_result(err)
+            return
+        brief = (brief or "").strip()
+        if not brief:
+            yield event.plain_result("给个方向，比如：/act 跟他说你今天加班到很晚，有点累")
+            return
+
+        yield event.plain_result("让她想想…")
+        try:
+            text = await self._director_generate(brief)
+        except Exception as e:
+            logger.error(f"[tg_presence] 导演生成失败: {e}")
+            yield event.plain_result(f"生成失败：{e}")
+            return
+        if not text:
+            yield event.plain_result("她没说出话来（模型返回空），换个提示试试。")
+            return
+        yield event.plain_result(await self._director_deliver(text))
 
     @filter.command("gallery")
     async def cmd_gallery(
