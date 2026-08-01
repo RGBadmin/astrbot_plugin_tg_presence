@@ -1,5 +1,6 @@
 import json
 import random
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,8 @@ from astrbot.core.star.star_tools import StarTools
 
 AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
+CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
 
 
 @register(
@@ -50,6 +53,14 @@ class TgPresence(Star):
             json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         tmp.replace(self.state_path)
+
+    @staticmethod
+    def _moment_photos(moment: dict) -> list[str]:
+        """兼容旧格式：v0.1.1 及以前是单个 photo 字段，之后是 photos 列表。"""
+        if moment.get("photos"):
+            return list(moment["photos"])
+        single = moment.get("photo")
+        return [single] if single else []
 
     def _tz(self) -> ZoneInfo:
         name = self.conf.get("timezone") or "Asia/Shanghai"
@@ -122,6 +133,39 @@ class TgPresence(Star):
             return []
         return sorted(p.name for p in root.iterdir() if p.is_dir())
 
+    async def _attached_images(self, event: AstrMessageEvent) -> list[Path]:
+        """取出当前消息里附带的图片，拷进插件数据目录长期保存。
+
+        平台给的图片通常落在 AstrBot 的临时目录，会被清理；而历史动态注入
+        可能在很久以后才读它，所以必须自己留一份。
+        """
+        import astrbot.api.message_components as Comp
+
+        store = self.data_dir / "moment_photos"
+        store.mkdir(parents=True, exist_ok=True)
+
+        saved: list[Path] = []
+        for seg in event.get_messages():
+            if not isinstance(seg, Comp.Image):
+                continue
+            try:
+                src = Path(await seg.convert_to_file_path())
+            except Exception as e:
+                logger.warning(f"[tg_presence] 附带图片取路径失败: {e}")
+                continue
+            if not src.exists():
+                logger.warning(f"[tg_presence] 附带图片不存在: {src}")
+                continue
+            suffix = src.suffix.lower() or ".jpg"
+            dst = store / f"{int(time.time() * 1000)}_{len(saved)}{suffix}"
+            try:
+                shutil.copy2(src, dst)
+            except OSError as e:
+                logger.warning(f"[tg_presence] 附带图片保存失败: {e}")
+                continue
+            saved.append(dst)
+        return saved
+
     # ------------------------------------------------------- 历史动态注入上下文
 
     @filter.on_llm_request()
@@ -139,7 +183,8 @@ class TgPresence(Star):
         lines = []
         for m in selected:
             stamp = datetime.fromtimestamp(m["ts"], tz).strftime("%m-%d %H:%M")
-            mark = "[配图] " if m.get("photo") else ""
+            n = len(self._moment_photos(m))
+            mark = f"[配图 {n} 张] " if n else ""
             lines.append(f"{stamp} {mark}{m['text']}")
 
         req.system_prompt += (
@@ -155,11 +200,11 @@ class TgPresence(Star):
 
         # 配图注入：ProviderRequest.image_urls 是 list[str]
         img_limit = int(self.conf.get("inject_images_limit", 10) or 0)
-        with_photo = [m for m in selected if m.get("photo")]
+        paths = [p for m in selected for p in self._moment_photos(m)]
         if img_limit > 0:
-            with_photo = with_photo[-img_limit:]
-        for m in with_photo:
-            path = Path(m["photo"])
+            paths = paths[-img_limit:]
+        for raw in paths:
+            path = Path(raw)
             if not path.exists():
                 continue
             try:
@@ -195,39 +240,81 @@ class TgPresence(Star):
             if self._daily_left("post", int(self.conf.get("post_daily_limit", 5))) == 0:
                 return "今天的动态已经发够了，明天再发。"
 
-        photo = None
-        photo_dir = (self.conf.get("moment_photo_dir") or "").strip()
-        if photo_dir:
-            photo = self._pick_image(photo_dir, category, PHOTO_EXTS)
+        # 优先用这条消息里随手附带的图；没有再从配置目录挑
+        photos = await self._attached_images(event)
+        source = "附带" if photos else ""
+        if not photos:
+            photo_dir = (self.conf.get("moment_photo_dir") or "").strip()
+            if photo_dir:
+                picked = self._pick_image(photo_dir, category, PHOTO_EXTS)
+                if picked:
+                    photos = [picked]
+                    source = "图库"
+
+        photos = photos[:MEDIA_GROUP_MAX]
 
         try:
-            if photo:
-                with open(photo, "rb") as f:
-                    await client.send_photo(chat_id=channel, photo=f, caption=text)
-            else:
-                await client.send_message(chat_id=channel, text=text)
+            await self._send_to_channel(client, channel, text, photos)
         except Exception as e:
             logger.error(f"[tg_presence] 发动态失败: {e}")
             return f"发动态失败了：{e}"
 
         # 手动发的也记进历史——她需要知道自己频道上有这条，才不会重复发
         self.state["moments"].append(
-            {"ts": time.time(), "text": text, "photo": str(photo) if photo else ""}
+            {
+                "ts": time.time(),
+                "text": text,
+                "photos": [str(p) for p in photos],
+            }
         )
         if enforce_limits:
             self._mark_done("post")
             self._bump_daily("post")
         self._save_state()
 
-        return f"动态已经发出去了{'（带了配图）' if photo else ''}。"
+        if not photos:
+            return "动态已经发出去了。"
+        return f"动态已经发出去了，带了 {len(photos)} 张{source}图。"
+
+    async def _send_to_channel(self, client, channel: str, text: str, photos: list[Path]):
+        """按图片张数选择发送方式。caption 超长时图文分两条发。"""
+        if not photos:
+            await client.send_message(chat_id=channel, text=text)
+            return
+
+        caption = text if len(text) <= CAPTION_MAX else None
+
+        handles = []
+        try:
+            if len(photos) == 1:
+                f = open(photos[0], "rb")
+                handles.append(f)
+                await client.send_photo(chat_id=channel, photo=f, caption=caption)
+            else:
+                from telegram import InputMediaPhoto
+
+                media = []
+                for i, p in enumerate(photos):
+                    f = open(p, "rb")
+                    handles.append(f)
+                    media.append(
+                        InputMediaPhoto(media=f, caption=caption if i == 0 else None)
+                    )
+                await client.send_media_group(chat_id=channel, media=media)
+        finally:
+            for f in handles:
+                f.close()
+
+        if caption is None:  # 正文太长塞不进 caption，补发一条纯文字
+            await client.send_message(chat_id=channel, text=text)
 
     @filter.llm_tool(name="post_moment")
     async def post_moment(self, event: AstrMessageEvent, text: str, category: str = ""):
-        """发一条动态到你自己的频道。当此刻发生了值得记录的事、你有情绪想表达、或者你想让对方看到你的近况时使用。像发朋友圈那样，不需要每次聊天都发。
+        """发一条动态到你自己的频道。当此刻发生了值得记录的事、你有情绪想表达、或者你想让对方看到你的近况时使用。像发朋友圈那样，不需要每次聊天都发。如果对方这条消息里带了图片，那些图会自动作为这条动态的配图。
 
         Args:
             text(string): 动态的正文，用你自己的口吻写
-            category(string): 可选，配图分类名。留空则由系统随机挑图或发纯文字
+            category(string): 可选，配图分类名。仅在对方没带图时才用它去图库里挑；留空则发纯文字
         """
         return await self._do_post(event, text, category)
 
