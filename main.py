@@ -60,6 +60,9 @@ DEFAULT_VISION_PROMPT = (
 VISION_MAX_FAILS = 3
 VISION_TIMEOUT = 120  # 秒。图片请求比纯文本慢，给宽裕些
 VISION_FORMATS = ("openai", "anthropic", "gemini")
+
+# 一轮最多请求几条图片描述。要多了模型容易敷衍，或写到一半被 max_tokens 截断
+NOTES_PER_TURN = 5
 ANTHROPIC_VERSION = "2023-06-01"
 
 
@@ -71,7 +74,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.11.0",
+    "0.11.1",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -816,6 +819,12 @@ class TgPresence(Star):
 
         if not pending:
             return
+        if len(pending) > NOTES_PER_TURN:
+            # 折叠是从最旧的开始的，所以最旧的那几张最急着要描述——留它们，
+            # 新图这轮先放着，下一轮自然会再排到
+            rest = len(pending) - NOTES_PER_TURN
+            pending = pending[:NOTES_PER_TURN]
+            logger.debug(f"[tg_presence] 本轮只请求 {NOTES_PER_TURN} 条描述，还剩 {rest} 张")
         self._save_state()  # 编号是刚分配的，落盘
 
         ids = "、".join(f"#{p}" for p in pending)
@@ -858,31 +867,71 @@ class TgPresence(Star):
         )
         logger.debug(f"[tg_presence] 请求描述图片 {ids}")
 
+    def _harvest_notes(self, text: str) -> int:
+        """把文本里的 <img_note> 存进档案，返回条数。"""
+        desc = self.state.setdefault("photo_desc", {})
+        found = 0
+        for hit in IMG_NOTE_RE.finditer(text):
+            body = hit.group("desc").strip()
+            if body:
+                desc[hit.group("id")] = body[:200]
+                found += 1
+        if found:
+            self._save_state()
+        return found
+
     @filter.on_llm_response()
     async def capture_descriptions(self, event: AstrMessageEvent, resp):
-        """抽出 <img_note> 存档，并从要发出去的内容里剥掉。"""
+        """抽出 <img_note> 存档，并从要发出去的内容里剥掉。
+
+        必须走 completion_text 这个 property，不能直接摸 result_chain：
+        LLMResponse.result_chain 默认是 None（provider 一般只填 _completion_text，
+        setter 在 result_chain 为 None 时就写那个私有字段），所以
+        result_chain.chain 多半取不到，判空一 return 就等于整个钩子没跑。
+        property 的 getter/setter 两种存储形态都覆盖，而且 result_chain 存在时
+        setter 只替换 Plain 组件、不动图片之类的其它组件。
+        """
         if not self.conf.get("describe_images", True):
             return
-        chain = getattr(getattr(resp, "result_chain", None), "chain", None)
+        text = getattr(resp, "completion_text", None)
+        if not isinstance(text, str) or "<img_note" not in text:
+            return
+
+        if found := self._harvest_notes(text):
+            logger.info(f"[tg_presence] 收到 {found} 条图片描述")
+        resp.completion_text = IMG_NOTE_RE.sub("", text).strip()
+
+    @filter.on_decorating_result()
+    async def strip_notes_before_send(self, event: AstrMessageEvent):
+        """发送前最后一道闸：确保 <img_note> 不会漏进聊天窗口。
+
+        上一步已经剥过一次，但文本抵达发送阶段的路径不止一条（其它插件改写、
+        分段回复重组等），这里照最终要发的内容再兜一次底。
+        正常情况下这里什么都匹配不到 —— 一旦日志里出现，说明上一步漏了。
+        """
+        if not self.conf.get("describe_images", True):
+            return
+        result = event.get_result()
+        chain = getattr(result, "chain", None)
         if not chain:
             return
 
-        desc = self.state.setdefault("photo_desc", {})
-        found = 0
+        keep, found = [], 0
         for comp in chain:
             text = getattr(comp, "text", None)
             if not isinstance(text, str) or "<img_note" not in text:
+                keep.append(comp)
                 continue
-            for hit in IMG_NOTE_RE.finditer(text):
-                body = hit.group("desc").strip()
-                if body:
-                    desc[hit.group("id")] = body[:200]
-                    found += 1
+            found += self._harvest_notes(text)
             comp.text = IMG_NOTE_RE.sub("", text).strip()
+            # 整条只有描述标记时剥完是空的，别把空消息发出去
+            if comp.text:
+                keep.append(comp)
 
         if found:
-            self._save_state()
-            logger.info(f"[tg_presence] 收到 {found} 条图片描述")
+            logger.warning(f"[tg_presence] 发送前兜底剥掉 {found} 条图片描述")
+        if len(keep) != len(chain):
+            result.chain = keep
 
     @filter.llm_tool(name="find_photo")
     async def find_photo(
