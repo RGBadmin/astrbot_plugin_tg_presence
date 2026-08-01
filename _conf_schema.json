@@ -67,13 +67,6 @@
     "hint": "Telegram 官方未公布该接口的频率上限，间隔太短可能触发限流。填 0 表示不限制。"
   },
 
-  "bio_cooldown_minutes": {
-    "description": "改简介最短间隔（分钟）",
-    "type": "int",
-    "default": 360,
-    "hint": "填 0 表示不限制。"
-  },
-
   "enable_reaction": {
     "description": "启用表情回应",
     "type": "bool",

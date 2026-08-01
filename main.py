@@ -395,60 +395,6 @@ class TgPresence(Star):
             await self._do_avatar(event, category, enforce_limits=False)
         )
 
-    # --------------------------------------------------------------- 改简介
-
-    async def _do_bio(
-        self, event: AstrMessageEvent, text: str, enforce_limits: bool = True
-    ) -> str:
-        """enforce_limits=False 用于手动指令。字数上限是 Telegram 的硬限制，两条路都要查。"""
-        client = self._client(event)
-        if client is None:
-            return "改简介失败：这个功能只能在 Telegram 上用。"
-
-        text = text.strip()
-        if not text:
-            return "改简介失败：内容是空的。"
-        if len(text) > 512:
-            return f"改简介失败：Telegram 上限 512 字符，你这条有 {len(text)} 个。"
-
-        if enforce_limits:
-            wait = self._cooldown_left(
-                "bio", int(self.conf.get("bio_cooldown_minutes", 360))
-            )
-            if wait:
-                return f"刚改过简介，{wait} 分钟内不能再改。"
-
-        try:
-            await client.set_my_description(description=text)
-        except Exception as e:
-            logger.error(f"[tg_presence] 改简介失败: {e}")
-            return f"改简介失败了：{e}"
-
-        if enforce_limits:
-            self._mark_done("bio")
-            self._save_state()
-        return "简介改好了。"
-
-    @filter.llm_tool(name="set_bio")
-    async def set_bio(self, event: AstrMessageEvent, text: str):
-        """改自己的个人简介。这是别人打开你资料页时看到的一段话，不是动态——它会覆盖掉上一条，没有历史记录。想记录某个时刻用发动态，想改变自我介绍才用这个。
-
-        Args:
-            text(string): 新的简介内容，512 字符以内
-        """
-        return await self._do_bio(event, text)
-
-    @filter.command("bio")
-    async def cmd_bio(self, event: AstrMessageEvent, text: str = ""):
-        """手动改简介。用法：/bio 新简介"""
-        if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
-            return
-        if not text:
-            yield event.plain_result("用法：/bio 新的简介内容")
-            return
-        yield event.plain_result(await self._do_bio(event, text, enforce_limits=False))
-
     # ------------------------------------------------------------- 表情回应
 
     @filter.llm_tool(name="react_message")
@@ -500,7 +446,6 @@ class TgPresence(Star):
             f"今日剩余：{'不限' if post_left < 0 else post_left} 条",
             f"发动态冷却：{self._cooldown_left('post', int(self.conf.get('post_cooldown_minutes', 180)))} 分钟",
             f"换头像冷却：{self._cooldown_left('avatar', int(self.conf.get('avatar_cooldown_minutes', 720)))} 分钟",
-            f"改简介冷却：{self._cooldown_left('bio', int(self.conf.get('bio_cooldown_minutes', 360)))} 分钟",
         ]
         if moments:
             last = moments[-1]
