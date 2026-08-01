@@ -95,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.14.0",
+    "0.14.1",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -2168,7 +2168,7 @@ class TgPresence(Star):
 
     @filter.command("link")
     async def cmd_link(self, event: AstrMessageEvent, target: str = ""):
-        """在控制台里绑定投递目标。用法：/link <UMO>，或 /link show 查看当前绑定。"""
+        """在控制台里绑定投递目标。用法：/link 目标UMO，或 /link show 查看当前绑定。"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
@@ -2192,7 +2192,8 @@ class TgPresence(Star):
                 )
             lines += [
                 "",
-                "绑定：/link <UMO>",
+                # 别用尖括号占位：Telegram 按 HTML 解析，<UMO> 会被当成标签整段吃掉
+                "绑定：/link 目标UMO",
                 "  例：/link AstrLover:FriendMessage:8338355157",
                 "  UMO = 机器人名称:消息类型:会话ID",
                 "  私聊是 FriendMessage，群聊是 GroupMessage",
@@ -2248,7 +2249,12 @@ class TgPresence(Star):
                 "要么 UMO 填错了，要么那个会话还没聊过——"
                 "没有对话的话，/say 发得出去但写不进历史。"
             )
-        msg += ["", "接下来：", "  /say <原话>   她原样发出", "  /act <提示>   她自己组织语言再发"]
+        msg += [
+            "",
+            "接下来：",
+            "  /say 你要她说的原话",
+            "  /act 给她的方向，她自己组织语言",
+        ]
         yield event.plain_result("\n".join(msg))
 
     @filter.command("say")
