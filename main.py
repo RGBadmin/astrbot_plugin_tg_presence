@@ -7,6 +7,7 @@ import mimetypes
 import random
 import re
 import shutil
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +53,9 @@ DEFAULT_VISION_PROMPT = (
     "2. 场景环境、光线、拍摄角度和距离\n"
     "3. 画面里出现的所有物品，以及任何文字、标志、招牌、屏幕内容\n"
     "4. 整体色调和氛围\n"
+    "5. 凡是有常见口语简称的，把简称也一并写进去，格式如"
+    "「黑色丝袜（黑丝）」「白色丝袜（白丝）」「高跟鞋（高跟）」「过膝袜（膝上袜）」——"
+    "检索是按词面匹配的，只写「黑色丝袜」的话，别人搜「黑丝」就找不到这张\n"
     "直接写描述，不要加任何开场白或总结句。名词尽量具体，"
     "宁可啰嗦也不要笼统——「黑色丝袜」比「深色袜子」有用。"
 )
@@ -63,6 +67,23 @@ VISION_FORMATS = ("openai", "anthropic", "gemini")
 
 # 一轮最多请求几条图片描述。要多了模型容易敷衍，或写到一半被 max_tokens 截断
 NOTES_PER_TURN = 5
+
+GALLERY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS photos (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    path    TEXT    NOT NULL UNIQUE,   -- 相对图库根目录；来源非图库时存绝对路径
+    folder  TEXT    NOT NULL DEFAULT '',
+    source  TEXT    NOT NULL DEFAULT 'gallery',  -- gallery / moment
+    descr   TEXT,                      -- 视觉 API 的描述；NULL = 还没索引
+    fails   INTEGER NOT NULL DEFAULT 0,
+    sent    INTEGER NOT NULL DEFAULT 0,
+    last_sent REAL,
+    added   REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_folder  ON photos(folder);
+CREATE INDEX IF NOT EXISTS idx_pending ON photos(fails) WHERE descr IS NULL;
+CREATE INDEX IF NOT EXISTS idx_sent    ON photos(last_sent);
+"""
 ANTHROPIC_VERSION = "2023-06-01"
 
 
@@ -74,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.11.2",
+    "0.12.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -92,6 +113,18 @@ class TgPresence(Star):
         self._vision_gate: asyncio.Semaphore | None = None
         # base64 指纹 -> sha256，省掉每轮对全部图片重算哈希
         self._key_cache: dict[str, str] = {}
+        self.db_path = self.data_dir / "gallery.db"
+        self._db: sqlite3.Connection | None = None
+
+    async def terminate(self):
+        """插件卸载或热重载时收尾，别把数据库句柄漏掉。"""
+        if self._db is not None:
+            try:
+                self._db.commit()
+                self._db.close()
+            except sqlite3.Error:
+                pass
+            self._db = None
 
     # ------------------------------------------------------------------ 状态
 
@@ -136,6 +169,139 @@ class TgPresence(Star):
             json.dumps(self.vision, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         tmp.replace(self.vision_path)
+
+    # ------------------------------------------------------------ 图库索引库
+
+    def db(self) -> sqlite3.Connection:
+        """图库索引。上万张图用 JSON 存不下——批量索引时每张都要落盘，
+        全量重写一次几 MB 的文件，跑一万张就是几十 GB 的无谓 IO。
+        SQLite 是标准库，增量写、按需查，不引入任何依赖。
+        """
+        if self._db is None:
+            self._db = sqlite3.connect(self.db_path)
+            self._db.row_factory = sqlite3.Row
+            self._db.executescript(GALLERY_SCHEMA)
+            self._db.commit()
+        return self._db
+
+    def _gallery_root(self) -> Path | None:
+        raw = (self.conf.get("gallery_dir") or "").strip()
+        if not raw:
+            return None
+        root = Path(raw).expanduser()
+        return root if root.is_dir() else None
+
+    def _photo_file(self, row: sqlite3.Row) -> Path | None:
+        """把库里的记录还原成磁盘路径。图库项存相对路径，其余存绝对路径。"""
+        p = Path(row["path"])
+        if p.is_absolute():
+            return p if p.exists() else None
+        root = self._gallery_root()
+        if not root:
+            return None
+        full = root / p
+        return full if full.exists() else None
+
+    def gallery_register(self, path: Path, source: str, folder: str = "") -> int | None:
+        """登记一张图片，返回行号。已登记的直接返回原行号，不会重复建。"""
+        # 图库内的图一律用相对路径当键，跟 scan 写进去的对齐。
+        # 否则从图库挑出来的配图会以绝对路径再插一条，同一张图两个编号
+        key, root = str(path), self._gallery_root()
+        if root:
+            try:
+                rel = path.resolve().relative_to(root.resolve())
+                key = rel.as_posix()
+                folder = rel.parts[0] if len(rel.parts) > 1 else ""
+                source = "gallery"
+            except (ValueError, OSError):
+                pass  # 不在图库目录下，按绝对路径存
+        try:
+            db = self.db()
+            cur = db.execute(
+                "INSERT OR IGNORE INTO photos(path, folder, source, added) "
+                "VALUES (?,?,?,?)",
+                (key, folder, source, time.time()),
+            )
+            db.commit()
+            if cur.lastrowid and cur.rowcount:
+                return cur.lastrowid
+            row = db.execute("SELECT id FROM photos WHERE path = ?", (key,)).fetchone()
+            return row["id"] if row else None
+        except sqlite3.Error as e:
+            logger.warning(f"[tg_presence] 图片登记失败 {path}: {e}")
+            return None
+
+    def gallery_scan(self) -> tuple[int, int]:
+        """扫描图库目录，把新文件登记进库。返回 (新增, 总数)。
+
+        只登记路径，不调视觉 API —— 那一步交给 /gallery index 慢慢跑。
+        """
+        root = self._gallery_root()
+        if not root:
+            return 0, 0
+        db = self.db()
+        added = 0
+        rows = []
+        for p in root.rglob("*"):
+            if not p.is_file() or p.suffix.lower() not in PHOTO_EXTS:
+                continue
+            rel = p.relative_to(root)
+            # 顶层子目录当作分类（一个博主一个文件夹）；直接放根目录的归空分类
+            folder = rel.parts[0] if len(rel.parts) > 1 else ""
+            rows.append((rel.as_posix(), folder, "gallery", time.time()))
+            if len(rows) >= 500:
+                added += db.executemany(
+                    "INSERT OR IGNORE INTO photos(path, folder, source, added) "
+                    "VALUES (?,?,?,?)",
+                    rows,
+                ).rowcount
+                db.commit()
+                rows.clear()
+        if rows:
+            added += db.executemany(
+                "INSERT OR IGNORE INTO photos(path, folder, source, added) VALUES (?,?,?,?)",
+                rows,
+            ).rowcount
+        db.commit()
+        total = db.execute("SELECT COUNT(*) c FROM photos").fetchone()["c"]
+        return added, total
+
+    def gallery_search(
+        self, keywords: str = "", folder: str = "", limit: int = 8
+    ) -> list[sqlite3.Row]:
+        """按关键词和分类找图。关键词取交集，只在已索引的图里找。"""
+        sql = ["SELECT * FROM photos WHERE descr IS NOT NULL"]
+        args: list = []
+        for w in [w for w in keywords.replace("，", " ").split() if w][:6]:
+            sql.append("AND descr LIKE ?")
+            args.append(f"%{w}%")
+        if folder.strip():
+            sql.append("AND folder LIKE ?")
+            args.append(f"%{folder.strip()}%")
+        # 最近发过的排后面，免得反复发同一张
+        sql.append("ORDER BY COALESCE(last_sent, 0) ASC, sent ASC, RANDOM() LIMIT ?")
+        args.append(max(1, min(limit, 20)))
+        try:
+            return self.db().execute(" ".join(sql), args).fetchall()
+        except sqlite3.Error as e:
+            logger.warning(f"[tg_presence] 图库检索失败: {e}")
+            return []
+
+    def gallery_stat(self) -> dict:
+        db = self.db()
+        row = db.execute(
+            "SELECT COUNT(*) total,"
+            " SUM(descr IS NOT NULL) indexed,"
+            " SUM(descr IS NULL AND fails < ?) pending,"
+            " SUM(descr IS NULL AND fails >= ?) stuck,"
+            " SUM(sent) sent"
+            " FROM photos",
+            (VISION_MAX_FAILS, VISION_MAX_FAILS),
+        ).fetchone()
+        folders = db.execute(
+            "SELECT COUNT(DISTINCT folder) c FROM photos WHERE folder <> ''"
+        ).fetchone()["c"]
+        return {k: (row[k] or 0) for k in row.keys()} | {"folders": folders}
 
     @staticmethod
     def _moment_photos(moment: dict) -> list[str]:
@@ -752,42 +918,65 @@ class TgPresence(Star):
             f"（第 {fails[pid]} 次，满 {VISION_MAX_FAILS} 次后不再自动重试）：{why}"
         )
 
-    async def _vision_describe(self, pid: str, path: str) -> bool:
-        """调独立视觉 API 解析一张图，存进详解档案。
+    async def _vision_of(self, path: str, skip_check=None) -> str | None:
+        """调独立视觉 API 拿一张图的描述。失败抛 VisionError。
 
         支持 OpenAI 兼容、Anthropic 原生、Gemini 原生三种接口格式，
         配置全在插件自己这儿，跟 AstrBot 的服务提供商互不干扰 ——
         主对话模型贵、这个便宜，本来就不该共用一套配置。
+
+        上下文图片和图库图片走的是同一条链路，只是描述存去不同地方。
+        skip_check 在拿到并发闸之后再判一次，避免排队期间白跑一趟。
         """
         cfg = self._vision_conf()
         if not cfg:
-            return False
+            raise VisionError("视觉 API 没配全")
+        image = self._read_image(path)
+        if not image:
+            raise VisionError("图片读不出来")
 
         async with self._gate():
-            if pid in self.vision:  # 排队期间已经被别的任务做掉了
-                return True
-
-            image = self._read_image(path)
-            if not image:
-                self._note_fail(pid, "图片读不出来")
-                return False
-
-            try:
-                text = await self._vision_post(cfg, *image)
-            except VisionError as e:
-                self._note_fail(pid, str(e))
-                return False
+            if skip_check and skip_check():
+                return None
+            text = await self._vision_post(cfg, *image)
 
         if not text:
-            self._note_fail(pid, "返回内容为空，可能是模型拒答或触发了内容过滤")
-            return False
+            raise VisionError("返回内容为空，可能是模型拒答或触发了内容过滤")
+        return text[: max(100, int(self.conf.get("vision_max_chars", 600) or 600))]
 
-        limit = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
-        self.vision[pid] = text[:limit]
+    async def _vision_describe(self, pid: str, path: str) -> bool:
+        """给上下文里的一张图做视觉解析，存进 vision.json。"""
+        if pid in self.vision:
+            return True
+        try:
+            text = await self._vision_of(path, lambda: pid in self.vision)
+        except VisionError as e:
+            self._note_fail(pid, str(e))
+            return False
+        if text is None:  # 排队期间已经被别的任务做掉了
+            return True
+
+        self.vision[pid] = text
         self._save_vision()
         if (self.state.get("vision_fail") or {}).pop(pid, None) is not None:
             self._save_state()
-        logger.info(f"[tg_presence] 视觉解析 #{pid} 完成，{len(self.vision[pid])} 字")
+        logger.info(f"[tg_presence] 视觉解析 #{pid} 完成，{len(text)} 字")
+        return True
+
+    async def _gallery_describe(self, row_id: int, path: str) -> bool:
+        """给图库里的一张图做视觉解析，存进索引库。"""
+        db = self.db()
+        try:
+            text = await self._vision_of(path)
+        except VisionError as e:
+            db.execute("UPDATE photos SET fails = fails + 1 WHERE id = ?", (row_id,))
+            db.commit()
+            logger.warning(f"[tg_presence] 图库 g{row_id} 索引失败：{e}")
+            return False
+        db.execute(
+            "UPDATE photos SET descr = ?, fails = 0 WHERE id = ?", (text, row_id)
+        )
+        db.commit()
         return True
 
     # ----------------------------------------------------- 让角色自己描述图片
@@ -1036,6 +1225,115 @@ class TgPresence(Star):
             self.state["recall_queue"].append(pid)
             self._save_state()
         return f"#{pid} 已取回，你现在能看到它了。"
+
+    # --------------------------------------------------------------- 发图给对方
+
+    @filter.llm_tool(name="browse_gallery")
+    async def browse_gallery(
+        self, event: AstrMessageEvent, keywords: str = "", folder: str = "", **_extra
+    ):
+        """在你自己的相册里翻，找一张想发给他的照片。想给他看点什么的时候先用这个挑，再用 send_photo 发出去。不带关键词就是随手翻翻。返回的编号形如 g123。
+
+        Args:
+            keywords(string): 想找什么样的，空格分隔，例如「黑丝 高跟」「厨房 做饭」。会取交集
+            folder(string): 可选，限定某个相册分类
+        """
+        rows = self.gallery_search(keywords, folder, limit=8)
+        if not rows:
+            stat = self.gallery_stat()
+            if not stat["indexed"]:
+                return "相册还没建好索引，现在挑不了。"
+            return "没找到合适的。换个说法再翻翻。"
+
+        lines = []
+        for r in rows:
+            tag = f"[{r['folder']}] " if r["folder"] else ""
+            seen = f" · 发过{r['sent']}次" if r["sent"] else ""
+            lines.append(f"g{r['id']} · {tag}{(r['descr'] or '')[:70]}{seen}")
+        return (
+            f"翻到 {len(rows)} 张：\n" + "\n".join(lines) + "\n用 send_photo 加编号发出去。"
+        )
+
+    @filter.llm_tool(name="send_photo")
+    async def send_photo(
+        self, event: AstrMessageEvent, photo_id: str, caption: str = "", **_extra
+    ):
+        """把一张照片发给对方。编号有两种：browse_gallery 给的 g123 是你相册里的；对话里 [图片 #3] 那种 #3 是之前聊天里出现过的图，想重发某张旧图就用它。发完照常说你的话，别把发照片这件事当成一次汇报。
+
+        Args:
+            photo_id(string): 照片编号，g123 或 #3
+            caption(string): 可选，跟照片一起发的一句话。留空则只发图
+        """
+        return await self._do_send_photo(event, photo_id, caption)
+
+    async def _do_send_photo(
+        self, event: AstrMessageEvent, photo_id: str, caption: str = "",
+        enforce_limits: bool = True,
+    ) -> str:
+        client = self._client(event)
+        if client is None:
+            return "这个平台发不了照片。"
+
+        raw = (photo_id or "").strip()
+        row = None
+        if raw.lower().startswith("g") and raw[1:].isdigit():
+            row = self.db().execute(
+                "SELECT * FROM photos WHERE id = ?", (int(raw[1:]),)
+            ).fetchone()
+            path = self._photo_file(row) if row else None
+        else:  # 聊天里出现过的图，走上下文那套编号
+            pid = raw.lstrip("#")
+            stored = (self.state.get("photo_paths") or {}).get(pid)
+            path = Path(stored) if stored and Path(stored).exists() else None
+        if not path:
+            return f"找不到 {raw} 这张照片。"
+
+        if enforce_limits:
+            cd = self._cooldown_left(
+                "photo", int(self.conf.get("photo_cooldown_minutes", 10))
+            )
+            if cd:
+                return f"刚发过照片，等 {cd} 分钟再发。先正常聊。"
+            left = self._daily_left("photo", int(self.conf.get("photo_daily_limit", 20)))
+            if left == 0:
+                return "今天发的照片够多了，明天再说。"
+
+        try:
+            with open(path, "rb") as fp:
+                await client.send_photo(
+                    chat_id=self._chat_id(event),
+                    photo=fp,
+                    caption=(caption or "")[:CAPTION_MAX] or None,
+                )
+        except Exception as e:
+            logger.error(f"[tg_presence] 发照片失败 {path}: {e}")
+            return f"照片没发出去：{e}"
+
+        if row is not None:
+            self.db().execute(
+                "UPDATE photos SET sent = sent + 1, last_sent = ? WHERE id = ?",
+                (time.time(), row["id"]),
+            )
+            self.db().commit()
+        if enforce_limits:
+            self._mark_done("photo")
+            self._bump_daily("photo")
+        logger.info(f"[tg_presence] 已发送照片 {raw} -> {path.name}")
+        return f"照片发出去了（{raw}）。"
+
+    @filter.command("photo")
+    async def cmd_photo(self, event: AstrMessageEvent, photo_id: str = "", *, caption: str = ""):
+        """手动发一张照片。用法：/photo g123 [附言]"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+        if not photo_id:
+            yield event.plain_result("用法：/photo g123 [附言]，编号从 /gallery search 查。")
+            return
+        yield event.plain_result(
+            await self._do_send_photo(event, photo_id, caption, enforce_limits=False)
+        )
 
     @filter.on_llm_request(priority=-60)
     async def serve_recalled(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -1353,6 +1651,11 @@ class TgPresence(Star):
             self._bump_daily("post")
         self._save_state()
 
+        # 动态配图登记进相册库，之后能被翻到、也能重新发给他。
+        # 从图库挑的那些扫描时已经在库里了，INSERT OR IGNORE 会跳过
+        for p in photos:
+            self.gallery_register(p, source="moment", folder="动态配图")
+
         # 返回值直接决定她接下来在聊天里的反应，所以要说清"要不要提"
         detail = f"，带了 {len(photos)} 张{source}图" if photos else ""
         if quiet:
@@ -1636,6 +1939,113 @@ class TgPresence(Star):
                 + ("" if self._vision_ready() else "（未配视觉 API）")
             )
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("gallery")
+    async def cmd_gallery(
+        self, event: AstrMessageEvent, action: str = "", *, rest: str = ""
+    ):
+        """管理相册索引。用法：/gallery [scan|index N|search 关键词|retry]"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+
+        action = (action or "").strip().lower()
+        stat = self.gallery_stat()
+
+        if not action:
+            root = self._gallery_root()
+            lines = [
+                f"相册目录：{root or '（未配置或路径无效）'}",
+                f"已登记：{stat['total']} 张 · {stat['folders']} 个分类",
+                f"已索引：{stat['indexed']} 张 · 待索引：{stat['pending']} 张",
+            ]
+            if stat["stuck"]:
+                lines.append(f"失败跳过：{stat['stuck']} 张（/gallery retry 重来）")
+            if stat["sent"]:
+                lines.append(f"累计发出：{stat['sent']} 次")
+            if not stat["total"]:
+                lines.append("\n先 /gallery scan 扫一遍目录。")
+            elif stat["pending"]:
+                lines.append("\n用 /gallery index 50 开始建索引，可以分多次跑。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "scan":
+            if not self._gallery_root():
+                yield event.plain_result("没配相册目录，或路径不存在。填「相册目录」那一项。")
+                return
+            yield event.plain_result("开始扫描，上万张图可能要几十秒…")
+            added, total = await asyncio.to_thread(self.gallery_scan)
+            yield event.plain_result(
+                f"扫完了。新增 {added} 张，库里共 {total} 张。\n"
+                + ("接着 /gallery index 50 建索引。" if added else "没有新文件。")
+            )
+            return
+
+        if action == "retry":
+            self.db().execute("UPDATE photos SET fails = 0 WHERE descr IS NULL")
+            self.db().commit()
+            yield event.plain_result("失败计数已清零，/gallery index 可以重跑那些图了。")
+            return
+
+        if action == "search":
+            rows = self.gallery_search(rest, limit=10)
+            if not rows:
+                yield event.plain_result("没找到。")
+                return
+            yield event.plain_result(
+                "\n".join(
+                    f"g{r['id']} · [{r['folder'] or '根目录'}] {(r['descr'] or '')[:60]}"
+                    for r in rows
+                )
+            )
+            return
+
+        if action == "index":
+            if not self._vision_ready():
+                yield event.plain_result("视觉 API 没配全，/vision 看缺哪项。")
+                return
+            batch = max(1, min(int(rest.strip()), 200)) if rest.strip().isdigit() else 20
+            rows = self.db().execute(
+                "SELECT id, path FROM photos WHERE descr IS NULL AND fails < ? "
+                "ORDER BY id LIMIT ?",
+                (VISION_MAX_FAILS, batch),
+            ).fetchall()
+            if not rows:
+                yield event.plain_result(
+                    f"没有待索引的图。已索引 {stat['indexed']} 张。"
+                    + (f"\n有 {stat['stuck']} 张失败跳过，/gallery retry 重来。" if stat["stuck"] else "")
+                )
+                return
+
+            yield event.plain_result(
+                f"开始索引 {len(rows)} 张（待索引共 {stat['pending']} 张），"
+                f"并发 {self.conf.get('vision_concurrency', 2)}，跑完再报。"
+            )
+            jobs = []
+            for r in rows:
+                p = self._photo_file(r)
+                if p:
+                    jobs.append(self._gallery_describe(r["id"], str(p)))
+                else:
+                    self.db().execute(
+                        "UPDATE photos SET fails = ? WHERE id = ?",
+                        (VISION_MAX_FAILS, r["id"]),
+                    )
+            self.db().commit()
+
+            results = await asyncio.gather(*jobs, return_exceptions=True)
+            ok = sum(1 for x in results if x is True)
+            after = self.gallery_stat()
+            yield event.plain_result(
+                f"完成 {ok}/{len(rows)} 张。已索引 {after['indexed']} / {after['total']}，"
+                f"还剩 {after['pending']} 张。"
+                + ("\n再发一次 /gallery index 继续。" if after["pending"] else "\n全部索引完毕。")
+            )
+            return
+
+        yield event.plain_result("用法：/gallery [scan|index N|search 关键词|retry]")
 
     @filter.command("vision")
     async def cmd_vision(self, event: AstrMessageEvent, arg: str = ""):

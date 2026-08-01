@@ -53,6 +53,26 @@
     "obvious_hint": true
   },
 
+  "gallery_dir": {
+    "description": "相册目录",
+    "type": "string",
+    "default": "",
+    "hint": "角色发给对方的照片从这里挑，绝对路径。顶层子文件夹名即分类（一个博主/一个主题一个文件夹），她挑图时可以按分类筛。支持 jpg/png/webp，会递归扫描。填好后先用 /gallery scan 登记，再用 /gallery index 分批建视觉索引——不建索引就只能靠分类名挑，建完才能按画面内容找。留空则禁用发照片功能。",
+    "obvious_hint": true
+  },
+  "photo_cooldown_minutes": {
+    "description": "发照片最短间隔（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "两张照片之间至少隔多久。真人不会连着刷图。填 0 表示不限制。只约束她自主发的，不影响 /photo 指令。"
+  },
+  "photo_daily_limit": {
+    "description": "每日发照片上限",
+    "type": "int",
+    "default": 20,
+    "hint": "按角色所在时区的自然日计算。填 0 表示不限制。同样不约束 /photo 指令。"
+  },
+
   "avatar_dir": {
     "description": "候选头像目录",
     "type": "string",
@@ -141,7 +161,7 @@
     "description": "视觉解析提示词",
     "type": "text",
     "default": "",
-    "hint": "作为 user 消息和图片一起发送。留空用内置提示词（要求覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围，并强调名词要具体）。这段解析只进档案、不发给任何人，写得越细检索越准。"
+    "hint": "作为 user 消息和图片一起发送。留空用内置提示词（覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围）。⚠️ 自己写的话务必保留「口语简称也要写」这一条——检索是按词面匹配的，描述里只有「黑色丝袜」，搜「黑丝」就找不到。这段解析只进档案、不发给任何人，写得越细检索越准。"
   },
   "vision_extra_body": {
     "description": "附加请求参数",
