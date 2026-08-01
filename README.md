@@ -60,7 +60,7 @@ AstrBot 把图片以 base64 data URL **永久写进对话历史**，之后每一
 
 **目录层**跟正文一次生成 —— 上下文里出现没描述过的图时，插件注入一段请求，角色在回复末尾附 `<img_note id="3">…</img_note>`，插件抽走存档并从要发出去的内容里剥掉，对方看不到。**不额外调模型**，而且此刻她正看着图、也知道当时在聊什么，写出来的话带着她自己的说法。
 
-**细节层**在图片首次进入上下文时**异步**调视觉 API 解析，不阻塞回复。这套 API 配置**在插件里独立填**（地址 / Key / 模型 ID / 系统提示词 / 最大输出长度），不走 AstrBot 的服务提供商 —— 主对话模型贵、这个便宜，本来就不该共用一套配置，也不该让它出现在对话模型的候选列表里。建议挑个便宜的多模态模型（Gemini Flash、qwen-vl 之类）。
+**细节层**在图片首次进入上下文时**异步**调视觉 API 解析，不阻塞回复。这套 API 配置**在插件里独立填**（格式 / 地址 / Key / 模型 ID / 系统提示词 / 最大输出长度 / 流式开关），不走 AstrBot 的服务提供商 —— 主对话模型贵、这个便宜，本来就不该共用一套配置，也不该让它出现在对话模型的候选列表里。支持 **OpenAI 兼容、Anthropic 原生、Gemini 原生**三种接口格式，挑个便宜的多模态模型即可。
 
 两层的价值在于**信息类型不同，不只是详略不同**。他说「昨天加班那张」走目录层，说「有咖啡杯那张」走细节层。而且能跨层组合：「加班 咖啡杯」——「加班」在目录、「咖啡杯」在细节，照样命中。
 
@@ -161,21 +161,53 @@ Docker 部署建议放在挂载卷里，例如：
 
 ### 独立视觉 API
 
-细节层用的是插件自己的 API 配置，跟 AstrBot 的服务提供商无关。**前三项都填了才启用。**
+细节层用的是插件自己的 API 配置，跟 AstrBot 的服务提供商无关。**地址、Key、模型 ID 都填了才启用。**
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
-| `vision_base_url` | 空 | OpenAI 兼容接口。填到 `/v1` 或填完整的 `/v1/chat/completions` 都认 |
-| `vision_api_key` | 空 | 以 Bearer 方式发送 |
-| `vision_model` | 空 | `model` 字段的值，必须是支持图片输入的多模态模型 |
+| `vision_api_format` | `openai` | 接口格式：`openai` / `anthropic` / `gemini`。**必须选对**，三家的请求体和鉴权头完全不同 |
+| `vision_base_url` | 空 | 只填到根即可，插件按格式补路径；填全了也认 |
+| `vision_api_key` | 空 | 鉴权头按格式自动选 |
+| `vision_model` | 空 | 必须是支持图片输入的多模态模型 |
+| `vision_stream` | 关 | 流式接收。**只在网关对非流式长响应 504 时才需要开** |
 | `vision_context_window` | 128000 | 该模型的上下文窗口。**不会发给 API**，仅用于校验下面那项 |
-| `vision_max_tokens` | 1024 | 请求里的 `max_tokens`。接近窗口时会被自动压到窗口的 1/4 并警告 |
+| `vision_max_tokens` | 1024 | 输出上限。接近窗口时会被自动压到窗口的 1/4 并警告 |
 | `vision_system_prompt` | 空 | system 角色。留空用内置的（只输出客观描述、不加开场白和免责声明） |
 | `vision_prompt` | 空 | user 消息，和图片一起发。留空用内置的 |
+| `vision_extra_body` | 空 | 一段 JSON，合并进请求体顶层。用来填插件没做成配置项的参数 |
 
-配好后用 **`/vision test`** 拿一张真图跑一次完整请求，直接看通不通 —— 比发张图然后翻日志快得多。
+#### 三种格式怎么填
+
+用中转站的话基本都是 `openai`，除非它明确说自己转发原生格式。
+
+| 格式 | 地址填 | 补成 | 鉴权头 | 模型名举例 |
+|---|---|---|---|---|
+| `openai` | `https://api.openai.com/v1` | `…/v1/chat/completions` | `Authorization: Bearer` | `gpt-4o-mini`、`qwen-vl-max` |
+| `anthropic` | `https://api.anthropic.com` | `…/v1/messages` | `x-api-key` + `anthropic-version` | `claude-haiku-4-5` |
+| `gemini` | `https://generativelanguage.googleapis.com/v1beta` | `…/models/{模型}:generateContent` | `x-goog-api-key` | `gemini-2.5-flash` |
+
+Gemini 的 Key 走**请求头**而不是 `?key=` URL 参数 —— 免得密钥出现在 URL 里被各级日志抄走。模型名会拼进路径，所以直接写 `gemini-2.5-flash`，不要写成 `models/gemini-2.5-flash`。
+
+配好后用 **`/vision test`** 拿一张真图跑一次完整请求，直接看通不通 —— 比发张图然后翻日志快得多。它会先回显解析出的格式、模型和最终地址，配错了一眼能看出来。
+
+#### `vision_extra_body`
+
+插件只做了通用的那几项，其余参数从这里塞进去，按你选的格式写。合并规则：同名的字典合并，其余直接覆盖。
+
+Gemini 放宽内容过滤（图像描述被误拦时用）：
+
+```json
+{"safetySettings": [
+  {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+  {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+]}
+```
+
+OpenAI 格式调采样：`{"temperature": 0.3}`。
 
 > **`vision_context_window` 的作用有限**，如实说明：单次请求只有一张图加一段短提示词，上下文窗口基本不构成约束，所以它只用来挡「最大输出长度设得比窗口还大」这种配置错误。没有拿它做别的事。
+
+> **`vision_stream` 默认关是有意的。** 结果整体存档，没人盯着看逐字输出，流式在这里唯一的价值是**绕过网关超时** —— 有些中转站对非流式的长响应直接 504 或挂断，那种情况下只有流式能跑通。插件会把增量拼回完整文本再存，三种格式的 SSE 结构不同（Anthropic 的 `content_block_delta`、Gemini 的 `candidates[].content.parts[]`、OpenAI 的 `choices[].delta.content`），都已分别处理，推理模型的 thinking 增量会被丢掉。
 
 ### 其他
 
@@ -255,8 +287,10 @@ Docker 部署建议放在挂载卷里，例如：
 | `<img_note>` 漏到聊天窗口 | 说明剥离没生效，先关掉 `describe_images` 再报 issue |
 | 一直没有图片描述 | 日志里搜 `请求描述图片`；没有则说明上下文里没检测到图片 |
 | 视觉解析不跑 | `/vision` 会告诉你三项配置缺哪个、有多少张待解析 |
-| 视觉解析一直失败 | `/vision test` 直接测。401 = Key 错，404 = 接口地址或模型 ID 错，400 看日志里的报错正文 |
-| 视觉解析返回空 | 多半是模型拒答或触发内容过滤，改 `vision_system_prompt` |
+| 视觉解析一直失败 | `/vision test` 直接测，它会回显格式和最终地址。401/403 = Key 错**或格式选错**，404 = 地址或模型 ID 错，400 看日志里的报错正文 |
+| 报错说字段不认识 | 格式选错了 —— 拿 `openai` 的请求体发给 Anthropic 端点必然报字段错 |
+| 视觉解析返回空 | 模型拒答或触发内容过滤。改 `vision_system_prompt`；Gemini 可用 `vision_extra_body` 放宽 `safetySettings` |
+| 网关 504 / 连接被挂断 | 开 `vision_stream` |
 | 连续 3 次失败后不再重试 | 这是设计如此，避免坏图无限撞 API。修好配置后用 `/vision retry` |
 
 ---

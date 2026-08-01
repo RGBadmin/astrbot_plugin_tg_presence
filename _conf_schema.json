@@ -82,25 +82,40 @@
     "obvious_hint": true
   },
 
+  "vision_api_format": {
+    "description": "视觉接口格式",
+    "type": "string",
+    "default": "openai",
+    "options": ["openai", "anthropic", "gemini"],
+    "hint": "三家的请求体、鉴权头、图片包装方式完全不同，必须选对。openai = OpenAI 兼容的 /chat/completions（绝大多数中转站、国产模型、vLLM 都是这个）；anthropic = Claude 原生 /v1/messages；gemini = Google 原生 generateContent。用中转站的话选 openai，除非它明确说自己转发原生格式。",
+    "obvious_hint": true
+  },
   "vision_base_url": {
     "description": "视觉 API 接口地址",
     "type": "string",
     "default": "",
-    "hint": "OpenAI 兼容接口。填到 /v1 即可（如 https://api.openai.com/v1），也可以填完整的 /v1/chat/completions，两种都认。这套配置独立于 AstrBot 的服务提供商——主对话模型贵、这个便宜，本来就不该共用。三项必填（地址、Key、模型 ID）齐了才启用。",
+    "hint": "只填到根即可，插件按上面选的格式补路径。openai：https://api.openai.com/v1 → /chat/completions；anthropic：https://api.anthropic.com 或 .../v1 → /v1/messages；gemini：https://generativelanguage.googleapis.com/v1beta → /models/{模型}:generateContent。填全了也认。这套配置独立于 AstrBot 的服务提供商——主对话模型贵、这个便宜，本来就不该共用。三项必填（地址、Key、模型 ID）齐了才启用。",
     "obvious_hint": true
   },
   "vision_api_key": {
     "description": "视觉 API Key",
     "type": "string",
     "default": "",
-    "hint": "以 Bearer 方式发送。",
+    "hint": "按格式自动选鉴权头：openai 用 Authorization: Bearer，anthropic 用 x-api-key，gemini 用 x-goog-api-key（走请求头而不是 URL 参数，免得密钥被各级日志抄走）。",
     "obvious_hint": true
   },
   "vision_model": {
     "description": "视觉模型 ID",
     "type": "string",
     "default": "",
-    "hint": "请求里 model 字段的值，例如 gemini-2.5-flash、qwen-vl-max、gpt-4o-mini。必须是支持图片输入的多模态模型。",
+    "hint": "必须是支持图片输入的多模态模型。openai 格式如 gpt-4o-mini、qwen-vl-max；anthropic 格式如 claude-haiku-4-5；gemini 格式如 gemini-2.5-flash（gemini 的模型名会拼进 URL 路径，别写成 models/xxx）。",
+    "obvious_hint": true
+  },
+  "vision_stream": {
+    "description": "流式接收",
+    "type": "bool",
+    "default": false,
+    "hint": "结果整体存档，没人盯着看逐字输出，所以默认关。开启只为一个理由：有些中转网关对非流式的长响应直接返回 504 或干脆挂断，那种情况下只有流式能跑通。插件会把增量拼回完整文本再存。",
     "obvious_hint": true
   },
   "vision_context_window": {
@@ -127,6 +142,13 @@
     "type": "text",
     "default": "",
     "hint": "作为 user 消息和图片一起发送。留空用内置提示词（要求覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围，并强调名词要具体）。这段解析只进档案、不发给任何人，写得越细检索越准。"
+  },
+  "vision_extra_body": {
+    "description": "附加请求参数",
+    "type": "text",
+    "default": "",
+    "hint": "一段 JSON 对象，合并进请求体顶层（同名的字典会合并，其余直接覆盖）。用来填插件没单独做成配置项的东西，按你选的格式写：gemini 的 safetySettings、temperature/top_p、anthropic 的 thinking 等。留空则不加。格式不合法会记一条警告并忽略，不影响请求。",
+    "obvious_hint": true
   },
   "vision_max_chars": {
     "description": "细节记录最长字数",

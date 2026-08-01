@@ -59,13 +59,19 @@ DEFAULT_VISION_PROMPT = (
 # 视觉解析连续失败这么多次就不再自动重试，避免坏图无限撞 API
 VISION_MAX_FAILS = 3
 VISION_TIMEOUT = 120  # 秒。图片请求比纯文本慢，给宽裕些
+VISION_FORMATS = ("openai", "anthropic", "gemini")
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+class VisionError(Exception):
+    """视觉解析失败，消息直接进失败日志。"""
 
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.10.0",
+    "0.11.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -406,9 +412,11 @@ class TgPresence(Star):
         model = (self.conf.get("vision_model") or "").strip()
         if not (base and key and model):
             return None
-        # 允许填到 /v1 也允许填全 —— 两种写法都常见，别让人猜
-        if not base.endswith("/chat/completions"):
-            base += "/chat/completions"
+
+        fmt = (self.conf.get("vision_api_format") or "openai").strip().lower()
+        if fmt not in VISION_FORMATS:
+            logger.warning(f"[tg_presence] 接口格式 {fmt} 不认识，按 openai 处理")
+            fmt = "openai"
 
         window = max(1024, int(self.conf.get("vision_context_window", 128000) or 128000))
         out = max(64, int(self.conf.get("vision_max_tokens", 1024) or 1024))
@@ -418,17 +426,185 @@ class TgPresence(Star):
             logger.warning(
                 f"[tg_presence] 最大输出长度不能接近上下文窗口，已压到 {out}"
             )
+
+        extra = {}
+        if raw := (self.conf.get("vision_extra_body") or "").strip():
+            try:
+                extra = json.loads(raw)
+                if not isinstance(extra, dict):
+                    raise ValueError("顶层必须是 JSON 对象")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"[tg_presence] 附加请求参数不是合法 JSON，已忽略：{e}")
+                extra = {}
+
         return {
-            "url": base,
+            "fmt": fmt,
+            "base": base,
             "key": key,
             "model": model,
             "window": window,
             "max_tokens": out,
+            "stream": bool(self.conf.get("vision_stream", False)),
+            "extra": extra,
             "system": (self.conf.get("vision_system_prompt") or "").strip()
             or DEFAULT_VISION_SYSTEM,
             "prompt": (self.conf.get("vision_prompt") or "").strip()
             or DEFAULT_VISION_PROMPT,
         }
+
+    # ----------------------------------------------- 三种接口格式的请求与解析
+
+    @staticmethod
+    def _vision_url(cfg: dict) -> str:
+        """按格式拼出请求地址。各家路径约定不同，都允许只填到根。"""
+        base, fmt = cfg["base"], cfg["fmt"]
+        if fmt == "openai":
+            # 填到 /v1 或填全都认
+            return base if base.endswith("/chat/completions") else base + "/chat/completions"
+        if fmt == "anthropic":
+            if base.endswith("/messages"):
+                return base
+            return base + ("/messages" if base.endswith("/v1") else "/v1/messages")
+        # gemini：模型名在路径里，流式和非流式是两个不同的方法
+        method = "streamGenerateContent?alt=sse" if cfg["stream"] else "generateContent"
+        head = base if base.rsplit("/", 1)[-1].startswith("v1") else base + "/v1beta"
+        return f"{head}/models/{cfg['model']}:{method}"
+
+    @staticmethod
+    def _vision_headers(cfg: dict) -> dict:
+        """鉴权方式三家各不相同。"""
+        fmt = cfg["fmt"]
+        if fmt == "anthropic":
+            return {
+                "x-api-key": cfg["key"],
+                "anthropic-version": ANTHROPIC_VERSION,
+                "Content-Type": "application/json",
+            }
+        if fmt == "gemini":
+            # 走 header 而不是 ?key=，免得密钥出现在 URL 里被各级日志抄走
+            return {"x-goog-api-key": cfg["key"], "Content-Type": "application/json"}
+        return {
+            "Authorization": f"Bearer {cfg['key']}",
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _vision_payload(cfg: dict, mime: str, b64: str) -> dict:
+        """按格式组装请求体。图片的位置和字段名三家完全不同。"""
+        fmt = cfg["fmt"]
+        if fmt == "anthropic":
+            body = {
+                "model": cfg["model"],
+                "max_tokens": cfg["max_tokens"],
+                "system": cfg["system"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": mime,
+                                    "data": b64,
+                                },
+                            },
+                            {"type": "text", "text": cfg["prompt"]},
+                        ],
+                    }
+                ],
+            }
+        elif fmt == "gemini":
+            body = {
+                "system_instruction": {"parts": [{"text": cfg["system"]}]},
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": cfg["prompt"]},
+                            {"inline_data": {"mime_type": mime, "data": b64}},
+                        ],
+                    }
+                ],
+                "generationConfig": {"maxOutputTokens": cfg["max_tokens"]},
+            }
+        else:
+            body = {
+                "model": cfg["model"],
+                "max_tokens": cfg["max_tokens"],
+                "messages": [
+                    {"role": "system", "content": cfg["system"]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": cfg["prompt"]},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime};base64,{b64}"
+                                },
+                            },
+                        ],
+                    },
+                ],
+            }
+
+        if cfg["stream"] and fmt != "gemini":  # gemini 靠 URL 上的方法名区分
+            body["stream"] = True
+        # 附加参数最后合并，允许覆盖上面任何一项（如 Gemini 的 safetySettings）
+        for k, v in (cfg["extra"] or {}).items():
+            if isinstance(v, dict) and isinstance(body.get(k), dict):
+                body[k].update(v)
+            else:
+                body[k] = v
+        return body
+
+    @staticmethod
+    def _resp_text(fmt: str, data: dict) -> str:
+        """从非流式响应里取正文。"""
+        try:
+            if fmt == "anthropic":
+                blocks = data["content"]
+            elif fmt == "gemini":
+                blocks = data["candidates"][0]["content"]["parts"]
+            else:
+                content = data["choices"][0]["message"].get("content")
+                if isinstance(content, str):
+                    return content.strip()
+                blocks = content or []  # 部分网关返回分块列表
+        except (KeyError, IndexError, TypeError):
+            return ""
+        if not isinstance(blocks, list):
+            return ""
+        # 只要 text，丢掉推理模型的 thinking 块——那是思考过程不是描述
+        bits = [
+            t.strip()
+            for b in blocks
+            if isinstance(b, dict)
+            and b.get("type", "text") == "text"
+            and isinstance(t := b.get("text"), str)
+            and t.strip()
+        ]
+        return " ".join(bits)
+
+    @staticmethod
+    def _delta_text(fmt: str, obj: dict) -> str:
+        """从一个 SSE 数据块里取增量文本。取不到就返回空串。"""
+        try:
+            if fmt == "anthropic":
+                if obj.get("type") != "content_block_delta":
+                    return ""
+                delta = obj.get("delta") or {}
+                # thinking_delta 不要，只要正文
+                return delta.get("text", "") if delta.get("type") == "text_delta" else ""
+            if fmt == "gemini":
+                parts = obj["candidates"][0]["content"]["parts"]
+                return "".join(
+                    p["text"] for p in parts if isinstance(p.get("text"), str)
+                )
+            return obj["choices"][0].get("delta", {}).get("content") or ""
+        except (KeyError, IndexError, TypeError):
+            return ""
 
     def _vision_ready(self) -> bool:
         return self._vision_conf() is not None
@@ -512,10 +688,11 @@ class TgPresence(Star):
         return n
 
     @staticmethod
-    def _data_url(path: str) -> str | None:
-        """把本地图片读成 data URL。
+    def _read_image(path: str) -> tuple[str, str] | None:
+        """把本地图片读成 (mime, base64)。远端 API 拿不到本机路径。
 
-        远端 API 拿不到本机路径，必须把图片本身带上。
+        三种格式对图片的包装不同（data URL / source 对象 / inline_data），
+        所以这里只出原料，拼装交给各自的 payload 构造。
         """
         try:
             raw = Path(path).read_bytes()
@@ -523,7 +700,45 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 读不到图片 {path}: {e}")
             return None
         mime = mimetypes.guess_type(path)[0] or "image/jpeg"
-        return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+        return mime, base64.b64encode(raw).decode()
+
+    async def _vision_post(self, cfg: dict, mime: str, b64: str) -> str:
+        """发一次请求，返回正文。失败抛 VisionError。"""
+        url = self._vision_url(cfg)
+        headers = self._vision_headers(cfg)
+        payload = self._vision_payload(cfg, mime, b64)
+        fmt = cfg["fmt"]
+        timeout = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.post(url, json=payload, headers=headers) as r:
+                    if r.status != 200:
+                        body = await r.text()
+                        # 带上响应体，光看状态码分不清是 key 错还是模型名错
+                        raise VisionError(f"HTTP {r.status} {body[:300]}")
+                    if not cfg["stream"]:
+                        return self._resp_text(fmt, json.loads(await r.text()))
+
+                    # 流式：逐行收 SSE，把增量拼回完整文本。
+                    # 有些中转网关对非流式长响应直接 504，只有流式能跑通
+                    bits: list[str] = []
+                    async for raw_line in r.content:
+                        line = raw_line.decode("utf-8", "ignore").strip()
+                        if not line.startswith("data:"):
+                            continue  # event: / 空行 / 注释心跳都跳过
+                        chunk = line[5:].strip()
+                        if chunk == "[DONE]":
+                            break
+                        try:
+                            bits.append(self._delta_text(fmt, json.loads(chunk)))
+                        except json.JSONDecodeError:
+                            continue
+                    return "".join(bits).strip()
+        except asyncio.TimeoutError:
+            raise VisionError(f"超时（{VISION_TIMEOUT} 秒）") from None
+        except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
+            raise VisionError(f"{type(e).__name__}: {e}") from e
 
     def _note_fail(self, pid: str, why: str) -> None:
         fails = self.state.setdefault("vision_fail", {})
@@ -537,9 +752,9 @@ class TgPresence(Star):
     async def _vision_describe(self, pid: str, path: str) -> bool:
         """调独立视觉 API 解析一张图，存进详解档案。
 
-        走 OpenAI 兼容的 /chat/completions，配置全在插件自己这儿，
-        跟 AstrBot 的服务提供商互不干扰 —— 主对话模型贵、这个便宜，
-        本来就不该共用一套配置。
+        支持 OpenAI 兼容、Anthropic 原生、Gemini 原生三种接口格式，
+        配置全在插件自己这儿，跟 AstrBot 的服务提供商互不干扰 ——
+        主对话模型贵、这个便宜，本来就不该共用一套配置。
         """
         cfg = self._vision_conf()
         if not cfg:
@@ -549,50 +764,17 @@ class TgPresence(Star):
             if pid in self.vision:  # 排队期间已经被别的任务做掉了
                 return True
 
-            data_url = self._data_url(path)
-            if not data_url:
+            image = self._read_image(path)
+            if not image:
                 self._note_fail(pid, "图片读不出来")
                 return False
 
-            payload = {
-                "model": cfg["model"],
-                "messages": [
-                    {"role": "system", "content": cfg["system"]},
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": cfg["prompt"]},
-                            {"type": "image_url", "image_url": {"url": data_url}},
-                        ],
-                    },
-                ],
-                "max_tokens": cfg["max_tokens"],
-            }
-            headers = {
-                "Authorization": f"Bearer {cfg['key']}",
-                "Content-Type": "application/json",
-            }
-
             try:
-                timeout = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
-                async with aiohttp.ClientSession(timeout=timeout) as sess:
-                    async with sess.post(
-                        cfg["url"], json=payload, headers=headers
-                    ) as r:
-                        body = await r.text()
-                        if r.status != 200:
-                            # 带上响应体，光看状态码查不出是 key 错还是模型名错
-                            self._note_fail(pid, f"HTTP {r.status} {body[:300]}")
-                            return False
-                        data = json.loads(body)
-            except asyncio.TimeoutError:
-                self._note_fail(pid, f"超时（{VISION_TIMEOUT} 秒）")
-                return False
-            except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-                self._note_fail(pid, f"{type(e).__name__}: {e}")
+                text = await self._vision_post(cfg, *image)
+            except VisionError as e:
+                self._note_fail(pid, str(e))
                 return False
 
-        text = self._resp_text(data)
         if not text:
             self._note_fail(pid, "返回内容为空，可能是模型拒答或触发了内容过滤")
             return False
@@ -604,31 +786,6 @@ class TgPresence(Star):
             self._save_state()
         logger.info(f"[tg_presence] 视觉解析 #{pid} 完成，{len(self.vision[pid])} 字")
         return True
-
-    @staticmethod
-    def _resp_text(data: dict) -> str:
-        """从 OpenAI 兼容响应里取正文。
-
-        content 可能是字符串，也可能是分块列表（部分网关这么返）；
-        推理模型的 reasoning_content 不要，那是思考过程不是描述。
-        """
-        try:
-            msg = data["choices"][0]["message"]
-        except (KeyError, IndexError, TypeError):
-            return ""
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            bits = [
-                t.strip()
-                for part in content
-                if isinstance(part, dict)
-                and isinstance(t := part.get("text"), str)
-                and t.strip()
-            ]
-            return " ".join(bits)
-        return ""
 
     # ----------------------------------------------------- 让角色自己描述图片
 
@@ -1470,7 +1627,8 @@ class TgPresence(Star):
                 )
                 return
             yield event.plain_result(
-                f"用 {cfg['model']} 试跑一张：\n{cfg['url']}"
+                f"格式 {cfg['fmt']} · 模型 {cfg['model']} · "
+                f"{'流式' if cfg['stream'] else '非流式'}\n{self._vision_url(cfg)}"
             )
             probe = "__test__"
             self.vision.pop(probe, None)
@@ -1483,8 +1641,9 @@ class TgPresence(Star):
                 (self.state.get("vision_fail") or {}).pop(probe, None)
                 self._save_state()
                 yield event.plain_result(
-                    "没通。日志里搜 `视觉解析 #__test__ 失败` 看具体原因："
-                    "401 是 key 错，404 多半是接口地址或模型 ID 错，400 看返回的报错正文。"
+                    "没通。日志里搜 `视觉解析 #__test__ 失败` 看具体原因：\n"
+                    "401/403 是 Key 错或格式选错（三家鉴权头不一样），\n"
+                    "404 多半是接口地址或模型 ID 错，400 看返回的报错正文。"
                 )
             return
 
