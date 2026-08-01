@@ -95,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.13.2",
+    "0.13.3",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1946,19 +1946,33 @@ class TgPresence(Star):
         return (self.conf.get("director_platform_id") or "").strip()
 
     @staticmethod
-    def _platform_of(event: AstrMessageEvent) -> str:
-        """UMO 第一段就是平台实例 ID，多 bot 靠它区分。"""
-        return event.unified_msg_origin.split(":", 1)[0]
+    def _umo_platform(umo: str) -> str:
+        """UMO 第一段就是「机器人名称」，多 bot 靠它区分。"""
+        return (umo or "").split(":", 1)[0]
+
+    def _platform_of(self, event: AstrMessageEvent) -> str:
+        return self._umo_platform(event.unified_msg_origin)
 
     def _director_guard(self, event: AstrMessageEvent) -> str | None:
-        """校验这条指令来自控制台。返回 None 表示放行，否则是要回的话。"""
+        """校验这条指令来自控制台、且目标绑对了。返回 None 放行。"""
         did = self._director_id()
         if not did:
-            return "没配控制台。在插件配置里填「控制台平台 ID」，那是另一个 bot 的适配器 ID。"
+            return (
+                "没配控制台。在插件配置里填「控制台机器人名称」——"
+                "WebUI「平台配置」里另一个 bot 那一栏的第一项。"
+            )
         if self._platform_of(event) != did:
             return "这条指令只能在控制台那个 bot 里发——在这儿发等于当着他的面喊话。"
-        if not (self.state.get("director_target") or "").strip():
+        target = (self.state.get("director_target") or "").strip()
+        if not target:
             return "还没绑定目标会话。先去角色那边的私聊里发一次 /link。"
+        if self._umo_platform(target) == did:
+            # 在填控制台名称之前跑过 /link 就会绑成这样：目标是控制台自己，
+            # 消息发回控制台、历史也写进控制台的会话，角色那边什么都没有
+            return (
+                f"投递目标绑到控制台自己了：\n{target}\n\n"
+                "到角色那个 bot 的私聊里重发一次 /link。"
+            )
         return None
 
     async def _append_assistant(self, umo: str, text: str) -> bool:
@@ -1973,10 +1987,14 @@ class TgPresence(Star):
         try:
             cid = await cm.get_curr_conversation_id(umo)
             if not cid:
-                logger.warning("[tg_presence] 目标会话还没有对话，历史没写进去")
+                logger.warning(
+                    f"[tg_presence] 写历史失败：{umo} 还没有对话。"
+                    "先在那个会话里正常聊一句，让 AstrBot 把对话建起来"
+                )
                 return False
             conv = await cm.get_conversation(umo, cid)
             if not conv:
+                logger.warning(f"[tg_presence] 写历史失败：取不到对话 {cid}")
                 return False
             history = json.loads(conv.history or "[]")
             if not isinstance(history, list):
@@ -1984,11 +2002,15 @@ class TgPresence(Star):
             body = text
             if self.conf.get("stamp_own_messages", True):
                 body = f"{datetime.now(self._tz()).strftime(STAMP_FMT)} {text}"
+            before = len(history)
             history.append({"role": "assistant", "content": body})
             await cm.update_conversation(umo, cid, history=history)
+            logger.info(
+                f"[tg_presence] 已写入对话历史 cid={cid} {before} -> {len(history)} 条"
+            )
             return True
         except Exception as e:
-            logger.error(f"[tg_presence] 写入对话历史失败: {e}")
+            logger.error(f"[tg_presence] 写历史失败: {e}")
             return False
 
     async def _director_deliver(self, text: str) -> str:
@@ -2011,8 +2033,14 @@ class TgPresence(Star):
             return f"找不到目标平台 {target.split(':', 1)[0]}，那个 bot 还连着吗？"
 
         wrote = await self._append_assistant(target, text)
-        logger.info(f"[tg_presence] 导演代发 {len(text)} 字，写历史={wrote}")
-        return ("已发出：\n" + text) + ("" if wrote else "\n⚠️ 但没能写进对话历史，她之后不记得说过这句。")
+        head = f"已发到 {self._umo_platform(target)}：\n{text}"
+        if wrote:
+            return head
+        return (
+            head
+            + "\n\n⚠️ 但没能写进对话历史，她之后不记得说过这句。"
+            + "\n日志里搜「写历史失败」看原因。"
+        )
 
     async def _director_generate(self, brief: str) -> str:
         """按导演提示，用角色的人格和历史生成一条主动消息。抛异常给调用方。"""
@@ -2060,26 +2088,59 @@ class TgPresence(Star):
         return (getattr(resp, "completion_text", "") or "").strip()
 
     @filter.command("link")
-    async def cmd_link(self, event: AstrMessageEvent):
-        """在角色的会话里执行，把这个会话设为导演指令的投递目标。"""
+    async def cmd_link(self, event: AstrMessageEvent, action: str = ""):
+        """在角色的会话里执行，把这个会话设为导演指令的投递目标。/link show 查看当前绑定。"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
-            return
-        umo = event.unified_msg_origin
-        if self._director_id() and self._platform_of(event) == self._director_id():
             yield event.plain_result(
-                "这里是控制台。要在角色那个 bot 的私聊里发 /link，绑定的是她跟对方的会话。"
+                "只有管理员能用这个指令。\n"
+                f"你的 ID 是 {event.get_sender_id()}，"
+                "确认它填进了**这个 bot 所用配置文件**的 admins_id 里 —— "
+                "多配置文件时每份都要填，另一份填了不算。"
             )
             return
+
+        umo = event.unified_msg_origin
+        here = self._platform_of(event)
+        did = self._director_id()
+        cur = (self.state.get("director_target") or "").strip()
+
+        if action.strip().lower() in ("show", "status"):
+            lines = [
+                f"这个会话：{umo}",
+                f"投递目标：{cur or '（未绑定）'}",
+                f"控制台：  {did or '（未配置）'}",
+            ]
+            if cur and did and self._umo_platform(cur) == did:
+                lines.append("\n⚠️ 目标绑到控制台自己了，到角色那边重发 /link。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if did and here == did:
+            yield event.plain_result(
+                "这里是控制台，绑它没意义。\n"
+                "要在角色那个 bot 的私聊里发 /link——绑定的是她跟你的会话。"
+            )
+            return
+
         self.state["director_target"] = umo
         self._save_state()
-        yield event.plain_result(
-            f"已绑定这个会话：\n{umo}\n\n"
-            "之后在控制台那个 bot 里：\n"
-            "  /say <原话>   她原样发出\n"
-            "  /act <提示>   她自己组织语言再发"
-        )
+        msg = [
+            f"已绑定这个会话：\n{umo}",
+            f"（机器人名称：{here}）",
+            "",
+            "之后在控制台那个 bot 里：",
+            "  /say <原话>   她原样发出",
+            "  /act <提示>   她自己组织语言再发",
+        ]
+        if not did:
+            # 没配控制台名称时无从判断这里是不是控制台，只能提醒
+            msg.append(
+                "\n⚠️ 还没填「控制台机器人名称」。如果你此刻是在控制台 bot 里发的这条，"
+                f"那就绑错了——目标该是角色和你的会话，不是 {here}。"
+                "填好配置后到角色那边重发一次，或用 /link show 核对。"
+            )
+        yield event.plain_result("\n".join(msg))
 
     @filter.command("say")
     async def cmd_say(self, event: AstrMessageEvent, *, text: str = ""):
