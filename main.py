@@ -83,8 +83,9 @@ CREATE TABLE IF NOT EXISTS photos (
     fails   INTEGER NOT NULL DEFAULT 0,
     sent    INTEGER NOT NULL DEFAULT 0,
     last_sent REAL,
-    added   REAL    NOT NULL,
-    tag_state  TEXT,               -- ok / 缺失 / 段数不齐 / 有问题
+    added   REAL    NOT NULL,      -- 扫进库的时间
+    file_time REAL,                -- 文件自身的修改时间，才是这张图真正的时间
+    tag_state  TEXT,               -- ok / 无标签 / 段数不齐 / 有问题
     tag_issues TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_folder  ON photos(folder);
@@ -102,7 +103,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.18.0",
+    "0.19.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -190,9 +191,10 @@ class TgPresence(Star):
             self._db.executescript(GALLERY_SCHEMA)
             # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
             have = {r["name"] for r in self._db.execute("PRAGMA table_info(photos)")}
-            for col in ("tag_state", "tag_issues"):
+            for col, typ in (("tag_state", "TEXT"), ("tag_issues", "TEXT"),
+                             ("file_time", "REAL")):
                 if col not in have:
-                    self._db.execute(f"ALTER TABLE photos ADD COLUMN {col} TEXT")
+                    self._db.execute(f"ALTER TABLE photos ADD COLUMN {col} {typ}")
             self._db.commit()
         return self._db
 
@@ -252,7 +254,15 @@ class TgPresence(Star):
         if not root:
             return 0, 0
         db = self.db()
-        added = 0
+        before = db.execute("SELECT COUNT(*) c FROM photos").fetchone()["c"]
+
+        # UPSERT 而不是 INSERT OR IGNORE：已登记的行也要刷新 file_time，
+        # 否则给老库补这一列时永远填不上
+        SQL = (
+            "INSERT INTO photos(path, folder, source, added, file_time) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(path) DO UPDATE SET file_time = excluded.file_time"
+        )
         rows = []
         for p in root.rglob("*"):
             if not p.is_file() or p.suffix.lower() not in PHOTO_EXTS:
@@ -260,23 +270,20 @@ class TgPresence(Star):
             rel = p.relative_to(root)
             # 顶层子目录当作分类（一个博主一个文件夹）；直接放根目录的归空分类
             folder = rel.parts[0] if len(rel.parts) > 1 else ""
-            rows.append((rel.as_posix(), folder, "gallery", time.time()))
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                mtime = None
+            rows.append((rel.as_posix(), folder, "gallery", time.time(), mtime))
             if len(rows) >= 500:
-                added += db.executemany(
-                    "INSERT OR IGNORE INTO photos(path, folder, source, added) "
-                    "VALUES (?,?,?,?)",
-                    rows,
-                ).rowcount
+                db.executemany(SQL, rows)
                 db.commit()
                 rows.clear()
         if rows:
-            added += db.executemany(
-                "INSERT OR IGNORE INTO photos(path, folder, source, added) VALUES (?,?,?,?)",
-                rows,
-            ).rowcount
+            db.executemany(SQL, rows)
         db.commit()
         total = db.execute("SELECT COUNT(*) c FROM photos").fetchone()["c"]
-        return added, total
+        return total - before, total
 
     def gallery_search(
         self, keywords: str = "", folder: str = "", limit: int = 8
@@ -314,79 +321,73 @@ class TgPresence(Star):
         # 一个词都没中的没意义（没给关键词时例外，那是随手翻）
         return [r for r in rows if not words or r["score"] > 0]
 
-    def _parse_day(self, day: str) -> float | None:
-        """把 MM-DD / YYYY-MM-DD 解析成时间戳。解析不了返回 None。"""
-        day = (day or "").strip()
-        if not day:
+    def _month_range(self, around: str) -> tuple[float, float] | None:
+        """把 YYYY-MM / MM / YYYY-MM-DD 解析成那个月的起止时间戳。
+
+        时间条件按「月」而不是按天算：人说的是"三月那会儿的"，
+        不是"3月1号那天的"。
+        """
+        s = (around or "").strip()
+        if not s:
             return None
         tz = self._tz()
-        for fmt, need_year in (("%Y-%m-%d", False), ("%m-%d", True)):
+        this_year = datetime.now(tz).year
+        for fmt, has_year in (("%Y-%m-%d", True), ("%Y-%m", True), ("%m", False)):
             try:
-                d = datetime.strptime(day, fmt)
-                if need_year:
-                    d = d.replace(year=datetime.now(tz).year)
-                return d.replace(tzinfo=tz).timestamp()
+                d = datetime.strptime(s, fmt)
             except ValueError:
                 continue
+            y, mo = (d.year if has_year else this_year), d.month
+            start = datetime(y, mo, 1, tzinfo=tz)
+            end = datetime(y + (mo == 12), mo % 12 + 1, 1, tzinfo=tz)
+            return start.timestamp(), end.timestamp()
         return None
 
     def _rerank(
         self, rows: list[sqlite3.Row], prefer_sent: str = "", around: str = ""
     ) -> list[sqlite3.Row]:
-        """对粗筛结果做加权重排。纯计算，不调模型。
+        """对粗筛结果重排。纯计算，不调模型。
 
-        三个维度各自在这一批里做 min-max 归一化再加权。用相对排名而不是
-        绝对阈值，是因为绝对阈值要调常数（多久算"最近"？），而相对排名
-        对任何时间跨度都自适应。
+        分层而不是加权：「上个月发过的那张」意思是在那批里挑匹配度最高的，
+        不是让时间给匹配度加点分——加权会让一张匹配度稍高但时间根本不对的
+        图挤上来，那不是人想要的。所以满足时间条件的整体排前面，组内再按
+        匹配度。不满足的仍然保留在后面兜底，避免条件太严时一张都返回不了。
 
-        同分时按 id 兜底，保证同一段词每次算出来的顺序完全一致。
+        排序键全是确定值，同一段词每次算出来的顺序完全一致。
         """
         if not rows:
             return rows
 
-        def norm(vals: list[float]) -> list[float]:
-            lo, hi = min(vals), max(vals)
-            if hi - lo < 1e-9:
-                return [0.5] * len(vals)
-            return [(v - lo) / (hi - lo) for v in vals]
-
-        m = norm([float(r["score"] or 0) for r in rows])
-
-        # 维度一：发过 / 没发过。她在对话里听得出要哪种，由她传参，这里只算。
-        # 必须用「距今多久」而不是 last_sent 本身：时间戳都是十几亿，
-        # min-max 之后「刚发过」和「半年前发过」的差异被压没了，
-        # 只剩「没发过」的 0 是离群点，recent 模式就完全失效
         now = time.time()
-        never = 10 * 365 * 86400.0  # 没发过的当成十年前，稳定排在最末
-        age = [
-            (now - float(r["last_sent"])) if r["last_sent"] else never for r in rows
-        ]
+        window = max(1, int(self.conf.get("sent_window_days", 30) or 30)) * 86400.0
+        rng = self._month_range(around)
         pref = (prefer_sent or "").strip().lower()
-        if pref in ("recent", "发过", "上次"):
-            s = [1 - v for v in norm(age)]          # 距今越短 = 刚发过 = 越高
-        elif pref in ("any", "不限"):
-            s = [0.5] * len(rows)
-        else:                                        # fresh，默认避免重复
-            s = norm(age)                            # 距今越久 / 没发过 = 越高
+        want_recent = pref in ("recent", "发过", "上次")
+        ignore_sent = pref in ("any", "不限")
+        # 他明说的条件要压过默认偏好：只说了"三月那会儿的"时，三月的图
+        # 必须全部排在前面，不能因为某张更新、恰好又没发过就被顶上来
+        told_pref = bool(pref) and not ignore_sent
 
-        # 维度二：文件首次出现的时间
-        added = [float(r["added"] or 0) for r in rows]
-        ts = self._parse_day(around)
-        if ts:
-            t = [1 - v for v in norm([abs(a - ts) for a in added])]  # 离指定时间越近越高
-        else:
-            t = norm(added)                          # 没指定就越新越高
+        def key(r: sqlite3.Row):
+            # 图片自身的时间优先用文件修改时间；老库还没回填就退回入库时间
+            ft = float(r["file_time"] or r["added"] or 0)
+            last = float(r["last_sent"] or 0)
+            fresh = (not last) or (now - last > window)
 
-        wm = float(self.conf.get("weight_match", 0.6) or 0)
-        ws = float(self.conf.get("weight_sent", 0.2) or 0)
-        wt = float(self.conf.get("weight_time", 0.2) or 0)
+            told, default = 0, 0   # 他明说的 / 默认偏好
+            if rng and rng[0] <= ft < rng[1]:
+                told += 1
+            if not ignore_sent and (want_recent != fresh):
+                # recent 要窗口内发过的，fresh 要没发过或早就过了窗口的
+                if told_pref:
+                    told += 1
+                else:
+                    default += 1
 
-        scored = [
-            (wm * m[i] + ws * s[i] + wt * t[i], int(rows[i]["id"]), rows[i])
-            for i in range(len(rows))
-        ]
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return [r for _, _, r in scored]
+            # 明说的条件 > 默认偏好 > 匹配度 > 新的优先 > id 兜底
+            return (-told, -default, -float(r["score"] or 0), -ft, int(r["id"]))
+
+        return sorted(rows, key=key)
 
     async def _pick_best(
         self, want: str, rows: list[sqlite3.Row], top: int
@@ -1576,8 +1577,8 @@ class TgPresence(Star):
             keywords(string): 检索词，空格分隔，例如「酒店 灰丝 细高跟 M腿」。词尽量多给几个，命中越多排得越前，个别词没对上也不影响
             want(string): 可选，把想找的画面用一句话原样描述出来
             folder(string): 可选，限定某个相册分类
-            prefer_sent(string): 他要的是以前发过的那张就填 recent，要没发过的新图就填 fresh，听不出来就留空（默认 fresh，免得老发同一张）
-            around(string): 他提到时间就填，格式 MM-DD 或 YYYY-MM-DD，会优先挑那前后收进来的图；没提就留空，默认偏向新收的
+            prefer_sent(string): 他要的是最近发过的那张就填 recent，要没发过的新图就填 fresh，听不出来就留空（默认 fresh，免得老发同一张）
+            around(string): 他提到某个月份就填，格式 YYYY-MM 或 MM，例如「三月那会儿的」填 03。那个月的图会整体排到前面。没提就留空
         """
         pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
         rows = self.gallery_search(keywords or want, folder, limit=pool)

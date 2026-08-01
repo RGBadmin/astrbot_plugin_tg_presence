@@ -189,24 +189,11 @@
     "default": 10,
     "hint": "重排后把前几张交给角色，由她自己挑一张发。给太多她挑得费劲、也吃上下文；给太少容易漏掉对的那张。"
   },
-  "weight_match": {
-    "description": "权重·关键词匹配度",
-    "type": "float",
-    "default": 0.6,
-    "hint": "命中词数在这一批里的相对排名。三个权重不必加起来等于 1，比例才有意义。",
-    "obvious_hint": true
-  },
-  "weight_sent": {
-    "description": "权重·发送历史",
-    "type": "float",
-    "default": 0.2,
-    "hint": "角色调工具时传 prefer_sent：填 recent 就偏向以前发过的（他说「上次那张」），填 fresh 或留空就偏向没发过的（避免反复发同一张）。这个判断由她在对话里做出，权重计算本身不调模型。"
-  },
-  "weight_time": {
-    "description": "权重·时间",
-    "type": "float",
-    "default": 0.2,
-    "hint": "按图片被收进相册的时间算。角色传了 around（他提到的时间）就偏向那前后的图，没传就偏向新收的。"
+  "sent_window_days": {
+    "description": "「最近发过」的天数",
+    "type": "int",
+    "default": 30,
+    "hint": "多少天以内发过算「最近发过」。角色调工具时传 prefer_sent=recent（他说「上次那张」），这个窗口内发过的会整体排到前面，组内再按关键词匹配度。默认 30 天。"
   },
   "picker_enable": {
     "description": "额外的模型精排",
