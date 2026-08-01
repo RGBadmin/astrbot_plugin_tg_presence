@@ -42,7 +42,7 @@ IMG_NOTE_RE = re.compile(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情",
-    "0.7.0",
+    "0.8.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -259,6 +259,10 @@ class TgPresence(Star):
                 bits.append(f"{who}当时说「{said[:60]}」")
             bits.append("已折叠")
             msg["content"][i] = {"type": "text", "text": "[" + " · ".join(bits) + "]"}
+            # 记下拍摄时间，find_photo 要用——占位可能被 llm_compress 吃掉，
+            # 但这份档案在 state.json 里，压缩动不到
+            if pid and when:
+                self.state.setdefault("photo_time", {})[pid] = when
             pruned += 1
 
         if pruned:
@@ -370,7 +374,11 @@ class TgPresence(Star):
             "按图片在对话里出现的先后顺序对应编号。描述要具体到能靠它认出这张图——\n"
             "画面内容、谁拍的、什么场合，用你自己的说法就行。\n"
             "这几行会被系统抽走存档，对方看不到，也不算进你的回复。\n"
-            "正常说你的话，把这些附在最后即可。\n"
+            "正常说你的话，把这些附在最后即可。\n\n"
+            "另外：对方提起某张旧图时（「昨天那张」「黑丝那张」），\n"
+            "先看对话里的 [图片 #N ...] 占位——描述就在里面，直接认出来即可。\n"
+            "上下文里找不到再用 find_photo 查存档。\n"
+            "**符合的不止一张时，问他是哪张，不要自己挑一张然后当成就是那张。**\n"
             "</describe_images>",
         )
         logger.debug(f"[tg_presence] 请求描述图片 {ids}")
@@ -400,6 +408,51 @@ class TgPresence(Star):
         if found:
             self._save_state()
             logger.info(f"[tg_presence] 收到 {found} 条图片描述")
+
+    @filter.llm_tool(name="find_photo")
+    async def find_photo(
+        self, event: AstrMessageEvent, keywords: str = "", day: str = ""
+    ):
+        """在你存过描述的旧图片里找。对话里能直接看到的那些占位不用查这个——只有当对方提起一张你在当前上下文里找不到的旧图时才用。返回候选列表，如果不止一张，问对方是哪张，别自己瞎猜。
+
+        Args:
+            keywords(string): 描述里的关键词，空格分隔，例如「黑丝 足底」。会取交集
+            day(string): 限定日期，格式 MM-DD 或 YYYY-MM-DD。留空则不限
+        """
+        desc = self.state.get("photo_desc") or {}
+        times = self.state.get("photo_time") or {}
+        if not desc:
+            return "还没有存过任何图片描述。"
+
+        words = [w for w in keywords.replace("，", " ").split() if w]
+        day = day.strip()
+
+        hits = []
+        for pid, text in desc.items():
+            if words and not all(w in text for w in words):
+                continue
+            ts = times.get(pid)
+            stamp = (
+                datetime.fromtimestamp(ts, self._tz()).strftime("%Y-%m-%d %H:%M")
+                if ts
+                else ""
+            )
+            if day and day not in stamp:
+                continue
+            hits.append((ts or 0, pid, stamp or "时间不详", text))
+
+        if not hits:
+            return "没找到符合的图片。换个说法再试，或者问问对方是哪张。"
+
+        hits.sort(reverse=True)
+        lines = [f"#{pid} · {stamp} · {text}" for _, pid, stamp, text in hits[:12]]
+        head = f"找到 {len(hits)} 张" + ("，只列最近 12 张：" if len(hits) > 12 else "：")
+        tail = (
+            "\n不止一张，先问清楚是哪张再取。"
+            if len(hits) > 1
+            else "\n用 recall_photo 加编号可以把它取回来重新看。"
+        )
+        return head + "\n" + "\n".join(lines) + tail
 
     @filter.llm_tool(name="recall_photo")
     async def recall_photo(self, event: AstrMessageEvent, photo_id: str):
