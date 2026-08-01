@@ -32,12 +32,17 @@ CTX_TIME_RE = re.compile(r"Current datetime:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
 
 DATA_URL_RE = re.compile(r"^data:image/(?P<ext>[\w+.-]+);base64,(?P<b64>.+)$", re.S)
 
+# 角色在回复末尾附的图片描述，会被剥掉不发给用户
+IMG_NOTE_RE = re.compile(
+    r"<img_note\s+id=[\"']?#?(?P<id>\w+)[\"']?\s*>(?P<desc>.*?)</img_note>", re.S
+)
+
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情",
-    "0.6.0",
+    "0.7.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -231,23 +236,29 @@ class TgPresence(Star):
 
         store = self.data_dir / "context_photos"
         store.mkdir(parents=True, exist_ok=True)
-        index = self.state.setdefault("photo_index", {})
+        desc = self.state.get("photo_desc") or {}
 
         pruned = 0
         for msg, i in slots[:-keep]:
             part = msg["content"][i]
             url = (part.get("image_url") or {}).get("url") or ""
-            pid = self._stash_photo(url, store, index)
+            pid = self._stash_photo(url, store)
             when = self._context_time(msg)
             stamp = (
                 datetime.fromtimestamp(when, self._tz()).strftime("%m-%d %H:%M")
                 if when
                 else "时间不详"
             )
-            msg["content"][i] = {
-                "type": "text",
-                "text": f"[图片 #{pid} · {stamp} · 已折叠，需要重新看就用 recall_photo]",
-            }
+            bits = [f"图片 #{pid or '?'}", stamp]
+            # 优先用角色自己存过的描述，它是靠内容检索的唯一依据
+            if pid and desc.get(pid):
+                bits.append(desc[pid])
+            # 没有描述时退而求其次，用发图时说的那句话
+            elif said := self._msg_own_text(msg):
+                who = "他" if msg.get("role") == "user" else "你"
+                bits.append(f"{who}当时说「{said[:60]}」")
+            bits.append("已折叠")
+            msg["content"][i] = {"type": "text", "text": "[" + " · ".join(bits) + "]"}
             pruned += 1
 
         if pruned:
@@ -256,31 +267,139 @@ class TgPresence(Star):
                 f"[tg_presence] 上下文图片瘦身：折叠 {pruned} 张，保留最近 {keep} 张"
             )
 
-    def _stash_photo(self, data_url: str, store: Path, index: dict) -> str:
-        """把 base64 图片存盘并登记编号。已存过的直接复用编号。"""
-        hit = DATA_URL_RE.match(data_url.strip())
-        if not hit:
-            return "?"
-        b64 = hit.group("b64")
-        # 必须用稳定哈希：内置 hash() 对字符串每次进程启动都不同，
-        # 重启后同一张图会被当成新图重复存盘
-        key = hashlib.sha256(b64.encode()).hexdigest()[:16]
-        if key in index:
-            return index[key]
+    @staticmethod
+    def _msg_own_text(msg: dict) -> str:
+        """取消息自己的正文，排除 AstrBot 注入的 system_reminder 和已有占位。"""
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        bits = []
+        for part in content:
+            if not (isinstance(part, dict) and part.get("type") == "text"):
+                continue
+            t = (part.get("text") or "").strip()
+            if not t or "<system_reminder>" in t or t.startswith("[图片 #"):
+                continue
+            bits.append(t)
+        return " ".join(bits)
 
-        pid = str(len(index) + 1)
+    @staticmethod
+    def _photo_key(data_url: str) -> str | None:
+        """图片的稳定标识。
+
+        必须用 sha256：内置 hash() 对字符串每次进程启动都不同，
+        重启后同一张图会被当成新图。
+        """
+        hit = DATA_URL_RE.match((data_url or "").strip())
+        if not hit:
+            return None
+        return hashlib.sha256(hit.group("b64").encode()).hexdigest()[:16]
+
+    def _photo_id(self, data_url: str) -> str | None:
+        """给图片分配（或取回）一个短编号。第一次见到就登记。"""
+        key = self._photo_key(data_url)
+        if key is None:
+            return None
+        index = self.state.setdefault("photo_index", {})
+        if key not in index:
+            index[key] = str(len(index) + 1)
+        return index[key]
+
+    def _stash_photo(self, data_url: str, store: Path) -> str | None:
+        """把 base64 图片解码存盘，返回编号。已存过的直接复用。"""
+        pid = self._photo_id(data_url)
+        if pid is None:
+            return None
+        paths = self.state.setdefault("photo_paths", {})
+        if pid in paths and Path(paths[pid]).exists():
+            return pid
+
+        hit = DATA_URL_RE.match(data_url.strip())
         ext = hit.group("ext").split("+")[0]
         if ext == "jpeg":
             ext = "jpg"
         path = store / f"{pid}.{ext}"
         try:
-            path.write_bytes(base64.b64decode(b64))
+            path.write_bytes(base64.b64decode(hit.group("b64")))
         except (binascii.Error, ValueError, OSError) as e:
             logger.warning(f"[tg_presence] 折叠图片存盘失败 #{pid}: {e}")
-            return "?"
-        index[key] = pid
-        self.state.setdefault("photo_paths", {})[pid] = str(path)
+            return None
+        paths[pid] = str(path)
         return pid
+
+    # ----------------------------------------------------- 让角色自己描述图片
+
+    @filter.on_llm_request(priority=-40)
+    async def ask_for_descriptions(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """把上下文里还没有描述的图片列出来，请角色在这次回复里顺带描述。
+
+        比折叠时另起一次视觉调用便宜得多，而且此刻她正看着图、
+        也知道当时聊的是什么，描述会带上她自己的视角。
+        """
+        if not self.conf.get("describe_images", True):
+            return
+
+        desc = self.state.get("photo_desc") or {}
+        pending: list[str] = []
+        for msg in req.contexts or []:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not (isinstance(part, dict) and part.get("type") == "image_url"):
+                    continue
+                pid = self._photo_id((part.get("image_url") or {}).get("url") or "")
+                if pid and pid not in desc and pid not in pending:
+                    pending.append(pid)
+
+        if not pending:
+            return
+        self._save_state()  # 编号是刚分配的，落盘
+
+        ids = "、".join(f"#{p}" for p in pending)
+        self._inject_text(
+            req,
+            "<describe_images>\n"
+            f"上下文里这几张图还没有存过描述：{ids}\n"
+            "请在这次回复的最末尾，为每张各写一条：\n"
+            '  <img_note id="编号">这张图是什么</img_note>\n'
+            "按图片在对话里出现的先后顺序对应编号。描述要具体到能靠它认出这张图——\n"
+            "画面内容、谁拍的、什么场合，用你自己的说法就行。\n"
+            "这几行会被系统抽走存档，对方看不到，也不算进你的回复。\n"
+            "正常说你的话，把这些附在最后即可。\n"
+            "</describe_images>",
+        )
+        logger.debug(f"[tg_presence] 请求描述图片 {ids}")
+
+    @filter.on_llm_response()
+    async def capture_descriptions(self, event: AstrMessageEvent, resp):
+        """抽出 <img_note> 存档，并从要发出去的内容里剥掉。"""
+        if not self.conf.get("describe_images", True):
+            return
+        chain = getattr(getattr(resp, "result_chain", None), "chain", None)
+        if not chain:
+            return
+
+        desc = self.state.setdefault("photo_desc", {})
+        found = 0
+        for comp in chain:
+            text = getattr(comp, "text", None)
+            if not isinstance(text, str) or "<img_note" not in text:
+                continue
+            for hit in IMG_NOTE_RE.finditer(text):
+                body = hit.group("desc").strip()
+                if body:
+                    desc[hit.group("id")] = body[:200]
+                    found += 1
+            comp.text = IMG_NOTE_RE.sub("", text).strip()
+
+        if found:
+            self._save_state()
+            logger.info(f"[tg_presence] 收到 {found} 条图片描述")
 
     @filter.llm_tool(name="recall_photo")
     async def recall_photo(self, event: AstrMessageEvent, photo_id: str):

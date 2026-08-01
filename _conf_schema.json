@@ -74,6 +74,14 @@
     "hint": "签名是资料页上那句会变的话（setMyShortDescription，120 字符以内），点开 bot 头像就能看到。填 0 表示不限制。"
   },
 
+  "describe_images": {
+    "description": "让角色自己描述图片",
+    "type": "bool",
+    "default": true,
+    "hint": "上下文里出现还没存过描述的图片时，请角色在这次回复末尾附一段 <img_note> 描述。这段会被插件抽走存档、不会发给用户。折叠后的占位就靠这段描述做内容检索——用户说「黑丝足底那张」时，角色才能对应到编号。不额外调模型，跟正文一次生成。",
+    "obvious_hint": true
+  },
+
   "max_context_images": {
     "description": "上下文里最多保留几张真图",
     "type": "int",
