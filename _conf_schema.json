@@ -1,0 +1,97 @@
+{
+  "channel_id": {
+    "description": "动态频道 ID",
+    "type": "string",
+    "default": "",
+    "hint": "角色发动态的目标 Telegram 频道。私密频道填数字 ID（-100 开头），公开频道可填 @频道用户名。留空则禁用发动态功能。获取方法：从频道转发一条消息给 @userinfobot。",
+    "obvious_hint": true
+  },
+
+  "post_cooldown_minutes": {
+    "description": "发动态最短间隔（分钟）",
+    "type": "int",
+    "default": 180,
+    "hint": "两条动态之间至少间隔多久。填 0 表示不限制。"
+  },
+  "post_daily_limit": {
+    "description": "每日动态条数上限",
+    "type": "int",
+    "default": 5,
+    "hint": "按角色所在时区的自然日计算。填 0 表示不限制。"
+  },
+
+  "inject_history": {
+    "description": "注入历史动态文字",
+    "type": "bool",
+    "default": true,
+    "hint": "每次对话前把角色发过的全部动态文字注入上下文，让她记得自己发过什么、避免重复。"
+  },
+  "inject_history_limit": {
+    "description": "注入动态条数上限",
+    "type": "int",
+    "default": 0,
+    "hint": "只注入最近 N 条。填 0 表示注入全部（1M 上下文足够）。"
+  },
+  "inject_history_images": {
+    "description": "同时注入动态配图",
+    "type": "bool",
+    "default": false,
+    "hint": "除文字外，把动态的配图也一并送进上下文。会显著增加 token 消耗和首字延迟，且依赖模型的多模态能力。"
+  },
+  "inject_images_limit": {
+    "description": "注入配图张数上限",
+    "type": "int",
+    "default": 10,
+    "hint": "仅在上一项开启时生效，取最近 N 张。填 0 表示不限制（不建议）。"
+  },
+
+  "moment_photo_dir": {
+    "description": "动态配图目录",
+    "type": "string",
+    "default": "",
+    "hint": "存放动态配图的目录，绝对路径。目录下可再建子文件夹作为分类，子文件夹名即角色调用时可指定的分类名。留空则动态只能发纯文字。",
+    "obvious_hint": true
+  },
+
+  "avatar_dir": {
+    "description": "候选头像目录",
+    "type": "string",
+    "default": "",
+    "hint": "存放候选头像的目录，绝对路径。只会读取 .jpg / .jpeg 文件（Telegram 头像接口只收 JPEG）。可建子文件夹作为分类。留空则禁用换头像功能。",
+    "obvious_hint": true
+  },
+  "avatar_cooldown_minutes": {
+    "description": "换头像最短间隔（分钟）",
+    "type": "int",
+    "default": 720,
+    "hint": "Telegram 官方未公布该接口的频率上限，间隔太短可能触发限流。填 0 表示不限制。"
+  },
+
+  "bio_cooldown_minutes": {
+    "description": "改简介最短间隔（分钟）",
+    "type": "int",
+    "default": 360,
+    "hint": "填 0 表示不限制。"
+  },
+
+  "enable_reaction": {
+    "description": "启用表情回应",
+    "type": "bool",
+    "default": true,
+    "hint": "允许角色对你的消息打表情，作为轻量的非文字回应。"
+  },
+
+  "timezone": {
+    "description": "时区",
+    "type": "string",
+    "default": "Asia/Shanghai",
+    "hint": "IANA 时区名，用于计算「每日上限」的自然日边界和动态时间戳显示。"
+  },
+
+  "admin_only_commands": {
+    "description": "手动指令仅管理员可用",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后任何人都能用 /moment /avatar /bio 指令操作这个 bot 的资料。这些资料是全局生效的，建议保持开启。"
+  }
+}

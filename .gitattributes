@@ -1,0 +1,4 @@
+# 插件跑在 Linux 容器里，仓库统一存 LF
+* text=auto eol=lf
+*.png binary
+*.jpg binary
