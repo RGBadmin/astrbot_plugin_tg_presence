@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -105,7 +105,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.20.0",
+    "0.20.1",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -676,12 +676,14 @@ class TgPresence(Star):
 
     def gallery_stat(self) -> dict:
         db = self.db()
+        # 别名一律加双引号：indexed 是 SQLite 保留字（INDEXED BY），
+        # 裸着写会被当成子句开头，直接语法错误
         row = db.execute(
-            "SELECT COUNT(*) total,"
-            " SUM(descr IS NOT NULL) indexed,"
-            " SUM(descr IS NULL AND fails < ?) pending,"
-            " SUM(descr IS NULL AND fails >= ?) stuck,"
-            " SUM(sent) sent"
+            'SELECT COUNT(*) AS "total",'
+            ' SUM(descr IS NOT NULL) AS "indexed",'
+            ' SUM(descr IS NULL AND fails < ?) AS "pending",'
+            ' SUM(descr IS NULL AND fails >= ?) AS "stuck",'
+            ' SUM(sent) AS "sent"'
             " FROM photos",
             (VISION_MAX_FAILS, VISION_MAX_FAILS),
         ).fetchone()
