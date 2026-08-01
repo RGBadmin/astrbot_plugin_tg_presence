@@ -23,12 +23,16 @@ SIGNATURE_MAX = 120  # setMyShortDescription 的上限
 STAMP_FMT = "[%m-%d %H:%M]"
 STAMP_RE = re.compile(r"^\[\d{2}-\d{2} \d{2}:\d{2}\]")
 
+# AstrBot 把当前时间写进 user 消息正文（astr_main_agent.py:980），
+# 这是历史里唯一可靠的时间锚点，用来给动态定位插入点
+CTX_TIME_RE = re.compile(r"Current datetime:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
+
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情",
-    "0.4.0",
+    "0.5.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -268,32 +272,104 @@ class TgPresence(Star):
         limit = int(self.conf.get("inject_history_limit", 0) or 0)
         selected = moments[-limit:] if limit > 0 else moments
 
-        tz = self._tz()
-        lines = []
-        for m in selected:
-            stamp = datetime.fromtimestamp(m["ts"], tz).strftime("%m-%d %H:%M")
-            n = len(self._moment_photos(m))
-            mark = f"[配图 {n} 张] " if n else ""
-            tail = "  ← 这条你发的时候没跟他提" if m.get("quiet") else ""
-            lines.append(f"{stamp} {mark}{m['text']}{tail}")
+        placed = self._interleave_moments(req, selected)
 
-        block = (
+        self._inject_text(
+            req,
             "<your_own_moments>\n"
-            "以下是你已经发到自己频道的全部动态，按时间先后排列。\n"
-            "这些都是你自己发的，你记得它们——包括配图是什么、当时为什么发。\n"
-            "如果对方提起某条动态或者你们聊到相关的事，你是知道来龙去脉的，\n"
-            "不要表现得像第一次看到。也不要重复发内容相近的动态。\n\n"
-            "标着「没跟他提」的那几条，是你发的时候故意没在聊天里说的。\n"
-            "他要是自己刷到来问，你可以说、可以敷衍、也可以过阵子再说——\n"
-            "看你当时什么心情，但要记得自己一直是知情的那个。\n\n"
-            + "\n".join(lines)
-            + "\n</your_own_moments>"
+            "你发过的动态以【我发了条动态】的形式出现在对话时间线里，按实际时间插在当时的位置。\n"
+            "那些都是你自己发的，你记得内容、配图和当时为什么发，也知道前后正在聊什么。\n"
+            "对方提起时不要表现得像第一次看到，也不要重复发内容相近的动态。\n\n"
+            "标着「当时没跟他提」的，是你发的时候故意没在聊天里说的。\n"
+            "他要是自己刷到来问，说不说、什么时候说，看你当时心情——\n"
+            "但你一直是知情的那个。\n"
+            "</your_own_moments>",
         )
-        where = self._inject_text(req, block)
-        logger.info(
-            f"[tg_presence] 已注入 {len(selected)} 条历史动态"
-            f"（{len(block)} 字符 → {where}），最后一条：{selected[-1]['text'][:30]}"
-        )
+        logger.info(f"[tg_presence] 已把 {placed}/{len(selected)} 条动态插入时间线")
+
+        if not self.conf.get("inject_history_images", False):
+            return
+
+        img_limit = int(self.conf.get("inject_images_limit", 10) or 0)
+        paths = [p for m in selected for p in self._moment_photos(m)]
+        if img_limit > 0:
+            paths = paths[-img_limit:]
+        for raw in paths:
+            path = Path(raw)
+            if not path.exists():
+                continue
+            try:
+                req.image_urls.append(path.as_uri())
+            except Exception as e:
+                logger.warning(f"[tg_presence] 配图注入失败 {path}: {e}")
+
+    def _interleave_moments(self, req: ProviderRequest, moments: list[dict]) -> int:
+        """把动态按时间插进 req.contexts 的对应位置，返回插入条数。
+
+        插入项带 "_no_save": True —— bind_checkpoint_messages 会读这个 key
+        (agent/message.py:338-339)，所以只发给模型、不写进对话历史。
+        每次请求重新编排，不会重复堆积，也不怕 /new 之后历史被清空。
+        """
+        pending = sorted(moments, key=lambda m: m["ts"])
+        if not pending:
+            return 0
+
+        merged: list[dict] = []
+        idx = 0
+        for msg in req.contexts or []:
+            when = self._context_time(msg)
+            if when is not None:
+                while idx < len(pending) and pending[idx]["ts"] < when:
+                    merged.append(self._moment_entry(pending[idx]))
+                    idx += 1
+            merged.append(msg)
+
+        # 比所有历史消息都新的，排在最后
+        while idx < len(pending):
+            merged.append(self._moment_entry(pending[idx]))
+            idx += 1
+
+        req.contexts = merged
+        return len(pending)
+
+    def _moment_entry(self, moment: dict) -> dict:
+        """把一条动态渲染成时间线里的一个事件。"""
+        stamp = datetime.fromtimestamp(moment["ts"], self._tz()).strftime(STAMP_FMT)
+        bits = [f"{stamp}【我发了条动态】{moment['text']}"]
+        n = len(self._moment_photos(moment))
+        if n:
+            bits.append(f"配图 {n} 张")
+        if moment.get("quiet"):
+            bits.append("当时没跟他提")
+        return {"role": "assistant", "content": " · ".join(bits), "_no_save": True}
+
+    def _context_time(self, msg: dict) -> float | None:
+        """解析一条历史消息的时间。
+
+        只认 user 消息正文里的 Current datetime —— assistant 那侧的
+        [MM-DD HH:MM] 不带年份，跨年会错，不值得为它冒险。
+        """
+        if msg.get("role") != "user":
+            return None
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                p.get("text") or ""
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            return None
+        hit = CTX_TIME_RE.search(text)
+        if not hit:
+            return None
+        try:
+            naive = datetime.strptime(hit.group(1), "%Y-%m-%d %H:%M")
+            return naive.replace(tzinfo=self._tz()).timestamp()
+        except (ValueError, TypeError):
+            return None
 
     @staticmethod
     def _inject_text(req: ProviderRequest, block: str) -> str:
