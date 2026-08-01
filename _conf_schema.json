@@ -82,24 +82,57 @@
     "obvious_hint": true
   },
 
-  "vision_provider_id": {
-    "description": "独立视觉模型 ID",
+  "vision_base_url": {
+    "description": "视觉 API 接口地址",
     "type": "string",
     "default": "",
-    "hint": "填「服务提供商」页面里某个提供商的 ID（不是模型名），建议单独配一个便宜的多模态模型（Gemini Flash、qwen-vl 之类）。图片首次进入上下文时会异步调它做一次详细解析，结果存进 vision.json，不占对话上下文。角色自己写的那句描述是「目录」，这份解析是「详情」——检索时两层都搜。留空则不启用，只靠角色自己的描述。",
+    "hint": "OpenAI 兼容接口。填到 /v1 即可（如 https://api.openai.com/v1），也可以填完整的 /v1/chat/completions，两种都认。这套配置独立于 AstrBot 的服务提供商——主对话模型贵、这个便宜，本来就不该共用。三项必填（地址、Key、模型 ID）齐了才启用。",
+    "obvious_hint": true
+  },
+  "vision_api_key": {
+    "description": "视觉 API Key",
+    "type": "string",
+    "default": "",
+    "hint": "以 Bearer 方式发送。",
+    "obvious_hint": true
+  },
+  "vision_model": {
+    "description": "视觉模型 ID",
+    "type": "string",
+    "default": "",
+    "hint": "请求里 model 字段的值，例如 gemini-2.5-flash、qwen-vl-max、gpt-4o-mini。必须是支持图片输入的多模态模型。",
+    "obvious_hint": true
+  },
+  "vision_context_window": {
+    "description": "视觉模型上下文窗口",
+    "type": "int",
+    "default": 128000,
+    "hint": "该模型的上下文窗口大小。插件用它校验「最大输出长度」是否合理——输出上限接近窗口的话图片就塞不进去了，会自动压到窗口的四分之一并记一条警告。这个值不会发给 API。"
+  },
+  "vision_max_tokens": {
+    "description": "最大输出长度",
+    "type": "int",
+    "default": 1024,
+    "hint": "请求里的 max_tokens。解析一张图 1024 通常够用；模型经常被这个值截断的话再往上调。"
+  },
+  "vision_system_prompt": {
+    "description": "视觉系统提示词",
+    "type": "text",
+    "default": "",
+    "hint": "作为 system 角色发送。留空用内置的（要求只输出客观描述、不加开场白和免责声明）。模型总是拒答或者总在描述前后加废话时，改这里。",
     "obvious_hint": true
   },
   "vision_prompt": {
     "description": "视觉解析提示词",
     "type": "text",
     "default": "",
-    "hint": "留空用内置提示词（要求覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围，并强调名词要具体）。这段解析只进档案、不发给任何人，写得越细检索越准。"
+    "hint": "作为 user 消息和图片一起发送。留空用内置提示词（要求覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围，并强调名词要具体）。这段解析只进档案、不发给任何人，写得越细检索越准。"
   },
   "vision_max_chars": {
     "description": "细节记录最长字数",
     "type": "int",
     "default": 600,
-    "hint": "超出部分截断。这份记录只在角色主动 inspect_photo 时才进上下文，可以放宽些。"
+    "hint": "存档时按这个长度截断，是对模型实际输出的兜底。这份记录只在角色主动 inspect_photo 时才进上下文，可以放宽些。"
   },
   "vision_concurrency": {
     "description": "视觉解析并发数",

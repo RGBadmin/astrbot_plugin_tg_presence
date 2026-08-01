@@ -3,6 +3,7 @@ import base64
 import binascii
 import hashlib
 import json
+import mimetypes
 import random
 import re
 import shutil
@@ -10,6 +11,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -38,6 +41,11 @@ IMG_NOTE_RE = re.compile(
     r"<img_note\s+id=[\"']?#?(?P<id>\w+)[\"']?\s*>(?P<desc>.*?)</img_note>", re.S
 )
 
+DEFAULT_VISION_SYSTEM = (
+    "你是图像标注助手。只输出对画面的客观描述，"
+    "不做评价、不加开场白、不加免责声明、不复述这段要求。"
+)
+
 DEFAULT_VISION_PROMPT = (
     "详细描述这张图片，供以后按内容检索用。请覆盖：\n"
     "1. 画面主体是什么，人物的姿态、衣着、配饰（材质和颜色都要写）\n"
@@ -50,13 +58,14 @@ DEFAULT_VISION_PROMPT = (
 
 # 视觉解析连续失败这么多次就不再自动重试，避免坏图无限撞 API
 VISION_MAX_FAILS = 3
+VISION_TIMEOUT = 120  # 秒。图片请求比纯文本慢，给宽裕些
 
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.9.0",
+    "0.10.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -390,8 +399,39 @@ class TgPresence(Star):
 
     # --------------------------------------------------------- 独立视觉 API 层
 
-    def _vision_provider_id(self) -> str:
-        return (self.conf.get("vision_provider_id") or "").strip()
+    def _vision_conf(self) -> dict | None:
+        """视觉 API 的配置。三项必填齐了才算配好，否则返回 None。"""
+        base = (self.conf.get("vision_base_url") or "").strip().rstrip("/")
+        key = (self.conf.get("vision_api_key") or "").strip()
+        model = (self.conf.get("vision_model") or "").strip()
+        if not (base and key and model):
+            return None
+        # 允许填到 /v1 也允许填全 —— 两种写法都常见，别让人猜
+        if not base.endswith("/chat/completions"):
+            base += "/chat/completions"
+
+        window = max(1024, int(self.conf.get("vision_context_window", 128000) or 128000))
+        out = max(64, int(self.conf.get("vision_max_tokens", 1024) or 1024))
+        if out >= window:
+            # 输出上限吃掉整个窗口的话，图片根本塞不进去
+            out = max(64, window // 4)
+            logger.warning(
+                f"[tg_presence] 最大输出长度不能接近上下文窗口，已压到 {out}"
+            )
+        return {
+            "url": base,
+            "key": key,
+            "model": model,
+            "window": window,
+            "max_tokens": out,
+            "system": (self.conf.get("vision_system_prompt") or "").strip()
+            or DEFAULT_VISION_SYSTEM,
+            "prompt": (self.conf.get("vision_prompt") or "").strip()
+            or DEFAULT_VISION_PROMPT,
+        }
+
+    def _vision_ready(self) -> bool:
+        return self._vision_conf() is not None
 
     def _gate(self) -> asyncio.Semaphore:
         """并发闸。懒创建——插件 __init__ 时不一定已经有事件循环。"""
@@ -414,7 +454,7 @@ class TgPresence(Star):
         这样那两步拿到的编号都是这里分配好的。
         """
         # 存盘只为两件事：折叠后能取回、给视觉模型读。都不需要就别占磁盘
-        if not self._vision_provider_id() and (
+        if not self._vision_ready() and (
             int(self.conf.get("max_context_images", 0) or 0) <= 0
         ):
             return
@@ -446,7 +486,7 @@ class TgPresence(Star):
 
     def _dispatch_vision(self, pids: list[str]) -> int:
         """给还没有详解的图派发解析任务。返回派了几个。"""
-        if not self._vision_provider_id():
+        if not self._vision_ready():
             return 0
         paths = self.state.get("photo_paths") or {}
         fails = self.state.get("vision_fail") or {}
@@ -471,34 +511,90 @@ class TgPresence(Star):
             logger.debug(f"[tg_presence] 派发 {n} 张图的视觉解析")
         return n
 
+    @staticmethod
+    def _data_url(path: str) -> str | None:
+        """把本地图片读成 data URL。
+
+        远端 API 拿不到本机路径，必须把图片本身带上。
+        """
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as e:
+            logger.warning(f"[tg_presence] 读不到图片 {path}: {e}")
+            return None
+        mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+        return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+
+    def _note_fail(self, pid: str, why: str) -> None:
+        fails = self.state.setdefault("vision_fail", {})
+        fails[pid] = fails.get(pid, 0) + 1
+        self._save_state()
+        logger.warning(
+            f"[tg_presence] 视觉解析 #{pid} 失败"
+            f"（第 {fails[pid]} 次，满 {VISION_MAX_FAILS} 次后不再自动重试）：{why}"
+        )
+
     async def _vision_describe(self, pid: str, path: str) -> bool:
-        """调独立视觉模型解析一张图，存进详解档案。"""
-        provider_id = self._vision_provider_id()
-        if not provider_id:
+        """调独立视觉 API 解析一张图，存进详解档案。
+
+        走 OpenAI 兼容的 /chat/completions，配置全在插件自己这儿，
+        跟 AstrBot 的服务提供商互不干扰 —— 主对话模型贵、这个便宜，
+        本来就不该共用一套配置。
+        """
+        cfg = self._vision_conf()
+        if not cfg:
             return False
 
         async with self._gate():
             if pid in self.vision:  # 排队期间已经被别的任务做掉了
                 return True
-            try:
-                resp = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=self.conf.get("vision_prompt") or DEFAULT_VISION_PROMPT,
-                    image_urls=[Path(path).as_uri()],
-                )
-            except Exception as e:
-                fails = self.state.setdefault("vision_fail", {})
-                fails[pid] = fails.get(pid, 0) + 1
-                self._save_state()
-                logger.warning(
-                    f"[tg_presence] 视觉解析 #{pid} 失败"
-                    f"（第 {fails[pid]} 次，满 {VISION_MAX_FAILS} 次后不再自动重试）: {e}"
-                )
+
+            data_url = self._data_url(path)
+            if not data_url:
+                self._note_fail(pid, "图片读不出来")
                 return False
 
-        text = self._resp_text(resp)
+            payload = {
+                "model": cfg["model"],
+                "messages": [
+                    {"role": "system", "content": cfg["system"]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": cfg["prompt"]},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    },
+                ],
+                "max_tokens": cfg["max_tokens"],
+            }
+            headers = {
+                "Authorization": f"Bearer {cfg['key']}",
+                "Content-Type": "application/json",
+            }
+
+            try:
+                timeout = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
+                async with aiohttp.ClientSession(timeout=timeout) as sess:
+                    async with sess.post(
+                        cfg["url"], json=payload, headers=headers
+                    ) as r:
+                        body = await r.text()
+                        if r.status != 200:
+                            # 带上响应体，光看状态码查不出是 key 错还是模型名错
+                            self._note_fail(pid, f"HTTP {r.status} {body[:300]}")
+                            return False
+                        data = json.loads(body)
+            except asyncio.TimeoutError:
+                self._note_fail(pid, f"超时（{VISION_TIMEOUT} 秒）")
+                return False
+            except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
+                self._note_fail(pid, f"{type(e).__name__}: {e}")
+                return False
+
+        text = self._resp_text(data)
         if not text:
-            logger.warning(f"[tg_presence] 视觉解析 #{pid} 返回空内容")
+            self._note_fail(pid, "返回内容为空，可能是模型拒答或触发了内容过滤")
             return False
 
         limit = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
@@ -510,18 +606,29 @@ class TgPresence(Star):
         return True
 
     @staticmethod
-    def _resp_text(resp) -> str:
-        """从 LLMResponse 里取纯文本，兼容不同版本的字段。"""
-        text = (getattr(resp, "completion_text", None) or "").strip()
-        if text:
-            return text
-        chain = getattr(getattr(resp, "result_chain", None), "chain", None) or []
-        bits = [
-            t.strip()
-            for c in chain
-            if isinstance(t := getattr(c, "text", None), str) and t.strip()
-        ]
-        return " ".join(bits)
+    def _resp_text(data: dict) -> str:
+        """从 OpenAI 兼容响应里取正文。
+
+        content 可能是字符串，也可能是分块列表（部分网关这么返）；
+        推理模型的 reasoning_content 不要，那是思考过程不是描述。
+        """
+        try:
+            msg = data["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError):
+            return ""
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            bits = [
+                t.strip()
+                for part in content
+                if isinstance(part, dict)
+                and isinstance(t := part.get("text"), str)
+                and t.strip()
+            ]
+            return " ".join(bits)
+        return ""
 
     # ----------------------------------------------------- 让角色自己描述图片
 
@@ -555,7 +662,7 @@ class TgPresence(Star):
         self._save_state()  # 编号是刚分配的，落盘
 
         ids = "、".join(f"#{p}" for p in pending)
-        has_vision = bool(self._vision_provider_id())
+        has_vision = self._vision_ready()
         # 有独立视觉层时，她这句话只负责「认出是哪张」，细节交给系统记，
         # 所以要求写一句就够；没有视觉层时这句是唯一的检索依据，得写全
         if has_vision:
@@ -1319,37 +1426,68 @@ class TgPresence(Star):
             lines.append(
                 f"图片存档：{len(paths)} 张 · 她记的描述 {desc_n} 条 · "
                 f"画面细节 {len(self.vision)} 条"
-                + ("" if self._vision_provider_id() else "（未配视觉模型）")
+                + ("" if self._vision_ready() else "（未配视觉 API）")
             )
         yield event.plain_result("\n".join(lines))
 
     @filter.command("vision")
     async def cmd_vision(self, event: AstrMessageEvent, arg: str = ""):
-        """给还没有细节记录的存量图片补做视觉解析。用法：/vision [张数|retry]"""
+        """给还没有细节记录的存量图片补做视觉解析。用法：/vision [张数|retry|test]"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。")
             return
 
-        provider_id = self._vision_provider_id()
-        if not provider_id:
-            yield event.plain_result(
-                "没配视觉模型。到插件配置里填「独立视觉模型 ID」——"
-                "填的是服务提供商的 ID，不是模型名。"
-            )
-            return
-        if self.context.get_provider_by_id(provider_id) is None:
-            avail = [
-                getattr(p, "provider_config", {}).get("id", "?")
-                for p in self.context.get_all_providers()
+        cfg = self._vision_conf()
+        if not cfg:
+            missing = [
+                label
+                for key, label in (
+                    ("vision_base_url", "接口地址"),
+                    ("vision_api_key", "API Key"),
+                    ("vision_model", "模型 ID"),
+                )
+                if not (self.conf.get(key) or "").strip()
             ]
             yield event.plain_result(
-                f"找不到 ID 为 {provider_id} 的服务提供商。\n"
-                f"当前可用：{'、'.join(avail) or '（无）'}"
+                f"视觉 API 还没配全，缺：{'、'.join(missing)}。\n"
+                "在插件配置的「独立视觉 API」几项里填。"
             )
             return
 
         arg = arg.strip().lower()
+        paths_all = self.state.get("photo_paths") or {}
+
+        if arg == "test":
+            # 拿一张真图跑一次完整请求。配置错了这里能立刻看出是哪一步错
+            sample = next(
+                (p for p in reversed(list(paths_all.values())) if Path(p).exists()),
+                None,
+            )
+            if not sample:
+                yield event.plain_result(
+                    "还没存过任何图片，没法测。先在聊天里发一张图再来。"
+                )
+                return
+            yield event.plain_result(
+                f"用 {cfg['model']} 试跑一张：\n{cfg['url']}"
+            )
+            probe = "__test__"
+            self.vision.pop(probe, None)
+            ok = await self._vision_describe(probe, sample)
+            if ok:
+                got = self.vision.pop(probe, "")
+                self._save_vision()
+                yield event.plain_result(f"通了。返回 {len(got)} 字：\n{got[:300]}")
+            else:
+                (self.state.get("vision_fail") or {}).pop(probe, None)
+                self._save_state()
+                yield event.plain_result(
+                    "没通。日志里搜 `视觉解析 #__test__ 失败` 看具体原因："
+                    "401 是 key 错，404 多半是接口地址或模型 ID 错，400 看返回的报错正文。"
+                )
+            return
+
         if arg == "retry":
             self.state["vision_fail"] = {}
             self._save_state()
