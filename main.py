@@ -95,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.13.4",
+    "0.14.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1965,13 +1965,16 @@ class TgPresence(Star):
             return "这条指令只能在控制台那个 bot 里发——在这儿发等于当着他的面喊话。"
         target = (self.state.get("director_target") or "").strip()
         if not target:
-            return "还没绑定目标会话。先去角色那边的私聊里发一次 /link。"
+            return (
+                "还没绑定目标会话。\n"
+                "在这儿发：/link 角色机器人名称:FriendMessage:会话ID"
+            )
         if self._umo_platform(target) == did:
-            # 在填控制台名称之前跑过 /link 就会绑成这样：目标是控制台自己，
-            # 消息发回控制台、历史也写进控制台的会话，角色那边什么都没有
+            # 目标是控制台自己的话，消息会发回控制台、历史也写进控制台的会话，
+            # 角色那边什么都没有，但看着像成功了
             return (
                 f"投递目标绑到控制台自己了：\n{target}\n\n"
-                "到角色那个 bot 的私聊里重发一次 /link。"
+                "重新绑：/link 角色机器人名称:FriendMessage:会话ID"
             )
         return None
 
@@ -2100,6 +2103,15 @@ class TgPresence(Star):
             f"会话 UMO：{umo}",
         ]
 
+        # 这个会话实际路由到哪份配置文件 —— WebUI 打开的默认是 default，
+        # 多配置文件时最容易改错地方，所以直接把文件名报出来
+        conf_name, conf_path = "", ""
+        try:
+            info = self.context.astrbot_config_mgr.get_conf_info(umo)
+            conf_name, conf_path = info.get("name", ""), info.get("path", "")
+        except Exception as e:
+            logger.debug(f"[tg_presence] 取配置文件信息失败: {e}")
+
         try:
             admins = self.context.get_config(umo=umo).get("admins_id", []) or []
         except Exception as e:
@@ -2107,10 +2119,15 @@ class TgPresence(Star):
             yield event.plain_result("\n".join(lines))
             return
 
+        if conf_name:
+            lines.append(f"\n这个会话用的配置文件：{conf_name}")
+            if conf_path:
+                lines.append(f"  文件：{conf_path}")
+        lines.append(f"里面的 admins_id 共 {len(admins)} 项")
+
         # 逐字复刻 WakingCheckStage 的判定：str(sender_id) == admin_id
         exact = [a for a in admins if sid == a]
         loose = [a for a in admins if str(a).strip() == sid]
-        lines.append(f"\n这个会话的 admins_id 共 {len(admins)} 项")
 
         if exact:
             lines.append("✅ 精确匹配成功，你在这份名单里")
@@ -2122,66 +2139,116 @@ class TgPresence(Star):
             bad = loose[0]
             lines.append(
                 f"⚠️ 名单里有你的 ID，但存成了 {type(bad).__name__} 类型：{bad!r}\n"
-                'AstrBot 比的是字符串，必须是带引号的 "'
-                + sid
-                + '"，不能是纯数字、也不能带空格。'
+                'AstrBot 比的是字符串，必须是带引号的 "' + sid + '"，'
+                "不能是纯数字、也不能带空格。"
             )
         else:
             lines.append(
-                "❌ 你的 ID 不在这份名单里。\n"
-                "注意 admins_id 是按**配置文件**读的——这个会话路由到的那份没填你，"
-                "在别的配置文件里填了不算。"
+                f"❌ 你的 ID 不在这份名单里。\n"
+                f"要改的是上面那份「{conf_name or '当前'}」，"
+                "不是 WebUI 打开时默认显示的那份——多配置文件时这俩经常不是同一个。"
             )
         yield event.plain_result("\n".join(lines))
 
+    async def _peek_conversation(self, umo: str) -> tuple[bool, int]:
+        """看一眼目标会话有没有对话、有多少条。用来当场识破 UMO 填错。"""
+        try:
+            cm = self.context.conversation_manager
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return False, 0
+            conv = await cm.get_conversation(umo, cid)
+            if not conv:
+                return False, 0
+            history = json.loads(conv.history or "[]")
+            return True, len(history) if isinstance(history, list) else 0
+        except Exception as e:
+            logger.debug(f"[tg_presence] 探查会话失败 {umo}: {e}")
+            return False, 0
+
     @filter.command("link")
-    async def cmd_link(self, event: AstrMessageEvent, action: str = ""):
-        """在角色的会话里执行，把这个会话设为导演指令的投递目标。/link show 查看当前绑定。"""
+    async def cmd_link(self, event: AstrMessageEvent, target: str = ""):
+        """在控制台里绑定投递目标。用法：/link <UMO>，或 /link show 查看当前绑定。"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
 
-        umo = event.unified_msg_origin
         here = self._platform_of(event)
         did = self._director_id()
         cur = (self.state.get("director_target") or "").strip()
+        arg = (target or "").strip()
 
-        if action.strip().lower() in ("show", "status"):
+        if not arg or arg.lower() in ("show", "status"):
             lines = [
-                f"这个会话：{umo}",
                 f"投递目标：{cur or '（未绑定）'}",
                 f"控制台：  {did or '（未配置）'}",
+                f"这个会话：{event.unified_msg_origin}",
             ]
-            if cur and did and self._umo_platform(cur) == did:
-                lines.append("\n⚠️ 目标绑到控制台自己了，到角色那边重发 /link。")
+            if cur:
+                ok, n = await self._peek_conversation(cur)
+                lines.append(
+                    f"目标会话：{'有对话，历史 ' + str(n) + ' 条' if ok else '⚠️ 查不到对话'}"
+                )
+            lines += [
+                "",
+                "绑定：/link <UMO>",
+                "  例：/link AstrLover:FriendMessage:8338355157",
+                "  UMO = 机器人名称:消息类型:会话ID",
+                "  私聊是 FriendMessage，群聊是 GroupMessage",
+            ]
             yield event.plain_result("\n".join(lines))
             return
 
-        if did and here == did:
+        # 绑定只在控制台做 —— 在角色那边发指令会在你俩的聊天记录里留痕，
+        # 那正是导演模式要避免的事
+        if not did:
             yield event.plain_result(
-                "这里是控制台，绑它没意义。\n"
-                "要在角色那个 bot 的私聊里发 /link——绑定的是她跟你的会话。"
+                "先在插件配置里填「控制台机器人名称」，再来绑定。"
+            )
+            return
+        if here != did:
+            yield event.plain_result(
+                "这条指令只能在控制台那个 bot 里发。\n"
+                "在角色那边发会在你俩的聊天记录里留下一条与剧情无关的消息。"
             )
             return
 
-        self.state["director_target"] = umo
-        self._save_state()
-        msg = [
-            f"已绑定这个会话：\n{umo}",
-            f"（机器人名称：{here}）",
-            "",
-            "之后在控制台那个 bot 里：",
-            "  /say <原话>   她原样发出",
-            "  /act <提示>   她自己组织语言再发",
-        ]
-        if not did:
-            # 没配控制台名称时无从判断这里是不是控制台，只能提醒
-            msg.append(
-                "\n⚠️ 还没填「控制台机器人名称」。如果你此刻是在控制台 bot 里发的这条，"
-                f"那就绑错了——目标该是角色和你的会话，不是 {here}。"
-                "填好配置后到角色那边重发一次，或用 /link show 核对。"
+        try:
+            from astrbot.core.platform.astr_message_event import MessageSesion
+
+            MessageSesion.from_str(arg)  # 只做格式校验
+        except Exception:
+            yield event.plain_result(
+                f"UMO 格式不对：{arg}\n\n"
+                "应该是三段，冒号分隔：\n"
+                "  机器人名称:消息类型:会话ID\n"
+                "  例：AstrLover:FriendMessage:8338355157\n"
+                "私聊填 FriendMessage，群聊填 GroupMessage。"
             )
+            return
+
+        if self._umo_platform(arg) == did:
+            yield event.plain_result(
+                f"这是控制台自己（{did}），绑它没意义。\n"
+                "第一段要填角色那个 bot 的机器人名称。"
+            )
+            return
+
+        ok, n = await self._peek_conversation(arg)
+        self.state["director_target"] = arg
+        self._save_state()
+
+        msg = [f"已绑定：{arg}"]
+        if ok:
+            msg.append(f"目标会话有对话，当前历史 {n} 条 ✅")
+        else:
+            msg.append(
+                "⚠️ 但查不到这个会话的对话记录。\n"
+                "要么 UMO 填错了，要么那个会话还没聊过——"
+                "没有对话的话，/say 发得出去但写不进历史。"
+            )
+        msg += ["", "接下来：", "  /say <原话>   她原样发出", "  /act <提示>   她自己组织语言再发"]
         yield event.plain_result("\n".join(msg))
 
     @filter.command("say")
