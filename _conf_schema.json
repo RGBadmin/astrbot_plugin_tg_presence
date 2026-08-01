@@ -78,15 +78,41 @@
     "description": "让角色自己描述图片",
     "type": "bool",
     "default": true,
-    "hint": "上下文里出现还没存过描述的图片时，请角色在这次回复末尾附一段 <img_note> 描述。这段会被插件抽走存档、不会发给用户。折叠后的占位就靠这段描述做内容检索——用户说「黑丝足底那张」时，角色才能对应到编号。不额外调模型，跟正文一次生成。",
+    "hint": "上下文里出现还没存过描述的图片时，请角色在这次回复末尾附一段 <img_note> 描述。这段会被插件抽走存档、不会发给用户。这是检索的「目录」层——带着她自己的视角和当时的语境（「阿泽加班时拍的」），折叠后的占位显示的就是它。不额外调模型，跟正文一次生成。配了独立视觉模型时会自动只要一句话，细节交给视觉层。",
     "obvious_hint": true
+  },
+
+  "vision_provider_id": {
+    "description": "独立视觉模型 ID",
+    "type": "string",
+    "default": "",
+    "hint": "填「服务提供商」页面里某个提供商的 ID（不是模型名），建议单独配一个便宜的多模态模型（Gemini Flash、qwen-vl 之类）。图片首次进入上下文时会异步调它做一次详细解析，结果存进 vision.json，不占对话上下文。角色自己写的那句描述是「目录」，这份解析是「详情」——检索时两层都搜。留空则不启用，只靠角色自己的描述。",
+    "obvious_hint": true
+  },
+  "vision_prompt": {
+    "description": "视觉解析提示词",
+    "type": "text",
+    "default": "",
+    "hint": "留空用内置提示词（要求覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围，并强调名词要具体）。这段解析只进档案、不发给任何人，写得越细检索越准。"
+  },
+  "vision_max_chars": {
+    "description": "细节记录最长字数",
+    "type": "int",
+    "default": 600,
+    "hint": "超出部分截断。这份记录只在角色主动 inspect_photo 时才进上下文，可以放宽些。"
+  },
+  "vision_concurrency": {
+    "description": "视觉解析并发数",
+    "type": "int",
+    "default": 2,
+    "hint": "同时最多跑几个解析请求。一次涌入多张图时靠它限流，避免打爆 API 配额。"
   },
 
   "max_context_images": {
     "description": "上下文里最多保留几张真图",
     "type": "int",
     "default": 0,
-    "hint": "AstrBot 把图片以 base64 永久写进对话历史，之后每轮都原样重发——几十张之后既吃 token 又稀释注意力。设成正数后，只保留最近这么多张真图，更早的换成 [图片 #N] 文字占位，角色需要时可用 recall_photo 工具按编号取回。⚠️ 折叠是写回历史的、不可逆，但被折叠的图会先存到 plugin_data/astrbot_plugin_tg_presence/context_photos/ 下，不会真的丢。填 0 表示不处理。",
+    "hint": "AstrBot 把图片以 base64 永久写进对话历史，之后每轮都原样重发——几十张之后既吃 token 又稀释注意力。设成正数后，只保留最近这么多张真图，更早的换成 [图片 #N] 文字占位，角色需要时可用 inspect_photo 查画面细节（只回文字，便宜）或 recall_photo 把原图整个取回。⚠️ 折叠是写回历史的、不可逆，但图片在首次进入上下文时就已存到 plugin_data/astrbot_plugin_tg_presence/context_photos/ 下，不会真的丢。填 0 表示不折叠（配了视觉模型的话仍会存盘和解析）。",
     "obvious_hint": true
   },
 

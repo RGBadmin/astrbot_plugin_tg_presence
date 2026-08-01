@@ -1,4 +1,5 @@
-﻿import base64
+﻿import asyncio
+import base64
 import binascii
 import hashlib
 import json
@@ -37,12 +38,25 @@ IMG_NOTE_RE = re.compile(
     r"<img_note\s+id=[\"']?#?(?P<id>\w+)[\"']?\s*>(?P<desc>.*?)</img_note>", re.S
 )
 
+DEFAULT_VISION_PROMPT = (
+    "详细描述这张图片，供以后按内容检索用。请覆盖：\n"
+    "1. 画面主体是什么，人物的姿态、衣着、配饰（材质和颜色都要写）\n"
+    "2. 场景环境、光线、拍摄角度和距离\n"
+    "3. 画面里出现的所有物品，以及任何文字、标志、招牌、屏幕内容\n"
+    "4. 整体色调和氛围\n"
+    "直接写描述，不要加任何开场白或总结句。名词尽量具体，"
+    "宁可啰嗦也不要笼统——「黑色丝袜」比「深色袜子」有用。"
+)
+
+# 视觉解析连续失败这么多次就不再自动重试，避免坏图无限撞 API
+VISION_MAX_FAILS = 3
+
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
-    "让角色自己发动态到频道、换头像、改签名、对消息点表情",
-    "0.8.0",
+    "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
+    "0.9.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -51,8 +65,15 @@ class TgPresence(Star):
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_tg_presence")
         self.state_path = self.data_dir / "state.json"
         self.state = self._load_state()
+        self.vision_path = self.data_dir / "vision.json"
+        self.vision = self._load_vision()
         # 角色最近一次出站的时刻。只在内存里，进程重启丢一次戳无所谓
         self._pending_sent: float | None = None
+        # 在跑的视觉解析任务，持引用防止 asyncio 中途回收
+        self._vision_tasks: set[asyncio.Task] = set()
+        self._vision_gate: asyncio.Semaphore | None = None
+        # base64 指纹 -> sha256，省掉每轮对全部图片重算哈希
+        self._key_cache: dict[str, str] = {}
 
     # ------------------------------------------------------------------ 状态
 
@@ -75,6 +96,28 @@ class TgPresence(Star):
             json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         tmp.replace(self.state_path)
+
+    def _load_vision(self) -> dict:
+        """视觉详解单独存一个文件，不跟 state.json 混。
+
+        一张图的详解几百字，几百张之后这份档案会很大；而 state.json
+        每发一条动态、每次冷却都要全量重写，混在一起等于每次把详解也抄一遍。
+        """
+        if not self.vision_path.exists():
+            return {}
+        try:
+            data = json.loads(self.vision_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"[tg_presence] 视觉档案读取失败，按空档案启动: {e}")
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_vision(self) -> None:
+        tmp = self.vision_path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(self.vision, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        tmp.replace(self.vision_path)
 
     @staticmethod
     def _moment_photos(moment: dict) -> list[str]:
@@ -289,17 +332,29 @@ class TgPresence(Star):
             bits.append(t)
         return " ".join(bits)
 
-    @staticmethod
-    def _photo_key(data_url: str) -> str | None:
+    def _photo_key(self, data_url: str) -> str | None:
         """图片的稳定标识。
 
         必须用 sha256：内置 hash() 对字符串每次进程启动都不同，
         重启后同一张图会被当成新图。
+
+        但上下文里几十张图时，每轮请求光算哈希就要过几十 MB 的 base64，
+        而且要过好几遍（登记一遍、请求描述一遍、折叠一遍），所以缓存一层。
+        缓存键用长度加首尾各 32 字符：尾部是 JPEG 压缩数据的末段，
+        不同图几乎必然不同，再叠上长度，撞不到一起。
         """
         hit = DATA_URL_RE.match((data_url or "").strip())
         if not hit:
             return None
-        return hashlib.sha256(hit.group("b64").encode()).hexdigest()[:16]
+        b64 = hit.group("b64")
+        probe = f"{len(b64)}:{b64[:32]}:{b64[-32:]}"
+        if (cached := self._key_cache.get(probe)) is not None:
+            return cached
+        key = hashlib.sha256(b64.encode()).hexdigest()[:16]
+        if len(self._key_cache) > 512:
+            self._key_cache.clear()
+        self._key_cache[probe] = key
+        return key
 
     def _photo_id(self, data_url: str) -> str | None:
         """给图片分配（或取回）一个短编号。第一次见到就登记。"""
@@ -333,6 +388,141 @@ class TgPresence(Star):
         paths[pid] = str(path)
         return pid
 
+    # --------------------------------------------------------- 独立视觉 API 层
+
+    def _vision_provider_id(self) -> str:
+        return (self.conf.get("vision_provider_id") or "").strip()
+
+    def _gate(self) -> asyncio.Semaphore:
+        """并发闸。懒创建——插件 __init__ 时不一定已经有事件循环。"""
+        if self._vision_gate is None:
+            n = max(1, int(self.conf.get("vision_concurrency", 2) or 2))
+            self._vision_gate = asyncio.Semaphore(n)
+        return self._vision_gate
+
+    @filter.on_llm_request(priority=-35)
+    async def register_context_photos(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """给上下文里每张图登记编号、存盘，并派发视觉解析。
+
+        存盘不能等到折叠时才做：llm_compress 会把整轮对话连同图片一起压掉，
+        /new 也会清空上下文，那之后原图就再也拿不回来了。图片一旦进入视野
+        就先落盘，后面无论上下文怎么变，档案都还在。
+
+        priority=-35 让它排在请求描述(-40)和折叠(-50)前面，
+        这样那两步拿到的编号都是这里分配好的。
+        """
+        # 存盘只为两件事：折叠后能取回、给视觉模型读。都不需要就别占磁盘
+        if not self._vision_provider_id() and (
+            int(self.conf.get("max_context_images", 0) or 0) <= 0
+        ):
+            return
+
+        store = self.data_dir / "context_photos"
+        store.mkdir(parents=True, exist_ok=True)
+
+        seen: list[str] = []
+        for msg in req.contexts or []:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not (isinstance(part, dict) and part.get("type") == "image_url"):
+                    continue
+                url = (part.get("image_url") or {}).get("url") or ""
+                pid = self._stash_photo(url, store)
+                if not pid:
+                    continue
+                if pid not in seen:
+                    seen.append(pid)
+                # 顺手补时间，别等折叠——压缩可能先一步把这轮吃掉
+                if when := self._context_time(msg):
+                    self.state.setdefault("photo_time", {}).setdefault(pid, when)
+
+        if seen:
+            self._save_state()
+        self._dispatch_vision(seen)
+
+    def _dispatch_vision(self, pids: list[str]) -> int:
+        """给还没有详解的图派发解析任务。返回派了几个。"""
+        if not self._vision_provider_id():
+            return 0
+        paths = self.state.get("photo_paths") or {}
+        fails = self.state.get("vision_fail") or {}
+        running = {t.get_name() for t in self._vision_tasks}
+
+        n = 0
+        for pid in pids:
+            if pid in self.vision or f"vision:{pid}" in running:
+                continue
+            if fails.get(pid, 0) >= VISION_MAX_FAILS:
+                continue
+            path = paths.get(pid)
+            if not path or not Path(path).exists():
+                continue
+            task = asyncio.create_task(
+                self._vision_describe(pid, path), name=f"vision:{pid}"
+            )
+            self._vision_tasks.add(task)
+            task.add_done_callback(self._vision_tasks.discard)
+            n += 1
+        if n:
+            logger.debug(f"[tg_presence] 派发 {n} 张图的视觉解析")
+        return n
+
+    async def _vision_describe(self, pid: str, path: str) -> bool:
+        """调独立视觉模型解析一张图，存进详解档案。"""
+        provider_id = self._vision_provider_id()
+        if not provider_id:
+            return False
+
+        async with self._gate():
+            if pid in self.vision:  # 排队期间已经被别的任务做掉了
+                return True
+            try:
+                resp = await self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=self.conf.get("vision_prompt") or DEFAULT_VISION_PROMPT,
+                    image_urls=[Path(path).as_uri()],
+                )
+            except Exception as e:
+                fails = self.state.setdefault("vision_fail", {})
+                fails[pid] = fails.get(pid, 0) + 1
+                self._save_state()
+                logger.warning(
+                    f"[tg_presence] 视觉解析 #{pid} 失败"
+                    f"（第 {fails[pid]} 次，满 {VISION_MAX_FAILS} 次后不再自动重试）: {e}"
+                )
+                return False
+
+        text = self._resp_text(resp)
+        if not text:
+            logger.warning(f"[tg_presence] 视觉解析 #{pid} 返回空内容")
+            return False
+
+        limit = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
+        self.vision[pid] = text[:limit]
+        self._save_vision()
+        if (self.state.get("vision_fail") or {}).pop(pid, None) is not None:
+            self._save_state()
+        logger.info(f"[tg_presence] 视觉解析 #{pid} 完成，{len(self.vision[pid])} 字")
+        return True
+
+    @staticmethod
+    def _resp_text(resp) -> str:
+        """从 LLMResponse 里取纯文本，兼容不同版本的字段。"""
+        text = (getattr(resp, "completion_text", None) or "").strip()
+        if text:
+            return text
+        chain = getattr(getattr(resp, "result_chain", None), "chain", None) or []
+        bits = [
+            t.strip()
+            for c in chain
+            if isinstance(t := getattr(c, "text", None), str) and t.strip()
+        ]
+        return " ".join(bits)
+
     # ----------------------------------------------------- 让角色自己描述图片
 
     @filter.on_llm_request(priority=-40)
@@ -365,21 +555,42 @@ class TgPresence(Star):
         self._save_state()  # 编号是刚分配的，落盘
 
         ids = "、".join(f"#{p}" for p in pending)
+        has_vision = bool(self._vision_provider_id())
+        # 有独立视觉层时，她这句话只负责「认出是哪张」，细节交给系统记，
+        # 所以要求写一句就够；没有视觉层时这句是唯一的检索依据，得写全
+        if has_vision:
+            howto = (
+                "一句话就行，抓最能认出这张图的那个点——谁拍的、什么场合、\n"
+                "画面里最显眼的是什么。用你自己的说法。画面里的琐碎细节\n"
+                "系统会另外记一份，你不用写。\n"
+            )
+        else:
+            howto = (
+                "描述要具体到能靠它认出这张图——画面内容、谁拍的、什么场合，\n"
+                "用你自己的说法就行。\n"
+            )
+
+        recall = (
+            "另外：对方提起某张旧图时（「昨天那张」「黑丝那张」），\n"
+            "先看对话里的 [图片 #N ...] 占位——描述就在里面，直接认出来即可。\n"
+            "上下文里找不到再用 find_photo 查存档。\n"
+            "**符合的不止一张时，问他是哪张，不要自己挑一张然后当成就是那张。**\n"
+        )
+        if has_vision:
+            recall += (
+                "他要是问起某张图里的具体东西（画面里有什么、什么颜色、写了什么字），\n"
+                "用 inspect_photo 查那张图的细节记录，别硬猜也别急着 recall_photo——\n"
+                "recall_photo 是把原图整个搬回来，只有真的需要亲眼再看一遍才用。\n"
+            )
+
         self._inject_text(
             req,
             "<describe_images>\n"
             f"上下文里这几张图还没有存过描述：{ids}\n"
             "请在这次回复的最末尾，为每张各写一条：\n"
             '  <img_note id="编号">这张图是什么</img_note>\n'
-            "按图片在对话里出现的先后顺序对应编号。描述要具体到能靠它认出这张图——\n"
-            "画面内容、谁拍的、什么场合，用你自己的说法就行。\n"
-            "这几行会被系统抽走存档，对方看不到，也不算进你的回复。\n"
-            "正常说你的话，把这些附在最后即可。\n\n"
-            "另外：对方提起某张旧图时（「昨天那张」「黑丝那张」），\n"
-            "先看对话里的 [图片 #N ...] 占位——描述就在里面，直接认出来即可。\n"
-            "上下文里找不到再用 find_photo 查存档。\n"
-            "**符合的不止一张时，问他是哪张，不要自己挑一张然后当成就是那张。**\n"
-            "</describe_images>",
+            "按图片在对话里出现的先后顺序对应编号。\n" + howto + "这几行会被系统抽走存档，对方看不到，也不算进你的回复。\n"
+            "正常说你的话，把这些附在最后即可。\n\n" + recall + "</describe_images>",
         )
         logger.debug(f"[tg_presence] 请求描述图片 {ids}")
 
@@ -413,23 +624,25 @@ class TgPresence(Star):
     async def find_photo(
         self, event: AstrMessageEvent, keywords: str = "", day: str = ""
     ):
-        """在你存过描述的旧图片里找。对话里能直接看到的那些占位不用查这个——只有当对方提起一张你在当前上下文里找不到的旧图时才用。返回候选列表，如果不止一张，问对方是哪张，别自己瞎猜。
+        """在存档的旧图片里找。对话里能直接看到的那些 [图片 #N] 占位不用查这个——只有当对方提起一张你在当前上下文里找不到的旧图时才用。会同时搜你自己写的那句描述和系统存的画面细节记录。返回候选列表，如果不止一张，问对方是哪张，别自己瞎猜。
 
         Args:
-            keywords(string): 描述里的关键词，空格分隔，例如「黑丝 足底」。会取交集
+            keywords(string): 关键词，空格分隔，例如「黑丝 足底」。会取交集。画面里的东西也能搜，比如「咖啡杯」
             day(string): 限定日期，格式 MM-DD 或 YYYY-MM-DD。留空则不限
         """
         desc = self.state.get("photo_desc") or {}
         times = self.state.get("photo_time") or {}
-        if not desc:
+        if not desc and not self.vision:
             return "还没有存过任何图片描述。"
 
         words = [w for w in keywords.replace("，", " ").split() if w]
         day = day.strip()
 
         hits = []
-        for pid, text in desc.items():
-            if words and not all(w in text for w in words):
+        for pid in set(desc) | set(self.vision):
+            mine = desc.get(pid, "")
+            detail = self.vision.get(pid, "")
+            if words and not all(w in mine or w in detail for w in words):
                 continue
             ts = times.get(pid)
             stamp = (
@@ -439,20 +652,60 @@ class TgPresence(Star):
             )
             if day and day not in stamp:
                 continue
-            hits.append((ts or 0, pid, stamp or "时间不详", text))
+            # 只在细节记录里命中的，标出来——她好知道自己为什么想起这张
+            only_detail = bool(words) and not all(w in mine for w in words)
+            label = mine or (detail[:60] + "…" if len(detail) > 60 else detail)
+            hits.append((ts or 0, pid, stamp or "时间不详", label, only_detail))
 
         if not hits:
             return "没找到符合的图片。换个说法再试，或者问问对方是哪张。"
 
         hits.sort(reverse=True)
-        lines = [f"#{pid} · {stamp} · {text}" for _, pid, stamp, text in hits[:12]]
+        lines = [
+            f"#{pid} · {stamp} · {label}"
+            + (" ←靠画面细节匹配到的" if only_detail else "")
+            for _, pid, stamp, label, only_detail in hits[:12]
+        ]
         head = f"找到 {len(hits)} 张" + ("，只列最近 12 张：" if len(hits) > 12 else "：")
         tail = (
             "\n不止一张，先问清楚是哪张再取。"
             if len(hits) > 1
-            else "\n用 recall_photo 加编号可以把它取回来重新看。"
+            else "\ninspect_photo 加编号能看这张图的画面细节，recall_photo 是把原图取回来重新看。"
         )
         return head + "\n" + "\n".join(lines) + tail
+
+    @filter.llm_tool(name="inspect_photo")
+    async def inspect_photo(self, event: AstrMessageEvent, photo_id: str):
+        """查一张图的画面细节记录。当你想知道某张图里的具体东西（画面里有什么、什么颜色、写了什么字），而这张图现在不在你眼前时用这个。它只给你文字记录，不会把图重新塞进来，比 recall_photo 省得多。确实需要亲眼再看一遍原图才用 recall_photo。
+
+        Args:
+            photo_id(string): 图片编号，比如 12
+        """
+        pid = photo_id.strip().lstrip("#")
+        detail = self.vision.get(pid)
+        mine = (self.state.get("photo_desc") or {}).get(pid)
+        if not detail and not mine:
+            known = pid in (self.state.get("photo_paths") or {})
+            return (
+                f"#{pid} 还没有细节记录，可以用 recall_photo 把原图取回来看。"
+                if known
+                else f"找不到 #{pid} 这张图。"
+            )
+
+        ts = (self.state.get("photo_time") or {}).get(pid)
+        stamp = (
+            datetime.fromtimestamp(ts, self._tz()).strftime("%Y-%m-%d %H:%M")
+            if ts
+            else "时间不详"
+        )
+        lines = [f"#{pid} · {stamp}"]
+        if mine:
+            lines.append(f"你当时记的：{mine}")
+        if detail:
+            lines.append(f"画面细节：{detail}")
+        else:
+            lines.append("（没有细节记录，需要的话用 recall_photo 看原图）")
+        return "\n".join(lines)
 
     @filter.llm_tool(name="recall_photo")
     async def recall_photo(self, event: AstrMessageEvent, photo_id: str):
@@ -1059,4 +1312,78 @@ class TgPresence(Star):
             last = moments[-1]
             stamp = datetime.fromtimestamp(last["ts"], self._tz()).strftime("%m-%d %H:%M")
             lines.append(f"最近一条：{stamp} {last['text'][:40]}")
+
+        paths = self.state.get("photo_paths") or {}
+        if paths:
+            desc_n = len(self.state.get("photo_desc") or {})
+            lines.append(
+                f"图片存档：{len(paths)} 张 · 她记的描述 {desc_n} 条 · "
+                f"画面细节 {len(self.vision)} 条"
+                + ("" if self._vision_provider_id() else "（未配视觉模型）")
+            )
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("vision")
+    async def cmd_vision(self, event: AstrMessageEvent, arg: str = ""):
+        """给还没有细节记录的存量图片补做视觉解析。用法：/vision [张数|retry]"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。")
+            return
+
+        provider_id = self._vision_provider_id()
+        if not provider_id:
+            yield event.plain_result(
+                "没配视觉模型。到插件配置里填「独立视觉模型 ID」——"
+                "填的是服务提供商的 ID，不是模型名。"
+            )
+            return
+        if self.context.get_provider_by_id(provider_id) is None:
+            avail = [
+                getattr(p, "provider_config", {}).get("id", "?")
+                for p in self.context.get_all_providers()
+            ]
+            yield event.plain_result(
+                f"找不到 ID 为 {provider_id} 的服务提供商。\n"
+                f"当前可用：{'、'.join(avail) or '（无）'}"
+            )
+            return
+
+        arg = arg.strip().lower()
+        if arg == "retry":
+            self.state["vision_fail"] = {}
+            self._save_state()
+        batch = max(1, min(int(arg), 50)) if arg.isdigit() else 10
+
+        paths = self.state.get("photo_paths") or {}
+        fails = self.state.get("vision_fail") or {}
+        pending = [
+            pid
+            for pid, p in paths.items()
+            if pid not in self.vision
+            and fails.get(pid, 0) < VISION_MAX_FAILS
+            and Path(p).exists()
+        ]
+        if not pending:
+            stuck = sum(1 for pid in paths if fails.get(pid, 0) >= VISION_MAX_FAILS)
+            msg = f"没有待解析的图片。已有细节记录 {len(self.vision)} 条。"
+            if stuck:
+                msg += f"\n另有 {stuck} 张失败满 {VISION_MAX_FAILS} 次被跳过，/vision retry 可重来。"
+            yield event.plain_result(msg)
+            return
+
+        # 新图优先——越近的越可能被提起
+        pending.sort(key=lambda p: int(p) if p.isdigit() else 0, reverse=True)
+        todo = pending[:batch]
+        yield event.plain_result(f"待解析 {len(pending)} 张，这次做 {len(todo)} 张。")
+
+        results = await asyncio.gather(
+            *(self._vision_describe(pid, paths[pid]) for pid in todo),
+            return_exceptions=True,
+        )
+        ok = sum(1 for r in results if r is True)
+        left = len(pending) - ok
+        yield event.plain_result(
+            f"完成 {ok}/{len(todo)} 张。"
+            + (f"\n还剩 {left} 张，再发一次 /vision 继续。" if left > 0 else "")
+        )
