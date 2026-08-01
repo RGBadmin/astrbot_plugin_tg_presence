@@ -176,18 +176,44 @@
     "default": 600,
     "hint": "存档时按这个长度截断，是对模型实际输出的兜底。⚠️ 如果你在提示词里加了结构化标签行，务必调大——标签本身就要 300~600 字，加上自然语言描述很容易超过 600 而被从尾部砍掉，丢的正好是排在最后的那些项。带标签的话建议 1500。这份记录只在角色主动 inspect_photo 时才进上下文，放宽些不影响日常开销。"
   },
-  "picker_enable": {
-    "description": "启用选图精排",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，相册检索分两步：先用关键词按命中数粗筛出一批候选，再把这批候选的完整描述交给模型逐张比对，挑出真正吻合的。只有在角色填了「想找的画面」时才会触发。关掉则只用关键词打分排序。",
+  "rank_pool": {
+    "description": "参与权重计算的候选数",
+    "type": "int",
+    "default": 60,
+    "hint": "先按关键词命中数取这么多张，再对这一批做加权重排。池子越大越不容易漏掉正确答案，但排序结果也越容易被权重扰动。这一步是纯计算，不调模型，加大它不花钱。",
     "obvious_hint": true
   },
-  "picker_candidates": {
-    "description": "精排候选数量",
+  "rank_return": {
+    "description": "最终返回几张",
     "type": "int",
-    "default": 20,
-    "hint": "粗筛先取多少张交给精排。给多了更不容易漏，但每张的完整描述都要塞进请求，token 和延迟同步上涨——20 张约 1~2 万 token。"
+    "default": 10,
+    "hint": "重排后把前几张交给角色，由她自己挑一张发。给太多她挑得费劲、也吃上下文；给太少容易漏掉对的那张。"
+  },
+  "weight_match": {
+    "description": "权重·关键词匹配度",
+    "type": "float",
+    "default": 0.6,
+    "hint": "命中词数在这一批里的相对排名。三个权重不必加起来等于 1，比例才有意义。",
+    "obvious_hint": true
+  },
+  "weight_sent": {
+    "description": "权重·发送历史",
+    "type": "float",
+    "default": 0.2,
+    "hint": "角色调工具时传 prefer_sent：填 recent 就偏向以前发过的（他说「上次那张」），填 fresh 或留空就偏向没发过的（避免反复发同一张）。这个判断由她在对话里做出，权重计算本身不调模型。"
+  },
+  "weight_time": {
+    "description": "权重·时间",
+    "type": "float",
+    "default": 0.2,
+    "hint": "按图片被收进相册的时间算。角色传了 around（他提到的时间）就偏向那前后的图，没传就偏向新收的。"
+  },
+  "picker_enable": {
+    "description": "额外的模型精排",
+    "type": "bool",
+    "default": false,
+    "hint": "权重重排之后，再把结果交给模型逐张比对一遍。默认关——角色拿到候选列表后本来就会自己挑，这一步是额外的一次调用。只有当她填了「想找的画面」时才会触发。",
+    "obvious_hint": true
   },
   "tag_strict": {
     "description": "严格校验标签取值",

@@ -102,7 +102,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.17.0",
+    "0.18.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -300,9 +300,11 @@ class TgPresence(Star):
         if folder.strip():
             sql += " AND folder LIKE ?"
             args.append(f"%{folder.strip()}%")
-        # 命中多的优先；同分时最近发过的排后面，免得反复发同一张
-        sql += " ORDER BY score DESC, COALESCE(last_sent, 0) ASC, sent ASC, RANDOM() LIMIT ?"
-        args.append(max(1, min(limit, 50)))
+        # 只按命中数排，同分用 id 兜底——不能有 RANDOM()：
+        # 同一段词每次搜出来的候选必须是同一批，否则"上次那张"永远漂移。
+        # 发送历史和时间的偏好交给后面的权重重排，那里是可控的确定性调整
+        sql += " ORDER BY score DESC, id ASC LIMIT ?"
+        args.append(max(1, min(limit, 200)))
 
         try:
             rows = self.db().execute(sql, args).fetchall()
@@ -311,6 +313,80 @@ class TgPresence(Star):
             return []
         # 一个词都没中的没意义（没给关键词时例外，那是随手翻）
         return [r for r in rows if not words or r["score"] > 0]
+
+    def _parse_day(self, day: str) -> float | None:
+        """把 MM-DD / YYYY-MM-DD 解析成时间戳。解析不了返回 None。"""
+        day = (day or "").strip()
+        if not day:
+            return None
+        tz = self._tz()
+        for fmt, need_year in (("%Y-%m-%d", False), ("%m-%d", True)):
+            try:
+                d = datetime.strptime(day, fmt)
+                if need_year:
+                    d = d.replace(year=datetime.now(tz).year)
+                return d.replace(tzinfo=tz).timestamp()
+            except ValueError:
+                continue
+        return None
+
+    def _rerank(
+        self, rows: list[sqlite3.Row], prefer_sent: str = "", around: str = ""
+    ) -> list[sqlite3.Row]:
+        """对粗筛结果做加权重排。纯计算，不调模型。
+
+        三个维度各自在这一批里做 min-max 归一化再加权。用相对排名而不是
+        绝对阈值，是因为绝对阈值要调常数（多久算"最近"？），而相对排名
+        对任何时间跨度都自适应。
+
+        同分时按 id 兜底，保证同一段词每次算出来的顺序完全一致。
+        """
+        if not rows:
+            return rows
+
+        def norm(vals: list[float]) -> list[float]:
+            lo, hi = min(vals), max(vals)
+            if hi - lo < 1e-9:
+                return [0.5] * len(vals)
+            return [(v - lo) / (hi - lo) for v in vals]
+
+        m = norm([float(r["score"] or 0) for r in rows])
+
+        # 维度一：发过 / 没发过。她在对话里听得出要哪种，由她传参，这里只算。
+        # 必须用「距今多久」而不是 last_sent 本身：时间戳都是十几亿，
+        # min-max 之后「刚发过」和「半年前发过」的差异被压没了，
+        # 只剩「没发过」的 0 是离群点，recent 模式就完全失效
+        now = time.time()
+        never = 10 * 365 * 86400.0  # 没发过的当成十年前，稳定排在最末
+        age = [
+            (now - float(r["last_sent"])) if r["last_sent"] else never for r in rows
+        ]
+        pref = (prefer_sent or "").strip().lower()
+        if pref in ("recent", "发过", "上次"):
+            s = [1 - v for v in norm(age)]          # 距今越短 = 刚发过 = 越高
+        elif pref in ("any", "不限"):
+            s = [0.5] * len(rows)
+        else:                                        # fresh，默认避免重复
+            s = norm(age)                            # 距今越久 / 没发过 = 越高
+
+        # 维度二：文件首次出现的时间
+        added = [float(r["added"] or 0) for r in rows]
+        ts = self._parse_day(around)
+        if ts:
+            t = [1 - v for v in norm([abs(a - ts) for a in added])]  # 离指定时间越近越高
+        else:
+            t = norm(added)                          # 没指定就越新越高
+
+        wm = float(self.conf.get("weight_match", 0.6) or 0)
+        ws = float(self.conf.get("weight_sent", 0.2) or 0)
+        wt = float(self.conf.get("weight_time", 0.2) or 0)
+
+        scored = [
+            (wm * m[i] + ws * s[i] + wt * t[i], int(rows[i]["id"]), rows[i])
+            for i in range(len(rows))
+        ]
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [r for _, _, r in scored]
 
     async def _pick_best(
         self, want: str, rows: list[sqlite3.Row], top: int
@@ -1492,16 +1568,18 @@ class TgPresence(Star):
     @filter.llm_tool(name="browse_gallery")
     async def browse_gallery(
         self, event: AstrMessageEvent, keywords: str = "", want: str = "",
-        folder: str = "", **_extra
+        folder: str = "", prefer_sent: str = "", around: str = "", **_extra
     ):
-        """在你自己的相册里翻，找一张想发给他的照片。想给他看点什么、或者他描述了某个画面让你找的时候用。返回的编号形如 g123，再用 send_photo 发出去。
+        """在你自己的相册里翻，找一张想发给他的照片。想给他看点什么、或者他描述了某个画面让你找的时候用。返回一批候选，你自己挑一张，再用 send_photo 发出去。
 
         Args:
             keywords(string): 检索词，空格分隔，例如「酒店 灰丝 细高跟 M腿」。词尽量多给几个，命中越多排得越前，个别词没对上也不影响
-            want(string): 可选但强烈建议填：把想找的画面用一句话原样描述出来。给了这个会再让模型逐张比对完整描述，挑出真正吻合的那张
+            want(string): 可选，把想找的画面用一句话原样描述出来
             folder(string): 可选，限定某个相册分类
+            prefer_sent(string): 他要的是以前发过的那张就填 recent，要没发过的新图就填 fresh，听不出来就留空（默认 fresh，免得老发同一张）
+            around(string): 他提到时间就填，格式 MM-DD 或 YYYY-MM-DD，会优先挑那前后收进来的图；没提就留空，默认偏向新收的
         """
-        pool = max(4, int(self.conf.get("picker_candidates", 20) or 20))
+        pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
         rows = self.gallery_search(keywords or want, folder, limit=pool)
         if not rows:
             stat = self.gallery_stat()
@@ -1509,22 +1587,28 @@ class TgPresence(Star):
                 return "相册还没建好索引，现在挑不了。"
             return "没找到合适的。换几个词再翻翻，或者把想找的画面整句说出来。"
 
-        picked, reranked = rows[:8], False
-        if want.strip() and self.conf.get("picker_enable", True) and len(rows) > 1:
-            picked = await self._pick_best(want.strip(), rows, top=8)
-            reranked = True
+        # 匹配度取一批 -> 固定权重重排。纯计算，同一段词每次结果都一样
+        ranked = self._rerank(rows, prefer_sent, around)
+        top = max(1, int(self.conf.get("rank_return", 10) or 10))
+        picked, by_model = ranked[:top], False
+
+        # 只有填了 want 且显式开了 picker 才额外过一遍模型
+        if want.strip() and self.conf.get("picker_enable", False) and len(picked) > 1:
+            picked = await self._pick_best(want.strip(), picked, top=top)
+            by_model = True
 
         lines = []
         for r in picked:
             tag = f"[{r['folder']}] " if r["folder"] else ""
-            seen = f" · 发过{r['sent']}次" if r["sent"] else ""
+            seen = f" · 发过{r['sent']}次" if r["sent"] else " · 没发过"
             lines.append(f"g{r['id']} · {tag}{(r['descr'] or '')[:70]}{seen}")
-        head = (
-            f"从 {len(rows)} 张里挑出这 {len(picked)} 张，最吻合的排在前面："
-            if reranked
-            else f"翻到 {len(picked)} 张："
+        return (
+            f"从 {len(rows)} 张候选里挑出这 {len(picked)} 张"
+            + ("（模型逐张比对过）" if by_model else "")
+            + "，越靠前越合适：\n"
+            + "\n".join(lines)
+            + "\n\n你自己看着挑一张，用 send_photo 加编号发出去。"
         )
-        return head + "\n" + "\n".join(lines) + "\n用 send_photo 加编号发出去。"
 
     @filter.llm_tool(name="send_photo")
     async def send_photo(
