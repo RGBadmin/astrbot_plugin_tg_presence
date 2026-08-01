@@ -32,7 +32,7 @@ CTX_TIME_RE = re.compile(r"Current datetime:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情",
-    "0.5.0",
+    "0.5.1",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -272,7 +272,7 @@ class TgPresence(Star):
         limit = int(self.conf.get("inject_history_limit", 0) or 0)
         selected = moments[-limit:] if limit > 0 else moments
 
-        placed = self._interleave_moments(req, selected)
+        anchors, tail = self._interleave_moments(req, selected)
 
         self._inject_text(
             req,
@@ -285,7 +285,16 @@ class TgPresence(Star):
             "但你一直是知情的那个。\n"
             "</your_own_moments>",
         )
-        logger.info(f"[tg_presence] 已把 {placed}/{len(selected)} 条动态插入时间线")
+        logger.info(
+            f"[tg_presence] {len(selected)} 条动态插入时间线"
+            f"（历史时间锚点 {anchors} 个，其中 {tail} 条排在全部历史之后）"
+        )
+        if req.contexts and anchors == 0 and len(req.contexts) > len(selected):
+            logger.warning(
+                "[tg_presence] 历史里一个时间锚点都没有，动态只能全部堆在末尾，顺序不可信。"
+                "可能原因：datetime_system_prompt 被关掉、这段历史早于该配置开启、"
+                "或者已被 llm_compress 压缩过（摘要会吃掉正文里的时间戳）"
+            )
 
         if not self.conf.get("inject_history_images", False):
             return
@@ -303,8 +312,14 @@ class TgPresence(Star):
             except Exception as e:
                 logger.warning(f"[tg_presence] 配图注入失败 {path}: {e}")
 
-    def _interleave_moments(self, req: ProviderRequest, moments: list[dict]) -> int:
-        """把动态按时间插进 req.contexts 的对应位置，返回插入条数。
+    def _interleave_moments(
+        self, req: ProviderRequest, moments: list[dict]
+    ) -> tuple[int, int]:
+        """把动态按时间插进 req.contexts 的对应位置。
+
+        返回 (历史里找到的时间锚点数, 排在全部历史之后的动态数)。
+        动态一定会全部插入——找不到锚点时就按时间顺序堆在末尾，
+        所以真正需要警惕的信号是「有历史但锚点为 0」，那时顺序不可信。
 
         插入项带 "_no_save": True —— bind_checkpoint_messages 会读这个 key
         (agent/message.py:338-339)，所以只发给模型、不写进对话历史。
@@ -312,25 +327,28 @@ class TgPresence(Star):
         """
         pending = sorted(moments, key=lambda m: m["ts"])
         if not pending:
-            return 0
+            return 0, 0
 
         merged: list[dict] = []
         idx = 0
+        anchors = 0
         for msg in req.contexts or []:
             when = self._context_time(msg)
             if when is not None:
+                anchors += 1
                 while idx < len(pending) and pending[idx]["ts"] < when:
                     merged.append(self._moment_entry(pending[idx]))
                     idx += 1
             merged.append(msg)
 
-        # 比所有历史消息都新的，排在最后
+        # 比所有历史消息都新的（或压根没有锚点可比的），排在最后
+        tail = len(pending) - idx
         while idx < len(pending):
             merged.append(self._moment_entry(pending[idx]))
             idx += 1
 
         req.contexts = merged
-        return len(pending)
+        return anchors, tail
 
     def _moment_entry(self, moment: dict) -> dict:
         """把一条动态渲染成时间线里的一个事件。"""
