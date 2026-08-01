@@ -102,7 +102,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.16.0",
+    "0.17.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -330,20 +330,44 @@ class TgPresence(Star):
             "你是图片检索助手。只输出编号，用逗号分隔，不要解释、不要输出别的任何字。"
         )
 
-        blocks = []
-        for i, r in enumerate(rows, 1):
-            blocks.append(f"[{i}] {(r['descr'] or '')[:900]}")
-        prompt = (
-            f"用户想找的画面：\n{want}\n\n"
-            f"下面是 {len(rows)} 张候选图片的描述：\n\n"
-            + "\n\n".join(blocks)
-            + f"\n\n把与用户描述最吻合的挑出来，按吻合程度从高到低排序，"
-            f"最多 {top} 个。明显不符的不要列。\n"
-            "只输出编号，例如：3,7,1"
-        )
+        by_image = (self.conf.get("picker_mode") or "text").strip().lower() == "image"
+        if by_image:
+            # 看图选比看描述准 —— 描述再细也是二手信息，漏写的东西就永远找不回来。
+            # 代价是贵：一张图 1500~4800 token，比一段描述贵好几倍，所以候选数另设上限
+            cap = max(2, int(self.conf.get("picker_image_max", 6) or 6))
+            rows = rows[:cap]
+            images, kept = [], []
+            for r in rows:
+                p = self._photo_file(r)
+                img = self._read_image(str(p)) if p else None
+                if img:
+                    images.append(img)
+                    kept.append(r)
+            if not images:
+                logger.warning("[tg_presence] 候选图都读不出来，退回粗筛结果")
+                return rows[:top]
+            rows = kept
+            prompt = (
+                f"用户想找的画面：\n{want}\n\n"
+                f"上面 {len(images)} 张图按 [1]~[{len(images)}] 编号。"
+                f"挑出与描述最吻合的，按吻合程度从高到低排序，最多 {top} 个。"
+                "明显不符的不要列。只输出编号，例如：3,1,2"
+            )
+            payload = self._multi_image_payload(cfg, images, prompt)
+        else:
+            blocks = [f"[{i}] {(r['descr'] or '')[:900]}" for i, r in enumerate(rows, 1)]
+            prompt = (
+                f"用户想找的画面：\n{want}\n\n"
+                f"下面是 {len(rows)} 张候选图片的描述：\n\n"
+                + "\n\n".join(blocks)
+                + f"\n\n把与用户描述最吻合的挑出来，按吻合程度从高到低排序，"
+                f"最多 {top} 个。明显不符的不要列。\n"
+                "只输出编号，例如：3,7,1"
+            )
+            payload = self._text_payload(cfg, prompt)
 
         try:
-            raw = await self._api_post(cfg, self._text_payload(cfg, prompt))
+            raw = await self._api_post(cfg, payload)
         except VisionError as e:
             logger.warning(f"[tg_presence] 选图精排失败，退回粗筛结果：{e}")
             return rows[:top]
@@ -357,7 +381,10 @@ class TgPresence(Star):
         if not picked:
             logger.warning(f"[tg_presence] 精排没返回有效编号：{(raw or '')[:80]}")
             return rows[:top]
-        logger.info(f"[tg_presence] 精排 {len(rows)} -> {len(picked)} 张")
+        logger.info(
+            f"[tg_presence] {'看图' if by_image else '看描述'}精排 "
+            f"{len(rows)} -> {len(picked)} 张"
+        )
         return picked[:top]
 
     def gallery_stat(self) -> dict:
@@ -945,6 +972,68 @@ class TgPresence(Star):
         return mime, base64.b64encode(raw).decode()
 
     @staticmethod
+    def _multi_image_payload(
+        cfg: dict, images: list[tuple[str, str]], prompt: str
+    ) -> dict:
+        """多图请求体。每张图前插一个 [N] 文本标记，模型才知道哪张是哪张。"""
+        fmt = cfg["fmt"]
+        if fmt == "anthropic":
+            content: list = []
+            for i, (mime, b64) in enumerate(images, 1):
+                content.append({"type": "text", "text": f"[{i}]"})
+                content.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime, "data": b64},
+                    }
+                )
+            content.append({"type": "text", "text": prompt})
+            body = {
+                "model": cfg["model"],
+                "max_tokens": cfg["max_tokens"],
+                "system": cfg["system"],
+                "messages": [{"role": "user", "content": content}],
+            }
+        elif fmt == "gemini":
+            parts: list = []
+            for i, (mime, b64) in enumerate(images, 1):
+                parts.append({"text": f"[{i}]"})
+                parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+            parts.append({"text": prompt})
+            body = {
+                "system_instruction": {"parts": [{"text": cfg["system"]}]},
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {"maxOutputTokens": cfg["max_tokens"]},
+            }
+        else:
+            content = []
+            for i, (mime, b64) in enumerate(images, 1):
+                content.append({"type": "text", "text": f"[{i}]"})
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
+            content.append({"type": "text", "text": prompt})
+            body = {
+                "model": cfg["model"],
+                "max_tokens": cfg["max_tokens"],
+                "messages": [
+                    {"role": "system", "content": cfg["system"]},
+                    {"role": "user", "content": content},
+                ],
+            }
+        if cfg["stream"] and fmt != "gemini":
+            body["stream"] = True
+        for k, v in (cfg["extra"] or {}).items():
+            if isinstance(v, dict) and isinstance(body.get(k), dict):
+                body[k].update(v)
+            else:
+                body[k] = v
+        return body
+
+    @staticmethod
     def _text_payload(cfg: dict, prompt: str) -> dict:
         """纯文本请求体。选图精排不需要传图，只比对文字描述。"""
         fmt = cfg["fmt"]
@@ -1072,26 +1161,30 @@ class TgPresence(Star):
         logger.info(f"[tg_presence] 视觉解析 #{pid} 完成，{len(text)} 字")
         return True
 
-    @staticmethod
-    def audit_tags(descr: str) -> tuple[str, list[str]]:
-        """校验描述末尾的 44 项标签行。返回 (归类, 问题列表)。
+    def audit_tags(self, descr: str) -> tuple[str, list[str]]:
+        """校验描述末尾的标签行。返回 (归类, 问题列表)。
 
-        归类：ok / 缺失 / 段数不齐 / 有问题
-        模型在这 44 项上会犯几类固定错误——32/33/34 三项候选值前缀雷同
-        （都有"不可见""被衣物覆盖""裸露-"）经常互填，25 项要填鞋款却填成
-        第 11 项的"穿鞋"，还有"中"→"中等"这种简写。这里只诊断不改数据：
-        非法值往往仍是有意义的词（"项圈"），删了反而丢信息，留着还能被
-        substring 检索命中。
+        归类：ok / 无标签 / 段数不齐 / 有问题
+
+        分两级：
+        · 结构校验（总是做）——段数够不够、编号连不连续。漏一项后面
+          全部错位，这是唯一会真正毁掉数据的错误。
+        · 值校验（仅 tag_strict 开启）——值在不在候选集里。提示词让模型
+          自由用词时这一级会把几乎每张都标成「有问题」，纯噪声，默认关。
+
+        「无标签」是中性的：提示词不要求标签时全库都这样，不该报警。
+
+        只诊断不改数据——非法值往往仍是有意义的词（模型写"项圈"而候选集
+        里只有"皮革项圈"），删了反而丢信息，留着还能被 substring 命中。
         """
-        if not FIELDS:
-            return "ok", []
+        strict = bool(self.conf.get("tag_strict", False)) and bool(FIELDS)
         line = ""
         for raw in reversed((descr or "").splitlines()):
             if "---" in raw and re.match(r"^\s*1\.", raw):
                 line = raw.strip()
                 break
         if not line:
-            return "缺失", ["整行标签没输出"]
+            return "无标签", []
 
         segs = line.split("---")
         issues, nums = [], []
@@ -1101,7 +1194,7 @@ class TgPresence(Star):
                 continue
             i = int(m.group(1))
             nums.append(i)
-            if not 1 <= i <= len(FIELDS):
+            if not strict or not 1 <= i <= len(FIELDS):
                 continue
             name, cand = FIELDS[i - 1]
             allowed = set(cand.split("|"))
@@ -1116,7 +1209,9 @@ class TgPresence(Star):
                 else:
                     issues.append(f"{i}.{name}「{one}」不在候选集")
 
-        if nums != list(range(1, len(FIELDS) + 1)):
+        # 期望项数：严格模式按候选表，否则按这张自己声明的最大编号
+        want = len(FIELDS) if strict and FIELDS else (max(nums) if nums else 0)
+        if not nums or nums != list(range(1, want + 1)):
             issues.insert(0, f"编号不连续：{len(nums)} 项")
             return "段数不齐", issues
         return ("有问题" if issues else "ok"), issues
@@ -1139,7 +1234,7 @@ class TgPresence(Star):
             (text, verdict, "; ".join(issues[:8]), row_id),
         )
         db.commit()
-        if verdict != "ok":
+        if verdict not in ("ok", "无标签"):
             logger.warning(
                 f"[tg_presence] g{row_id} 标签{verdict}：{'; '.join(issues[:3])}"
             )
@@ -2546,22 +2641,19 @@ class TgPresence(Star):
                 for r in bad:
                     lines.append(f"  g{r['id']} [{r['tag_state']}] {(r['tag_issues'] or '')[:70]}")
             miss = db.execute(
-                "SELECT COUNT(*) c FROM photos WHERE tag_state IN ('缺失','段数不齐')"
+                "SELECT COUNT(*) c FROM photos WHERE tag_state = '段数不齐'"
             ).fetchone()["c"]
             if miss:
-                lines.append(
-                    f"\n{miss} 张标签缺失或不齐，/gallery redo 可以把它们排队重跑。"
-                )
-            lines.append("\n注：非法值不影响关键词检索（描述全文照样能搜到），")
-            lines.append("只有要按项精确筛选时才需要在意。")
+                lines.append(f"\n{miss} 张编号不连续，/gallery redo 排队重跑。")
+            lines.append("\n注：检索是拿描述+标签全文做匹配的，值填在第几项不影响，")
+            lines.append("「有问题」不用重跑；「无标签」也正常（提示词没要求标签时如此）。")
             yield event.plain_result("\n".join(lines))
             return
 
         if action == "redo":
             db = self.db()
             n = db.execute(
-                "UPDATE photos SET descr = NULL, fails = 0 "
-                "WHERE tag_state IN ('缺失','段数不齐')"
+                "UPDATE photos SET descr = NULL, fails = 0 WHERE tag_state = '段数不齐'"
             ).rowcount
             db.commit()
             yield event.plain_result(

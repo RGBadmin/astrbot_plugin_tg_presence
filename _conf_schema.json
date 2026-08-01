@@ -189,6 +189,26 @@
     "default": 20,
     "hint": "粗筛先取多少张交给精排。给多了更不容易漏，但每张的完整描述都要塞进请求，token 和延迟同步上涨——20 张约 1~2 万 token。"
   },
+  "tag_strict": {
+    "description": "严格校验标签取值",
+    "type": "bool",
+    "default": false,
+    "hint": "索引时是否检查标签的每个值都在 tag_schema.py 的候选集里。只有当你的提示词给模型列了固定候选值时才该开——让模型自由用词的话，开了会把几乎每张都标成「有问题」，全是噪声。关掉后仍然校验结构（段数、编号连续性），那才是真正会毁数据的错误。"
+  },
+  "picker_mode": {
+    "description": "精排依据",
+    "type": "string",
+    "default": "text",
+    "options": ["text", "image"],
+    "hint": "text = 把候选图的文字描述交给模型比对，便宜。image = 直接把候选图片本身发给多模态模型看图选，准得多——描述再细也是二手信息，当初漏写的东西永远找不回来，而看图不受这个限制。代价是贵：一张图 1500~4800 token，比一段描述贵好几倍，延迟也高。",
+    "obvious_hint": true
+  },
+  "picker_image_max": {
+    "description": "看图精排最多几张",
+    "type": "int",
+    "default": 6,
+    "hint": "仅在精排依据选 image 时生效。粗筛结果会先截到这个数再发图，避免一次传十几张。6 张约 1~3 万 token。"
+  },
   "picker_model": {
     "description": "选图模型 ID",
     "type": "string",
