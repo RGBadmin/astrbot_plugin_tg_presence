@@ -74,6 +74,14 @@
     "hint": "签名是资料页上那句会变的话（setMyShortDescription，120 字符以内），点开 bot 头像就能看到。填 0 表示不限制。"
   },
 
+  "max_context_images": {
+    "description": "上下文里最多保留几张真图",
+    "type": "int",
+    "default": 0,
+    "hint": "AstrBot 把图片以 base64 永久写进对话历史，之后每轮都原样重发——几十张之后既吃 token 又稀释注意力。设成正数后，只保留最近这么多张真图，更早的换成 [图片 #N] 文字占位，角色需要时可用 recall_photo 工具按编号取回。⚠️ 折叠是写回历史的、不可逆，但被折叠的图会先存到 plugin_data/astrbot_plugin_tg_presence/context_photos/ 下，不会真的丢。填 0 表示不处理。",
+    "obvious_hint": true
+  },
+
   "stamp_own_messages": {
     "description": "给角色自己的消息打时间戳",
     "type": "bool",

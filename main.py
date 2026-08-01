@@ -1,4 +1,7 @@
-﻿import json
+﻿import base64
+import binascii
+import hashlib
+import json
 import random
 import re
 import shutil
@@ -27,12 +30,14 @@ STAMP_RE = re.compile(r"^\[\d{2}-\d{2} \d{2}:\d{2}\]")
 # 这是历史里唯一可靠的时间锚点，用来给动态定位插入点
 CTX_TIME_RE = re.compile(r"Current datetime:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
 
+DATA_URL_RE = re.compile(r"^data:image/(?P<ext>[\w+.-]+);base64,(?P<b64>.+)$", re.S)
+
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情",
-    "0.5.1",
+    "0.6.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -190,6 +195,127 @@ class TgPresence(Star):
                 continue
             saved.append(dst)
         return saved
+
+    # --------------------------------------------------------- 上下文图片瘦身
+
+    @filter.on_llm_request(priority=-50)
+    async def prune_context_images(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """只保留最近 N 张真图，更早的换成文字占位。
+
+        AstrBot 把图片以 base64 data URL 的形式写进 conversation history
+        (entities.py:207-222 → internal.py:531)，之后每一轮都原样重发。
+        累积几十张之后既吃 token 又稀释注意力。
+
+        换下来的图先存盘再替换，正文里留 [图片 #N] 的编号，
+        需要重新看时用 recall_photo 工具按编号取回。
+
+        priority=-50 让它在其它注入之后跑，只处理真正的历史图片。
+        """
+        keep = int(self.conf.get("max_context_images", 0) or 0)
+        if keep <= 0:
+            return
+
+        slots: list[tuple[dict, int]] = []
+        for msg in req.contexts or []:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for i, part in enumerate(content):
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    slots.append((msg, i))
+
+        if len(slots) <= keep:
+            return
+
+        store = self.data_dir / "context_photos"
+        store.mkdir(parents=True, exist_ok=True)
+        index = self.state.setdefault("photo_index", {})
+
+        pruned = 0
+        for msg, i in slots[:-keep]:
+            part = msg["content"][i]
+            url = (part.get("image_url") or {}).get("url") or ""
+            pid = self._stash_photo(url, store, index)
+            when = self._context_time(msg)
+            stamp = (
+                datetime.fromtimestamp(when, self._tz()).strftime("%m-%d %H:%M")
+                if when
+                else "时间不详"
+            )
+            msg["content"][i] = {
+                "type": "text",
+                "text": f"[图片 #{pid} · {stamp} · 已折叠，需要重新看就用 recall_photo]",
+            }
+            pruned += 1
+
+        if pruned:
+            self._save_state()
+            logger.info(
+                f"[tg_presence] 上下文图片瘦身：折叠 {pruned} 张，保留最近 {keep} 张"
+            )
+
+    def _stash_photo(self, data_url: str, store: Path, index: dict) -> str:
+        """把 base64 图片存盘并登记编号。已存过的直接复用编号。"""
+        hit = DATA_URL_RE.match(data_url.strip())
+        if not hit:
+            return "?"
+        b64 = hit.group("b64")
+        # 必须用稳定哈希：内置 hash() 对字符串每次进程启动都不同，
+        # 重启后同一张图会被当成新图重复存盘
+        key = hashlib.sha256(b64.encode()).hexdigest()[:16]
+        if key in index:
+            return index[key]
+
+        pid = str(len(index) + 1)
+        ext = hit.group("ext").split("+")[0]
+        if ext == "jpeg":
+            ext = "jpg"
+        path = store / f"{pid}.{ext}"
+        try:
+            path.write_bytes(base64.b64decode(b64))
+        except (binascii.Error, ValueError, OSError) as e:
+            logger.warning(f"[tg_presence] 折叠图片存盘失败 #{pid}: {e}")
+            return "?"
+        index[key] = pid
+        self.state.setdefault("photo_paths", {})[pid] = str(path)
+        return pid
+
+    @filter.llm_tool(name="recall_photo")
+    async def recall_photo(self, event: AstrMessageEvent, photo_id: str):
+        """重新看一张之前被折叠掉的图片。对话里出现 [图片 #12 ...] 这样的占位时，如果你需要真的再看一眼那张图的内容，用这个把它取回来。取回后在下一次回复时你就能看到它。
+
+        Args:
+            photo_id(string): 占位里的编号，比如 12
+        """
+        pid = photo_id.strip().lstrip("#")
+        path = (self.state.get("photo_paths") or {}).get(pid)
+        if not path or not Path(path).exists():
+            return f"找不到 #{pid} 这张图。"
+        self.state.setdefault("recall_queue", [])
+        if pid not in self.state["recall_queue"]:
+            self.state["recall_queue"].append(pid)
+            self._save_state()
+        return f"#{pid} 已取回，你现在能看到它了。"
+
+    @filter.on_llm_request(priority=-60)
+    async def serve_recalled(self, event: AstrMessageEvent, req: ProviderRequest):
+        """把被 recall_photo 点名的图片重新塞进本轮请求。"""
+        queue = self.state.get("recall_queue") or []
+        if not queue:
+            return
+        paths = self.state.get("photo_paths") or {}
+        for pid in queue:
+            p = paths.get(pid)
+            if p and Path(p).exists():
+                try:
+                    req.image_urls.append(Path(p).as_uri())
+                except Exception as e:
+                    logger.warning(f"[tg_presence] 取回图片 #{pid} 失败: {e}")
+        logger.info(f"[tg_presence] 本轮取回 {len(queue)} 张折叠图片")
+        self.state["recall_queue"] = []
+        self._save_state()
 
     # ------------------------------------------------------- 角色消息打时间戳
 
