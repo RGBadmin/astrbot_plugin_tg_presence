@@ -21,6 +21,11 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.star_tools import StarTools
 
+try:
+    from .tag_schema import ALIAS, FIELDS, OWNER
+except ImportError:  # 单文件加载时的兜底，关掉标签校验但插件照常跑
+    FIELDS, OWNER, ALIAS = [], {}, {}
+
 AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
@@ -78,7 +83,9 @@ CREATE TABLE IF NOT EXISTS photos (
     fails   INTEGER NOT NULL DEFAULT 0,
     sent    INTEGER NOT NULL DEFAULT 0,
     last_sent REAL,
-    added   REAL    NOT NULL
+    added   REAL    NOT NULL,
+    tag_state  TEXT,               -- ok / 缺失 / 段数不齐 / 有问题
+    tag_issues TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_folder  ON photos(folder);
 CREATE INDEX IF NOT EXISTS idx_pending ON photos(fails) WHERE descr IS NULL;
@@ -95,7 +102,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.15.0",
+    "0.16.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -181,6 +188,11 @@ class TgPresence(Star):
             self._db = sqlite3.connect(self.db_path)
             self._db.row_factory = sqlite3.Row
             self._db.executescript(GALLERY_SCHEMA)
+            # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
+            have = {r["name"] for r in self._db.execute("PRAGMA table_info(photos)")}
+            for col in ("tag_state", "tag_issues"):
+                if col not in have:
+                    self._db.execute(f"ALTER TABLE photos ADD COLUMN {col} TEXT")
             self._db.commit()
         return self._db
 
@@ -1060,6 +1072,55 @@ class TgPresence(Star):
         logger.info(f"[tg_presence] 视觉解析 #{pid} 完成，{len(text)} 字")
         return True
 
+    @staticmethod
+    def audit_tags(descr: str) -> tuple[str, list[str]]:
+        """校验描述末尾的 44 项标签行。返回 (归类, 问题列表)。
+
+        归类：ok / 缺失 / 段数不齐 / 有问题
+        模型在这 44 项上会犯几类固定错误——32/33/34 三项候选值前缀雷同
+        （都有"不可见""被衣物覆盖""裸露-"）经常互填，25 项要填鞋款却填成
+        第 11 项的"穿鞋"，还有"中"→"中等"这种简写。这里只诊断不改数据：
+        非法值往往仍是有意义的词（"项圈"），删了反而丢信息，留着还能被
+        substring 检索命中。
+        """
+        if not FIELDS:
+            return "ok", []
+        line = ""
+        for raw in reversed((descr or "").splitlines()):
+            if "---" in raw and re.match(r"^\s*1\.", raw):
+                line = raw.strip()
+                break
+        if not line:
+            return "缺失", ["整行标签没输出"]
+
+        segs = line.split("---")
+        issues, nums = [], []
+        for seg in segs:
+            m = re.match(r"^(\d+)\.(.*)$", seg.strip(), re.S)
+            if not m:
+                continue
+            i = int(m.group(1))
+            nums.append(i)
+            if not 1 <= i <= len(FIELDS):
+                continue
+            name, cand = FIELDS[i - 1]
+            allowed = set(cand.split("|"))
+            for one in m.group(2).split(","):
+                one = ALIAS.get(one.strip(), one.strip())
+                if not one or one in allowed:
+                    continue
+                owners = OWNER.get(one)
+                if owners:
+                    who = "、".join(f"{o}.{FIELDS[o - 1][0]}" for o in owners[:3])
+                    issues.append(f"{i}.{name}「{one}」是 {who} 的值")
+                else:
+                    issues.append(f"{i}.{name}「{one}」不在候选集")
+
+        if nums != list(range(1, len(FIELDS) + 1)):
+            issues.insert(0, f"编号不连续：{len(nums)} 项")
+            return "段数不齐", issues
+        return ("有问题" if issues else "ok"), issues
+
     async def _gallery_describe(self, row_id: int, path: str) -> bool:
         """给图库里的一张图做视觉解析，存进索引库。"""
         db = self.db()
@@ -1070,10 +1131,18 @@ class TgPresence(Star):
             db.commit()
             logger.warning(f"[tg_presence] 图库 g{row_id} 索引失败：{e}")
             return False
+
+        verdict, issues = self.audit_tags(text)
         db.execute(
-            "UPDATE photos SET descr = ?, fails = 0 WHERE id = ?", (text, row_id)
+            "UPDATE photos SET descr = ?, fails = 0, tag_state = ?, tag_issues = ? "
+            "WHERE id = ?",
+            (text, verdict, "; ".join(issues[:8]), row_id),
         )
         db.commit()
+        if verdict != "ok":
+            logger.warning(
+                f"[tg_presence] g{row_id} 标签{verdict}：{'; '.join(issues[:3])}"
+            )
         return True
 
     # ----------------------------------------------------- 让角色自己描述图片
@@ -2408,7 +2477,7 @@ class TgPresence(Star):
     async def cmd_gallery(
         self, event: AstrMessageEvent, action: str = "", *, rest: str = ""
     ):
-        """管理相册索引。用法：/gallery [scan|index N|search 关键词|retry]"""
+        """管理相册索引。用法：/gallery [scan|index N|search 词|audit|redo|retry]"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
@@ -2451,6 +2520,55 @@ class TgPresence(Star):
             self.db().execute("UPDATE photos SET fails = 0 WHERE descr IS NULL")
             self.db().commit()
             yield event.plain_result("失败计数已清零，/gallery index 可以重跑那些图了。")
+            return
+
+        if action == "audit":
+            db = self.db()
+            rows = db.execute(
+                "SELECT COALESCE(tag_state,'未校验') s, COUNT(*) c FROM photos "
+                "WHERE descr IS NOT NULL GROUP BY s ORDER BY c DESC"
+            ).fetchall()
+            if not rows:
+                yield event.plain_result("还没有已索引的图。")
+                return
+            total = sum(r["c"] for r in rows)
+            lines = [f"已索引 {total} 张，标签质量："]
+            for r in rows:
+                lines.append(f"  {r['s']:6} {r['c']:>5} 张 ({r['c']*100//total}%)")
+
+            bad = db.execute(
+                "SELECT id, tag_state, tag_issues FROM photos "
+                "WHERE tag_state IS NOT NULL AND tag_state <> 'ok' "
+                "ORDER BY id LIMIT 5"
+            ).fetchall()
+            if bad:
+                lines.append("\n举例：")
+                for r in bad:
+                    lines.append(f"  g{r['id']} [{r['tag_state']}] {(r['tag_issues'] or '')[:70]}")
+            miss = db.execute(
+                "SELECT COUNT(*) c FROM photos WHERE tag_state IN ('缺失','段数不齐')"
+            ).fetchone()["c"]
+            if miss:
+                lines.append(
+                    f"\n{miss} 张标签缺失或不齐，/gallery redo 可以把它们排队重跑。"
+                )
+            lines.append("\n注：非法值不影响关键词检索（描述全文照样能搜到），")
+            lines.append("只有要按项精确筛选时才需要在意。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if action == "redo":
+            db = self.db()
+            n = db.execute(
+                "UPDATE photos SET descr = NULL, fails = 0 "
+                "WHERE tag_state IN ('缺失','段数不齐')"
+            ).rowcount
+            db.commit()
+            yield event.plain_result(
+                f"已把 {n} 张标签有结构问题的图退回待索引，/gallery index 重跑。"
+                if n
+                else "没有需要重跑的图。"
+            )
             return
 
         if action == "search":
@@ -2509,7 +2627,10 @@ class TgPresence(Star):
             )
             return
 
-        yield event.plain_result("用法：/gallery [scan|index N|search 关键词|retry]")
+        yield event.plain_result(
+            "用法：/gallery [scan|index N|search 词|audit|redo|retry]\n"
+            "  audit 看标签质量分布，redo 把结构坏的排队重跑"
+        )
 
     @filter.command("vision")
     async def cmd_vision(self, event: AstrMessageEvent, arg: str = ""):
