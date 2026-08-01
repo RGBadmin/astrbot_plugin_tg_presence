@@ -189,6 +189,49 @@
     "default": 10,
     "hint": "重排后把前几张交给角色，由她自己挑一张发。给太多她挑得费劲、也吃上下文；给太少容易漏掉对的那张。"
   },
+  "embed_model": {
+    "description": "向量模型 ID",
+    "type": "string",
+    "default": "",
+    "hint": "填了才启用语义检索。关键词是词面匹配——你说「足底」而描述里写「脚底」、你说「红底」而标签里是「红色」，就永远搜不到。向量按语义找，能补上这一块。只支持 OpenAI 兼容的 /embeddings 接口（Gemini 的兼容层、各中转站、本地 ollama 都提供）。例：text-embedding-3-small、bge-m3、Qwen3-Embedding。留空则完全不启用，检索退回纯关键词。",
+    "obvious_hint": true
+  },
+  "embed_base_url": {
+    "description": "向量接口地址",
+    "type": "string",
+    "default": "",
+    "hint": "留空则复用视觉 API 的地址。填到 /v1 即可，插件补 /embeddings。注意 Anthropic 不提供向量服务，如果视觉用的是 anthropic 原生格式，这里必须单独填一个 OpenAI 兼容的地址。"
+  },
+  "embed_api_key": {
+    "description": "向量 API Key",
+    "type": "string",
+    "default": "",
+    "hint": "留空则复用视觉 API 的 Key。"
+  },
+  "embed_dim": {
+    "description": "向量维度",
+    "type": "int",
+    "default": 1024,
+    "hint": "要和模型实际输出的维度一致，填错会导致检索结果全乱——/gallery embed test 会当场报出实际维度供核对。支持指定维度的模型会把这个值一起发过去，不支持的会被忽略（插件收到 400 会自动去掉重试）。一万张 × 1024 维常驻内存约 40 MB，用 3072 维也才 120 MB，这个量级不必省。"
+  },
+  "embed_max_chars": {
+    "description": "送去转向量的最长字数",
+    "type": "int",
+    "default": 1800,
+    "hint": "超出会截断，但**结尾的标签行一定保留**——那一行口语词最密集（黑丝、细高跟、M腿），丢了等于把语义检索最该抓住的东西扔掉。注意模型的输入上限：gemini-embedding-001 只有 2048 token（约 1300 汉字），gemini-embedding-2 有 8192。描述加标签通常 1200~1500 字，用 001 的话这里要调到 1200 以下。"
+  },
+  "embed_batch": {
+    "description": "向量批量条数",
+    "type": "int",
+    "default": 32,
+    "hint": "一次请求送多少条描述去转向量。大一点快，但单条描述近千字，太大容易超模型的输入上限。"
+  },
+  "vector_weight": {
+    "description": "向量在匹配度里的占比",
+    "type": "float",
+    "default": 0.4,
+    "hint": "最终匹配度 = 关键词命中率 × (1 - 这个值) + 语义相似度 × 这个值。调高更宽容、更能找到换了说法的图，调低更精确。只影响匹配度这一项，时间和发送条件仍然分层压在它上面。"
+  },
   "sent_window_days": {
     "description": "「最近发过」的天数",
     "type": "int",

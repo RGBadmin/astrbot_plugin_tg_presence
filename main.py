@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import sqlite3
+import struct
 import time
 from datetime import datetime
 from pathlib import Path
@@ -85,6 +86,7 @@ CREATE TABLE IF NOT EXISTS photos (
     last_sent REAL,
     added   REAL    NOT NULL,      -- 扫进库的时间
     file_time REAL,                -- 文件自身的修改时间，才是这张图真正的时间
+    vec     BLOB,                  -- 描述的语义向量，float32 且已归一化
     tag_state  TEXT,               -- ok / 无标签 / 段数不齐 / 有问题
     tag_issues TEXT
 );
@@ -103,7 +105,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.19.0",
+    "0.20.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -123,6 +125,8 @@ class TgPresence(Star):
         self._key_cache: dict[str, str] = {}
         self.db_path = self.data_dir / "gallery.db"
         self._db: sqlite3.Connection | None = None
+        # (ids, numpy矩阵)，第一次语义检索时构建，写入新向量后置空重建
+        self._vec_cache: tuple[list[int], object] | None = None
 
     async def terminate(self):
         """插件卸载或热重载时收尾，别把数据库句柄漏掉。"""
@@ -192,7 +196,7 @@ class TgPresence(Star):
             # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
             have = {r["name"] for r in self._db.execute("PRAGMA table_info(photos)")}
             for col, typ in (("tag_state", "TEXT"), ("tag_issues", "TEXT"),
-                             ("file_time", "REAL")):
+                             ("file_time", "REAL"), ("vec", "BLOB")):
                 if col not in have:
                     self._db.execute(f"ALTER TABLE photos ADD COLUMN {col} {typ}")
             self._db.commit()
@@ -320,6 +324,212 @@ class TgPresence(Star):
             return []
         # 一个词都没中的没意义（没给关键词时例外，那是随手翻）
         return [r for r in rows if not words or r["score"] > 0]
+
+    # ------------------------------------------------------------ 语义向量
+
+    def _embed_conf(self) -> dict | None:
+        """向量接口配置。没填模型就是不启用。"""
+        model = (self.conf.get("embed_model") or "").strip()
+        if not model:
+            return None
+        vis = self._vision_conf() or {}
+        base = (self.conf.get("embed_base_url") or "").strip().rstrip("/")
+        key = (self.conf.get("embed_api_key") or "").strip()
+        if not base:
+            # 复用视觉的地址，但要把它补过的 /chat/completions 去掉
+            base = (self.conf.get("vision_base_url") or "").strip().rstrip("/")
+            base = base.removesuffix("/chat/completions").rstrip("/")
+        if not key:
+            key = vis.get("key", "")
+        if not (base and key):
+            return None
+        if not base.endswith("/embeddings"):
+            base += "/embeddings"
+        return {
+            "url": base,
+            "key": key,
+            "model": model,
+            "dim": max(64, int(self.conf.get("embed_dim", 1024) or 1024)),
+        }
+
+    async def _embed(self, texts: list[str]) -> list[list[float]] | None:
+        """一批文本转向量。只走 OpenAI 兼容的 /embeddings。"""
+        cfg = self._embed_conf()
+        if not cfg or not texts:
+            return None
+        payload = {"model": cfg["model"], "input": texts}
+        # 支持指定维度的模型才认这个字段，不支持的会忽略
+        if cfg["dim"]:
+            payload["dimensions"] = cfg["dim"]
+        headers = {
+            "Authorization": f"Bearer {cfg['key']}",
+            "Content-Type": "application/json",
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.post(cfg["url"], json=payload, headers=headers) as r:
+                    body = await r.text()
+                    if r.status != 200:
+                        # 有些服务不认 dimensions，去掉重试一次
+                        if "dimensions" in payload and r.status == 400:
+                            payload.pop("dimensions")
+                            async with sess.post(
+                                cfg["url"], json=payload, headers=headers
+                            ) as r2:
+                                body = await r2.text()
+                                if r2.status != 200:
+                                    raise VisionError(f"HTTP {r2.status} {body[:200]}")
+                        else:
+                            raise VisionError(f"HTTP {r.status} {body[:200]}")
+                    data = json.loads(body)
+            items = sorted(data["data"], key=lambda x: x.get("index", 0))
+            return [it["embedding"] for it in items]
+        except VisionError:
+            raise
+        except Exception as e:
+            raise VisionError(f"{type(e).__name__}: {e}") from e
+
+    def _embed_text(self, descr: str) -> str:
+        """裁出送去转向量的文本。超长时必须保住结尾的标签行。
+
+        描述九百来字加标签三百多字，对 2048 token 上限的模型（如
+        gemini-embedding-001）正好压线。粗暴地截前 N 个字符会把标签整个切掉，
+        而那一行恰恰是口语词最密集的地方——「黑丝」「细高跟」「M腿」全在那儿，
+        丢了等于把语义检索最该抓住的东西扔了。
+        """
+        descr = descr or ""
+        limit = max(200, int(self.conf.get("embed_max_chars", 1800) or 1800))
+        if len(descr) <= limit:
+            return descr
+        lines = descr.rstrip().splitlines()
+        tail = lines[-1].strip() if lines and "---" in lines[-1] else ""
+        if tail and len(tail) < limit - 100:
+            return descr[: limit - len(tail) - 1].rstrip() + "\n" + tail
+        return descr[:limit]
+
+    @staticmethod
+    def _vec_pack(vec: list[float]) -> bytes:
+        """归一化后存 float32。预归一化之后检索时点积即余弦，省一次开方。"""
+        import math
+
+        n = math.sqrt(sum(v * v for v in vec)) or 1.0
+        return struct.pack(f"<{len(vec)}f", *[v / n for v in vec])
+
+    def _load_matrix(self):
+        """把全库向量读进内存。第一次检索时构建，之后复用。
+
+        8 万张 × 1024 维 float32 约 320 MB。每次检索都从 SQLite 读一遍
+        显然不行，而这个量级又完全不值得上向量数据库，常驻内存最省事。
+        """
+        if self._vec_cache is not None:
+            return self._vec_cache
+        try:
+            import numpy as np
+        except ImportError:
+            logger.warning("[tg_presence] 没装 numpy，语义检索不可用")
+            self._vec_cache = ([], None)
+            return self._vec_cache
+
+        rows = self.db().execute(
+            "SELECT id, vec FROM photos WHERE vec IS NOT NULL ORDER BY id"
+        ).fetchall()
+        if not rows:
+            self._vec_cache = ([], None)
+            return self._vec_cache
+
+        ids = [int(r["id"]) for r in rows]
+        dim = len(rows[0]["vec"]) // 4
+        mat = np.frombuffer(b"".join(r["vec"] for r in rows), dtype="<f4")
+        try:
+            mat = mat.reshape(len(ids), dim)
+        except ValueError:
+            logger.error("[tg_presence] 向量维度不一致，可能换过模型；请 /gallery embed redo")
+            self._vec_cache = ([], None)
+            return self._vec_cache
+        logger.info(f"[tg_presence] 载入 {len(ids)} 条向量 {dim} 维，{mat.nbytes/1048576:.0f} MB")
+        self._vec_cache = (ids, mat)
+        return self._vec_cache
+
+    async def _vector_search(self, query: str, limit: int) -> dict[int, float]:
+        """全库语义检索，返回 {图片id: 余弦相似度}。不可用时返回空。"""
+        if not query.strip() or not self._embed_conf():
+            return {}
+        ids, mat = self._load_matrix()
+        if mat is None or not ids:
+            return {}
+        try:
+            import numpy as np
+
+            got = await self._embed([query])
+            if not got:
+                return {}
+            q = np.asarray(got[0], dtype="<f4")
+            if q.shape[0] != mat.shape[1]:
+                logger.warning(
+                    f"[tg_presence] 查询向量 {q.shape[0]} 维与库里 {mat.shape[1]} 维对不上"
+                )
+                return {}
+            q /= np.linalg.norm(q) or 1.0
+            sims = mat @ q
+            n = min(limit, len(ids))
+            top = np.argpartition(-sims, n - 1)[:n]
+            return {ids[i]: float(sims[i]) for i in top}
+        except VisionError as e:
+            logger.warning(f"[tg_presence] 语义检索失败，退回纯关键词：{e}")
+            return {}
+        except Exception as e:
+            logger.warning(f"[tg_presence] 语义检索出错：{e}")
+            return {}
+
+    async def _recall(
+        self, keywords: str, want: str, folder: str, pool: int
+    ) -> list[sqlite3.Row]:
+        """关键词召回 ∪ 语义召回，合并出候选池并算出统一的匹配度。
+
+        用并集而不是加权合并两条通路：加权要调系数，而且一方的分数会污染
+        另一方——关键词精确命中的图不该因为语义分低就被挤出候选。并集则是
+        两边各自的头部都一定进池，谁都不漏，反正后面还有分层重排收窄。
+
+        进池之后再算统一的匹配度：关键词命中率和语义相似度按 vector_weight
+        加权。这一步是在「匹配度」这个维度内部合成，不影响时间/发送条件
+        压在它上面的分层结构。
+        """
+        words = [w for w in (keywords or "").replace("，", " ").split() if w][:8]
+        kw_rows = self.gallery_search(keywords or want, folder, limit=pool)
+
+        vw = float(self.conf.get("vector_weight", 0.4) or 0)
+        query = " ".join(x for x in (want.strip(), keywords.strip()) if x)
+        vec_hits = await self._vector_search(query, pool) if vw > 0 else {}
+
+        by_id = {int(r["id"]): dict(r) for r in kw_rows}
+        # 语义召回里那些关键词没捞到的，补进池子
+        missing = [i for i in vec_hits if i not in by_id]
+        if missing:
+            marks = ",".join("?" * len(missing))
+            extra = self.db().execute(
+                f"SELECT *, 0 AS score FROM photos WHERE id IN ({marks})", missing
+            ).fetchall()
+            for r in extra:
+                if folder.strip() and folder.strip() not in (r["folder"] or ""):
+                    continue
+                by_id[int(r["id"])] = dict(r)
+
+        n_words = len(words) or 1
+        for pid, row in by_id.items():
+            kw = min(1.0, float(row.get("score") or 0) / n_words)
+            sim = vec_hits.get(pid)
+            # 只有真启用了向量、且这张图在语义 top 里，才把两者混起来
+            row["score"] = kw * (1 - vw) + sim * vw if sim is not None and vw > 0 else kw
+        merged = sorted(
+            by_id.values(), key=lambda r: (-float(r["score"]), int(r["id"]))
+        )[:pool]
+        if vec_hits:
+            logger.debug(
+                f"[tg_presence] 召回 关键词{len(kw_rows)} ∪ 语义{len(vec_hits)} "
+                f"-> {len(merged)} 张"
+            )
+        return merged
 
     def _month_range(self, around: str) -> tuple[float, float] | None:
         """把 YYYY-MM / MM / YYYY-MM-DD 解析成那个月的起止时间戳。
@@ -1581,14 +1791,14 @@ class TgPresence(Star):
             around(string): 他提到某个月份就填，格式 YYYY-MM 或 MM，例如「三月那会儿的」填 03。那个月的图会整体排到前面。没提就留空
         """
         pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
-        rows = self.gallery_search(keywords or want, folder, limit=pool)
+        rows = await self._recall(keywords, want, folder, pool)
         if not rows:
             stat = self.gallery_stat()
             if not stat["indexed"]:
                 return "相册还没建好索引，现在挑不了。"
             return "没找到合适的。换几个词再翻翻，或者把想找的画面整句说出来。"
 
-        # 匹配度取一批 -> 固定权重重排。纯计算，同一段词每次结果都一样
+        # 召回之后按固定逻辑重排。纯计算，同一段词每次结果都一样
         ranked = self._rerank(rows, prefer_sent, around)
         top = max(1, int(self.conf.get("rank_return", 10) or 10))
         picked, by_model = ranked[:top], False
@@ -2657,7 +2867,7 @@ class TgPresence(Star):
     async def cmd_gallery(
         self, event: AstrMessageEvent, action: str = "", *, rest: str = ""
     ):
-        """管理相册索引。用法：/gallery [scan|index N|search 词|audit|redo|retry]"""
+        """管理相册索引。用法：/gallery [scan|index N|search 词|embed N|audit|redo|retry]"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
@@ -2677,6 +2887,12 @@ class TgPresence(Star):
                 lines.append(f"失败跳过：{stat['stuck']} 张（/gallery retry 重来）")
             if stat["sent"]:
                 lines.append(f"累计发出：{stat['sent']} 次")
+            if self._embed_conf():
+                v = self.db().execute(
+                    "SELECT SUM(vec IS NOT NULL) a,"
+                    " SUM(descr IS NOT NULL AND vec IS NULL) b FROM photos"
+                ).fetchone()
+                lines.append(f"语义向量：{v['a'] or 0} 条 · 待转 {v['b'] or 0} 条")
             if not stat["total"]:
                 lines.append("\n先 /gallery scan 扫一遍目录。")
             elif stat["pending"]:
@@ -2700,6 +2916,132 @@ class TgPresence(Star):
             self.db().execute("UPDATE photos SET fails = 0 WHERE descr IS NULL")
             self.db().commit()
             yield event.plain_result("失败计数已清零，/gallery index 可以重跑那些图了。")
+            return
+
+        if action == "embed":
+            db = self.db()
+            if not self._embed_conf():
+                yield event.plain_result(
+                    "没配向量模型。填「向量模型 ID」那一项，地址和 Key 留空会复用视觉 API 的。\n"
+                    "注意 Anthropic 不提供向量服务，视觉用 anthropic 格式的话要单独填地址。"
+                )
+                return
+            arg = rest.strip().lower()
+            if arg == "test":
+                # 光看「有没有报错」不够：内容策略更常见的表现不是拒绝，
+                # 而是照常返回向量、但对敏感内容的区分度塌掉。
+                # 拿三段文本探一下——两段同类不同细节，一段完全无关。
+                probes = [
+                    "卧室床上仰躺，穿黑色丝袜，双腿M型大开，小阴唇外翻蝴蝶形，"
+                    "阴道口微张有透明淫水，阴蒂从包皮露出",
+                    "浴室里站着，白色丝袜半脱到膝盖，背对镜头翘臀，"
+                    "肛门闭合周围干净，没有插入物",
+                    "厨房灶台前系着围裙切西红柿，砧板上有青菜，窗外是白天",
+                ]
+                try:
+                    vs = await self._embed(probes)
+                except VisionError as e:
+                    yield event.plain_result(
+                        f"调不通：{e}\n"
+                        "401 是 Key 错，404 多半是地址或模型 ID 错。\n"
+                        "Gemini 要填 https://generativelanguage.googleapis.com/v1beta/openai"
+                    )
+                    return
+                if not vs or len(vs) != 3:
+                    yield event.plain_result(f"返回条数不对（{len(vs or [])}/3），接口有问题。")
+                    return
+
+                def cos(a, b):
+                    import math
+                    d = sum(x * y for x, y in zip(a, b))
+                    na = math.sqrt(sum(x * x for x in a)) or 1
+                    nb = math.sqrt(sum(x * x for x in b)) or 1
+                    return d / (na * nb)
+
+                s12, s13 = cos(vs[0], vs[1]), cos(vs[0], vs[2])
+                gap = s12 - s13
+                lines = [
+                    f"通了。维度 {len(vs[0])}，配置写的 {self._embed_conf()['dim']}"
+                    + ("  ⚠️ 对不上，按实际维度改配置" if len(vs[0]) != self._embed_conf()["dim"] else ""),
+                    "",
+                    f"两段露骨描述之间   相似度 {s12:.3f}",
+                    f"露骨 vs 厨房做饭   相似度 {s13:.3f}",
+                    f"区分度             {gap:.3f}",
+                ]
+                if len(set(len(v) for v in vs)) > 1:
+                    lines.append("\n❌ 三条维度不一致，接口异常。")
+                elif gap < 0.05:
+                    lines.append(
+                        "\n❌ 区分度几乎为零——露骨内容和做饭被编码得差不多。\n"
+                        "这个模型对这类文本没有有效表示，检索会一直不准。换一个。"
+                    )
+                elif gap < 0.15:
+                    lines.append(
+                        "\n⚠️ 区分度偏低，语义检索效果会打折。可以先跑 200 条看看实际效果。"
+                    )
+                else:
+                    lines.append("\n✅ 区分度正常，可以放量。")
+                yield event.plain_result("\n".join(lines))
+                return
+
+            if arg == "redo":
+                n = db.execute("UPDATE photos SET vec = NULL").rowcount
+                db.commit()
+                self._vec_cache = None
+                yield event.plain_result(
+                    f"已清空 {n} 条向量（换了模型或维度就该这样）。再发 /gallery embed 重建。"
+                )
+                return
+
+            todo = max(1, min(int(arg), 20000)) if arg.isdigit() else 1000
+            rows = db.execute(
+                "SELECT id, descr FROM photos "
+                "WHERE descr IS NOT NULL AND vec IS NULL ORDER BY id LIMIT ?",
+                (todo,),
+            ).fetchall()
+            left_before = db.execute(
+                "SELECT COUNT(*) c FROM photos WHERE descr IS NOT NULL AND vec IS NULL"
+            ).fetchone()["c"]
+            if not rows:
+                done = db.execute(
+                    "SELECT COUNT(*) c FROM photos WHERE vec IS NOT NULL"
+                ).fetchone()["c"]
+                yield event.plain_result(f"没有待转向量的图。已有 {done} 条向量。")
+                return
+
+            batch = max(1, min(int(self.conf.get("embed_batch", 32) or 32), 256))
+            yield event.plain_result(
+                f"待转 {left_before} 条，这次做 {len(rows)} 条，每批 {batch}。"
+            )
+            ok = fail = 0
+            for i in range(0, len(rows), batch):
+                chunk = rows[i : i + batch]
+                try:
+                    vecs = await self._embed([self._embed_text(r["descr"]) for r in chunk])
+                except VisionError as e:
+                    fail += len(chunk)
+                    logger.warning(f"[tg_presence] 转向量失败：{e}")
+                    if fail >= batch * 3:  # 连着几批都挂，别再空转
+                        break
+                    continue
+                if not vecs or len(vecs) != len(chunk):
+                    fail += len(chunk)
+                    continue
+                db.executemany(
+                    "UPDATE photos SET vec = ? WHERE id = ?",
+                    [(self._vec_pack(v), r["id"]) for v, r in zip(vecs, chunk)],
+                )
+                db.commit()
+                ok += len(chunk)
+            self._vec_cache = None  # 有新向量，下次检索重建内存矩阵
+            left = db.execute(
+                "SELECT COUNT(*) c FROM photos WHERE descr IS NOT NULL AND vec IS NULL"
+            ).fetchone()["c"]
+            yield event.plain_result(
+                f"完成 {ok} 条" + (f"，失败 {fail} 条" if fail else "")
+                + f"。还剩 {left} 条"
+                + ("，再发一次 /gallery embed 继续。" if left else "，全部转完。")
+            )
             return
 
         if action == "audit":
@@ -2805,8 +3147,8 @@ class TgPresence(Star):
             return
 
         yield event.plain_result(
-            "用法：/gallery [scan|index N|search 词|audit|redo|retry]\n"
-            "  audit 看标签质量分布，redo 把结构坏的排队重跑"
+            "用法：/gallery [scan|index N|search 词|embed N|audit|redo|retry]\n"
+            "  embed 把描述转成语义向量，audit 看标签质量，redo 重跑结构坏的"
         )
 
     @filter.command("vision")
