@@ -105,7 +105,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.20.1",
+    "0.20.2",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -257,7 +257,18 @@ class TgPresence(Star):
         root = self._gallery_root()
         if not root:
             return 0, 0
-        db = self.db()
+
+        # 这个方法通过 asyncio.to_thread 跑在工作线程里——扫几万个文件要几十秒，
+        # 不能占着事件循环。但 SQLite 连接不许跨线程用，所以开一条本线程自己的，
+        # 用完就关。建表由主线程的 self.db() 负责，这里只管读写。
+        db = sqlite3.connect(self.db_path)
+        db.row_factory = sqlite3.Row
+        try:
+            return self._scan_into(db, root)
+        finally:
+            db.close()
+
+    def _scan_into(self, db: sqlite3.Connection, root: Path) -> tuple[int, int]:
         before = db.execute("SELECT COUNT(*) c FROM photos").fetchone()["c"]
 
         # UPSERT 而不是 INSERT OR IGNORE：已登记的行也要刷新 file_time，
