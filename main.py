@@ -95,7 +95,7 @@ class VisionError(Exception):
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.13.3",
+    "0.13.4",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -1326,7 +1326,7 @@ class TgPresence(Star):
         """手动发一张照片。用法：/photo g123 [附言]"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if not photo_id:
             yield event.plain_result("用法：/photo g123 [附言]，编号从 /gallery search 查。")
@@ -1720,7 +1720,7 @@ class TgPresence(Star):
         """手动发一条动态。用法：/moment 正文"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if not text:
             yield event.plain_result("用法：/moment 动态正文")
@@ -1788,7 +1788,7 @@ class TgPresence(Star):
         """手动换头像。用法：/avatar [分类]"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         yield event.plain_result(
             await self._do_avatar(event, category, enforce_limits=False)
@@ -1862,7 +1862,7 @@ class TgPresence(Star):
         """手动改签名。用法：/signature 新签名"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if not text:
             yield event.plain_result("用法：/signature 新的签名内容")
@@ -1913,7 +1913,7 @@ class TgPresence(Star):
         """查看插件状态：已发动态数、各项冷却剩余。"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
 
         moments = self.state.get("moments", [])
@@ -2087,17 +2087,59 @@ class TgPresence(Star):
         )
         return (getattr(resp, "completion_text", "") or "").strip()
 
+    @filter.command("whoami")
+    async def cmd_whoami(self, event: AstrMessageEvent):
+        """诊断：这个会话里你是谁、插件读到的管理员名单认不认你。不需要管理员权限。"""
+        self._seal_command(event)
+        sid = str(event.get_sender_id())
+        umo = event.unified_msg_origin
+        lines = [
+            f"你的 ID：{sid}",
+            f"当前身份：{event.role or '（普通用户）'}",
+            f"机器人名称：{self._umo_platform(umo)}",
+            f"会话 UMO：{umo}",
+        ]
+
+        try:
+            admins = self.context.get_config(umo=umo).get("admins_id", []) or []
+        except Exception as e:
+            lines.append(f"\n读配置失败：{e}")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # 逐字复刻 WakingCheckStage 的判定：str(sender_id) == admin_id
+        exact = [a for a in admins if sid == a]
+        loose = [a for a in admins if str(a).strip() == sid]
+        lines.append(f"\n这个会话的 admins_id 共 {len(admins)} 项")
+
+        if exact:
+            lines.append("✅ 精确匹配成功，你在这份名单里")
+            if event.role != "admin":
+                lines.append(
+                    "但身份仍不是 admin —— 名单是对的，问题在别处，把这段发出来我看。"
+                )
+        elif loose:
+            bad = loose[0]
+            lines.append(
+                f"⚠️ 名单里有你的 ID，但存成了 {type(bad).__name__} 类型：{bad!r}\n"
+                'AstrBot 比的是字符串，必须是带引号的 "'
+                + sid
+                + '"，不能是纯数字、也不能带空格。'
+            )
+        else:
+            lines.append(
+                "❌ 你的 ID 不在这份名单里。\n"
+                "注意 admins_id 是按**配置文件**读的——这个会话路由到的那份没填你，"
+                "在别的配置文件里填了不算。"
+            )
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("link")
     async def cmd_link(self, event: AstrMessageEvent, action: str = ""):
         """在角色的会话里执行，把这个会话设为导演指令的投递目标。/link show 查看当前绑定。"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result(
-                "只有管理员能用这个指令。\n"
-                f"你的 ID 是 {event.get_sender_id()}，"
-                "确认它填进了**这个 bot 所用配置文件**的 admins_id 里 —— "
-                "多配置文件时每份都要填，另一份填了不算。"
-            )
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
 
         umo = event.unified_msg_origin
@@ -2147,7 +2189,7 @@ class TgPresence(Star):
         """在控制台里用：让角色原样说一句话。用法：/say 内容"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if err := self._director_guard(event):
             yield event.plain_result(err)
@@ -2159,7 +2201,7 @@ class TgPresence(Star):
         """在控制台里用：给个方向，让角色自己组织语言发出去。用法：/act 跟他说你今天加班到很晚"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if err := self._director_guard(event):
             yield event.plain_result(err)
@@ -2188,7 +2230,7 @@ class TgPresence(Star):
         """管理相册索引。用法：/gallery [scan|index N|search 关键词|retry]"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
 
         action = (action or "").strip().lower()
@@ -2293,7 +2335,7 @@ class TgPresence(Star):
         """给还没有细节记录的存量图片补做视觉解析。用法：/vision [张数|retry|test]"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。")
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
 
         cfg = self._vision_conf()
