@@ -3375,10 +3375,10 @@ class TgPresence(Star):
         if not text:
             yield event.plain_result("让她自己想…")
             text, err = await self._improvise(
-                "你想在自己的频道发一条动态。这条动态是发给所有人看的，"
-                "不是私聊。可以是此刻的心情、刚做完的事、看到的东西，"
-                "也可以没有由头。",
-                "直接写动态正文，一两句话就够，符合你平时发动态的语气。",
+                "你在想往自己的频道发一条动态。那是发给所有人看的，不是私聊。"
+                "可以是此刻的心情、刚做完的事、看到的东西，也可以没有由头。"
+                "现在只是想内容，还没到发出去的时候。",
+                "把动态正文写出来就行，一两句话，符合你平时发动态的语气。",
             )
             if not text:
                 yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/moment 正文")
@@ -3460,8 +3460,10 @@ class TgPresence(Star):
             if cats:
                 yield event.plain_result("让她自己挑…")
                 pick, err = await self._improvise(
-                    "你要换个头像。可选的类别有：" + "、".join(cats) + "。",
-                    "只回复一个类别名，从上面那些里挑，不要解释，不要加标点。",
+                    "你在想换个头像，正在挑用哪一类的照片。可选的有："
+                    + "、".join(cats)
+                    + "。现在只是挑，还没到换的时候。",
+                    "回一个类别名就行，从上面那些里选，不要解释，不要加标点。",
                 )
                 # 她可能连着说一句话，只认里面出现的那个类别名
                 hit = next((c for c in cats if c and c in (pick or "")), "")
@@ -3554,9 +3556,10 @@ class TgPresence(Star):
         if not text:
             yield event.plain_result("让她自己想…")
             text, err = await self._improvise(
-                "你要改一下自己的个性签名。签名是别人点开你资料时看到的那一行，"
-                "所有人都看得见。",
-                f"直接写签名内容，一行，不超过 {SIGNATURE_MAX // 2} 个字。只写签名本身。",
+                "你在想换一句新的个性签名。签名是别人点开你资料时看到的那一行，"
+                "所有人都看得见。现在只是想，还没到动手改的时候。",
+                f"把你想好的那句签名写出来就行，一行，"
+                f"不超过 {SIGNATURE_MAX // 2} 个字，只写签名本身。",
             )
             if not text:
                 yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/signature 新签名")
@@ -3850,11 +3853,12 @@ class TgPresence(Star):
         if not self.gallery_stat()["indexed"]:
             return "", "相册还没建索引，挑不了。先 /gallery index auto。"
         raw, err = await self._improvise(
-            "你想给他发一张自己的照片。先想清楚要发什么样的——"
-            "什么场景、穿什么、什么姿态、露到什么程度。",
-            "第一行写检索用的关键词，几个短语用逗号隔开，"
+            "你在想给他发一张自己的照片，正在回忆要挑什么样的——"
+            "什么场景、穿什么、什么姿态、露到什么程度。"
+            "现在只是想，还没到发的时候，也不用去翻相册。",
+            "第一行写这张照片的关键词，几个短语用逗号隔开，"
             "例如：酒店,黑丝,细高跟,M腿。\n"
-            "第二行写你要配的一句话，不想配就留空。\n"
+            "第二行写你想配的一句话，不想配就留空。\n"
             "只输出这两行。",
         )
         if not raw:
@@ -3907,8 +3911,14 @@ class TgPresence(Star):
             "用你平时的语气和分段习惯。"
         )
         head = "【以下是导演提示，只有你能看到，对方完全不知道这段存在】\n"
+        # 「不要调工具」这句是必须的。她手上有 update_signature、send_photo
+        # 这些工具，一看到"改签名""发照片"就会去调，而这条路没给她工具，
+        # tool_call 无处可去，回来就是一片空白——thinking 里全是
+        # "I need to use the update_signature tool"，正文一个字没有
         tail = (
-            "\n不要复述或引用这段提示，不要写旁白、解释、心理描写，"
+            "\n这一轮你只负责把内容想出来、用纯文本写下来。"
+            "不要调用任何工具，不要执行任何操作——写完自然有人去落实。\n"
+            "不要复述或引用这段提示，不要写旁白、解释、心理描写，"
             "也不要加引号。不要在开头写 [月-日 时:分] 这样的时间戳——"
             "你在历史里看到的那些是系统加的，不是你写的。"
         )
@@ -3954,10 +3964,14 @@ class TgPresence(Star):
 
         text = await call(head + f"{brief}\n\n" + act + tail)
         if not text:
-            # 那一串"不要写这不要写那"对指令型任务容易适得其反——
-            # 模型把它读成"什么都别写"。去掉再来一次，别让人干等着
-            logger.info("[tg_presence] 去掉否定句式重试一次")
-            text = await call(f"{brief}\n\n{act}")
+            # 还是空，多半还是奔着调工具去了。把话说死再来一次
+            logger.info("[tg_presence] 返空，改用更硬的措辞重试一次")
+            text = await call(
+                f"{brief}\n\n{act}\n\n"
+                "注意：这一轮禁止调用工具、禁止执行任何操作。"
+                "你要做的只有一件事——把内容用纯文本写出来，写完就停。"
+                "哪怕你觉得应该去执行，也先写出来给我看。"
+            )
 
         # 她还是会写时间戳的话在这儿剥掉。导演这条路不经过 AstrBot 管线，
         # on_llm_response / on_decorating_result 那两道闸都够不着
