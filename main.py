@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import inspect
 import json
 import math
 import mimetypes
@@ -200,10 +201,58 @@ VEC_SEGS: dict[str, tuple[int, ...] | None] = {
 # 不锚定的话它会被当成层标题，把真正的第一层内容整段吃掉
 LAYER_RE = re.compile(r"^[\s*·・-]*第\s*([一二三四五六])\s*层[^\n]*", re.M)
 LAYER_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
+
+# 插件自带控制台支持的指令 -> handler 名。
+# 只收不需要平台 client 的那些：/photo /moment /avatar /signature 得借
+# 角色那个 bot 的身份去调 Telegram（发图、改头像、改签名），控制台拿不到
+# 它的 client，那四条继续在角色的会话里发
+CONSOLE_ROUTES = {
+    "gallery": "cmd_gallery",
+    "vision": "cmd_vision",
+    "presence": "cmd_presence",
+    "proactive": "cmd_proactive",
+    "link": "cmd_link",
+    "say": "cmd_say",
+    "act": "cmd_act",
+    "whoami": "cmd_whoami",
+}
 # 九宫格的逐格描述。挑图时它们没有判别力——十张图开头都是「左上：白色墙面」
 GRID_RE = re.compile(r"^(左上|中上|右上|左中|正中|右中|左下|中下|右下)\s*[：:]")
 # 描述一变，所有分段向量都得作废，不能只清主向量
 VEC_NULLS = ", ".join(f"{c} = NULL" for c in VEC_SEGS)
+
+
+class ConsoleEvent:
+    """给插件自带控制台用的假 event。
+
+    handler 都是按 AstrMessageEvent 写的，为了不把十几个 handler 改成
+    双入口，这里补一个最小实现：接住 plain_result、报出发送者身份。
+    role 直接给 admin —— 能走到这儿说明已经过了白名单，控制台本来就是
+    你一个人的。
+    """
+
+    def __init__(self, uid: str, chat_id):
+        self.unified_msg_origin = f"console:FriendMessage:{chat_id}"
+        self.role = "admin"
+        self.replies: list[str] = []
+        self._uid = str(uid)
+
+    def plain_result(self, text: str) -> str:
+        if text:
+            self.replies.append(text)
+        return text
+
+    def get_sender_id(self) -> str:
+        return self._uid
+
+    def get_platform_name(self) -> str:
+        return "console"
+
+    def should_call_llm(self, _flag: bool) -> None:
+        """控制台不经过 AstrBot 管线，没有"要不要丢给 LLM"这回事。"""
+
+    def get_result(self):
+        return None
 
 
 class VisionError(Exception):
@@ -260,6 +309,8 @@ class TgPresence(Star):
         self._index_note: str = ""
         # 主动消息的倒计时循环。懒启动——__init__ 时还不一定有事件循环
         self._proactive_task: asyncio.Task | None = None
+        # 插件自带控制台的长轮询
+        self._console_task: asyncio.Task | None = None
 
     @staticmethod
     def _walk_conf(node, out: dict) -> dict:
@@ -332,12 +383,17 @@ class TgPresence(Star):
             )
         return flat
 
+    async def initialize(self):
+        """AstrBot 装载插件后调用。控制台得在这儿起——它不该等到你
+        先跟角色说一句话才上线。"""
+        self._ensure_console()
+
     async def terminate(self):
         """插件卸载或热重载时收尾，别把数据库句柄漏掉。"""
-        for task in (self._index_task, self._proactive_task):
+        for task in (self._index_task, self._proactive_task, self._console_task):
             if task and not task.done():
                 task.cancel()  # 后台任务跟着插件一起走
-        self._index_task = self._proactive_task = None
+        self._index_task = self._proactive_task = self._console_task = None
         if self._db is not None:
             try:
                 self._db.commit()
@@ -3447,22 +3503,26 @@ class TgPresence(Star):
 
     def _director_guard(self, event: AstrMessageEvent) -> str | None:
         """校验这条指令来自控制台、且目标绑对了。返回 None 放行。"""
-        did = self._director_id()
-        if not did:
-            return (
-                "没配控制台。在插件配置里填「控制台机器人名称」——"
-                "WebUI「平台配置」里另一个 bot 那一栏的第一项。"
-            )
-        if self._platform_of(event) != did:
-            return "这条指令只能在控制台那个 bot 里发——在这儿发等于当着他的面喊话。"
+        here = self._platform_of(event)
+        # 插件自带的控制台天生就是"另一头"，不用再对机器人名称
+        if here != "console":
+            did = self._director_id()
+            if not did:
+                return (
+                    "没配控制台。两种办法：在插件配置里填「控制台 Bot Token」"
+                    "用插件自带的控制台，或者填「控制台机器人名称」"
+                    "沿用 AstrBot 里接入的另一个 bot。"
+                )
+            if here != did:
+                return "这条指令只能在控制台里发——在这儿发等于当着他的面喊话。"
         target = (self.state.get("director_target") or "").strip()
         if not target:
             return (
                 "还没绑定目标会话。\n"
                 "在这儿发：/link 角色机器人名称:FriendMessage:会话ID"
             )
-        if self._umo_platform(target) == did:
-            # 目标是控制台自己的话，消息会发回控制台、历史也写进控制台的会话，
+        if self._umo_platform(target) in ("console", self._director_id() or "\0"):
+            # 目标绑到控制台自己的话，消息会发回控制台、历史也写进控制台的会话，
             # 角色那边什么都没有，但看着像成功了
             return (
                 f"投递目标绑到控制台自己了：\n{target}\n\n"
@@ -3815,6 +3875,148 @@ class TgPresence(Star):
         ]
         yield event.plain_result("\n".join(msg))
 
+    # ------------------------------------------------------- 插件自带的控制台
+
+    def _console_admins(self) -> set[str]:
+        raw = (self.conf.get("console_admins") or "").replace("，", ",")
+        return {x.strip() for x in raw.split(",") if x.strip()}
+
+    async def _tg_api(self, method: str, timeout: int = 15, **params):
+        """直接打 Telegram Bot API。控制台不经过 AstrBot 的平台系统。"""
+        token = (self.conf.get("console_token") or "").strip()
+        if not token:
+            return None
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as sess:
+                async with sess.post(url, json=params) as r:
+                    data = await r.json()
+            if not data.get("ok"):
+                logger.warning(f"[tg_presence] 控制台 {method} 失败：{data.get('description')}")
+                return None
+            return data.get("result")
+        except asyncio.TimeoutError:
+            return None
+        except Exception as e:
+            logger.warning(f"[tg_presence] 控制台 {method} 出错：{e}")
+            return None
+
+    async def _console_say(self, chat_id, text: str) -> None:
+        """回消息。超过 Telegram 单条上限就切开发。"""
+        for i in range(0, len(text), 3800):
+            await self._tg_api("sendMessage", chat_id=chat_id, text=text[i : i + 3800])
+
+    @staticmethod
+    def _bind_args(func, rest: str) -> tuple[list, dict]:
+        """按 handler 的签名把参数切出来，规则跟 AstrBot 那套对齐。
+
+        位置参数一个词一个，keyword-only（写在 * 之后的那个）吃掉剩下的
+        全部文本——所以 /gallery index auto 会切成 action='index'、rest='auto'，
+        而 /act 后面整句话都进 brief。
+        """
+        args: list = []
+        kwargs: dict = {}
+        remain = (rest or "").strip()
+        for name, p in inspect.signature(func).parameters.items():
+            if name in ("self", "event"):
+                continue
+            if p.kind is p.KEYWORD_ONLY:
+                kwargs[name] = remain
+                remain = ""
+            elif p.kind is p.VAR_KEYWORD:
+                continue
+            elif remain:
+                head, _, remain = remain.partition(" ")
+                args.append(head)
+                remain = remain.strip()
+            # 位置参数没东西可填就跳过它用默认值，但不能就此收手——
+            # /gallery 不带参数时，后面那个 keyword-only 的 rest 还等着赋值
+        return args, kwargs
+
+    async def _console_run(self, chat_id, uid: str, text: str) -> None:
+        """把控制台收到的一行指令交给对应的 handler，回复原样转发回去。"""
+        name, _, rest = text[1:].partition(" ")
+        name = name.split("@", 1)[0].strip().lower()  # /gallery@mybot 也认
+        handler = CONSOLE_ROUTES.get(name)
+        if handler is None:
+            await self._console_say(
+                chat_id,
+                f"没有 /{name} 这个指令。\n可用：" + "、".join(f"/{k}" for k in CONSOLE_ROUTES),
+            )
+            return
+
+        func = getattr(self, handler)
+        ev = ConsoleEvent(uid, chat_id)
+        try:
+            args, kwargs = self._bind_args(func, rest)
+            async for _ in func(ev, *args, **kwargs):
+                # handler 是 async generator，每 yield 一次就回一条
+                while ev.replies:
+                    await self._console_say(chat_id, ev.replies.pop(0))
+        except Exception as e:
+            logger.error(f"[tg_presence] 控制台执行 /{name} 出错：{e}", exc_info=True)
+            await self._console_say(chat_id, f"执行 /{name} 出错：{e}")
+            return
+        while ev.replies:
+            await self._console_say(chat_id, ev.replies.pop(0))
+
+    async def _console_loop(self) -> None:
+        """长轮询收指令。跟 AstrBot 的平台系统完全无关，不会跟它抢 getUpdates。"""
+        offset = 0
+        # 起来先把积压的旧消息丢掉，免得重启后把几小时前的指令重跑一遍
+        if backlog := await self._tg_api("getUpdates", timeout=10, offset=-1, limit=1):
+            offset = backlog[-1]["update_id"] + 1
+        me = await self._tg_api("getMe", timeout=10)
+        logger.info(
+            f"[tg_presence] 控制台已上线：@{(me or {}).get('username', '?')}，"
+            f"管理员 {len(self._console_admins())} 人"
+        )
+        while True:
+            try:
+                updates = await self._tg_api(
+                    "getUpdates", timeout=40, offset=offset, limit=20, allowed_updates=["message"]
+                )
+                if not updates:
+                    await asyncio.sleep(3)
+                    continue
+                for u in updates:
+                    offset = max(offset, u.get("update_id", 0) + 1)
+                    msg = u.get("message") or {}
+                    text = (msg.get("text") or "").strip()
+                    if not text.startswith("/"):
+                        continue
+                    uid = str((msg.get("from") or {}).get("id", ""))
+                    chat = (msg.get("chat") or {}).get("id")
+                    admins = self._console_admins()
+                    if not admins:
+                        logger.warning(
+                            f"[tg_presence] 控制台没配管理员，忽略来自 ID {uid} 的消息。"
+                            "在「控制台管理员 ID」里填上你自己的 ID 才会响应"
+                        )
+                        continue
+                    if uid not in admins:
+                        logger.warning(f"[tg_presence] 控制台收到非管理员消息，来自 ID {uid}")
+                        continue
+                    await self._console_run(chat, uid, text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[tg_presence] 控制台轮询出错：{e}")
+                await asyncio.sleep(10)
+
+    def _ensure_console(self) -> None:
+        """懒启动控制台。没填 token 就不起。"""
+        if not (self.conf.get("console_token") or "").strip():
+            return
+        if self._console_task and not self._console_task.done():
+            return
+        try:
+            self._console_task = asyncio.create_task(self._console_loop())
+        except RuntimeError:
+            pass
+
     # --------------------------------------------------------------- 主动消息
 
     def _next_gap(self) -> float:
@@ -3950,6 +4152,7 @@ class TgPresence(Star):
         if self._umo_platform(umo) == self._director_id():
             return
         self._ensure_proactive()
+        self._ensure_console()  # initialize 没被调到时的兜底
         if self.conf.get("proactive_enable", False):
             self._touch_proactive(umo)
 

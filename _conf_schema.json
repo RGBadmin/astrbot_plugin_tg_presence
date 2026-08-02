@@ -490,10 +490,24 @@
     }
   },
   "director": {
-    "description": "⑧ 导演模式",
+    "description": "⑧ 控制台与导演",
     "type": "object",
-    "hint": "从另一个 bot 发指令让她说话，指令不进她的上下文，也不出现在聊天窗口。",
+    "hint": "控制台是你发指令的地方，导演模式是让她替你说话。可以用插件自带的独立 bot（下面填 token），也可以继续用 AstrBot 里接入的另一个 bot。",
     "items": {
+      "console_token": {
+        "description": "控制台 Bot Token",
+        "type": "string",
+        "default": "",
+        "hint": "另开一个 Telegram bot 专门收插件指令，跟 BotFather 要 token 填这里。填了才启用——留空的话所有指令仍走 AstrBot 接入的那个 bot。好处是不用在 AstrBot 平台配置里多加一个通道：那样两个 bot 抢同一套轮询容易报 Conflict，而且导演指令混在角色的会话列表里也乱。这个 bot 由插件自己长轮询，跟 AstrBot 的平台系统完全无关。",
+        "obvious_hint": true
+      },
+      "console_admins": {
+        "description": "控制台管理员 ID",
+        "type": "string",
+        "default": "",
+        "hint": "允许使用控制台的 Telegram 用户 ID，多个用逗号分隔，例如 8338355157。留空时控制台谁的消息都不回（包括你自己）——这是有意的：token 万一泄露，没填白名单就等于没开门。不知道自己 ID 的话，先填一个随便的值，然后给控制台 bot 发一句话，日志里会打印出「控制台收到非管理员消息，来自 ID xxx」。",
+        "obvious_hint": true
+      },
       "director_platform_id": {
         "description": "控制台机器人名称",
         "type": "string",
