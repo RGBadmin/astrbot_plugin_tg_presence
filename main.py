@@ -27,6 +27,45 @@ try:
 except ImportError:  # 单文件加载时的兜底，关掉标签校验但插件照常跑
     FIELDS, OWNER, ALIAS = [], {}, {}
 
+
+def _build_vocab() -> frozenset:
+    """拿标签候选值凑一份中文分词词典。
+
+    中文不写空格。人说「红底细高跟」，而库里是「红底」和「细高跟」两个
+    分开的词，整串 LIKE 必然落空——这类词组恰恰是检索里最常用的说法。
+    标签候选值本来就是这个领域最常用词的集合，拿来当词典比引一个通用
+    分词库更贴题，还不用多一个依赖。
+
+    「无」「空」「无法判断」这些占位词要剔掉：它们在库里遍地都是，
+    切出来只会让每张图都命中一次，纯噪声。
+    """
+    stop = {"无", "空", "有", "没有", "未知", "其它", "其他", "无法判断", "不可见"}
+    vocab = set()
+
+    def put(s: str) -> None:
+        s = s.strip()
+        if len(s) >= 2 and s not in stop:
+            vocab.add(s)
+
+    for _name, cand in FIELDS:
+        for v in cand.split("|"):
+            for one in v.replace("，", ",").split(","):
+                put(one)
+                # 「室内-酒店」这类复合值要把两截也收进来：
+                # 人嘴上说的是「酒店」，不会说「室内-酒店」
+                if "-" in one:
+                    for part in one.split("-"):
+                        put(part)
+    for k in ALIAS:
+        put(k)
+    return frozenset(vocab)
+
+
+TAG_VOCAB = _build_vocab()
+# 词典切不动的部分退回二元组滑窗。噪声片段（「色情」「趣内」）匹配不上
+# 就是不加分，不会误召回，只是把分数摊薄一点
+GRAM_MIN_LEN = 4
+
 AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
@@ -373,6 +412,71 @@ class TgPresence(Star):
         total = db.execute("SELECT COUNT(*) c FROM photos").fetchone()["c"]
         return total - before, total
 
+    @staticmethod
+    def _split_query(keywords: str, cap: int = 16) -> list[str]:
+        """把检索词切成能真正匹配上的片段。
+
+        先按空格和标点切，再对每个中文长词做一次词典正向最大匹配——
+        人说「红色情趣内衣」，库里写的是「红色蕾丝连体情趣内衣」，
+        整串匹配不到，切成「红色」「情趣内衣」就都中了。
+
+        原词也保留并排在最前：它要是真能整串命中，那是最强的信号，
+        不该因为拆开而丢掉。
+        """
+        raw = [
+            w
+            for w in re.split(r"[\s,，、;；/]+", (keywords or "").strip())
+            if w
+        ]
+        out: list[str] = []
+        for w in raw:
+            cjk_long = len(w) >= 3 and re.search(r"[一-鿿]", w)
+            pieces = TgPresence._seg(w) if cjk_long else []
+            # 整串原词保留——真能命中的话那是最强信号。但十来个字的整句
+            # 不可能逐字出现在描述里，留着只是白占一个 LIKE 位置
+            if (len(w) <= 8 or not pieces) and w not in out:
+                out.append(w)
+            for piece in pieces:
+                if piece not in out:
+                    out.append(piece)
+        return out[:cap]
+
+    @staticmethod
+    def _seg(word: str) -> list[str]:
+        """正向最大匹配切词，词典啃不动的残段退回二元组滑窗。
+
+        标签词典只覆盖 44 项候选值，而人搜的词一大半来自描述正文——
+        「酒店」「百叶窗」「路灯」「枕头」这些一个都不在候选值里。
+        所以残段不能丢，得按二元组补上，否则「酒店里穿灰丝」里的
+        「酒店」就凭空消失了。
+
+        词典词排在前面：它们更可靠，截断时该优先保住。二元组噪声
+        （「店里」「里穿」）匹配不上就是不加分，不会误召回。
+        """
+        solid, fuzzy, buf, i, n = [], [], [], 0, len(word)
+
+        def flush() -> None:
+            s = "".join(buf)
+            buf.clear()
+            if len(s) >= 2:
+                fuzzy.extend(s[k : k + 2] for k in range(len(s) - 1))
+
+        while i < n:
+            for j in range(min(n, i + 6), i + 1, -1):
+                if word[i:j] in TAG_VOCAB:
+                    flush()
+                    solid.append(word[i:j])
+                    i = j
+                    break
+            else:
+                buf.append(word[i])
+                i += 1
+        flush()
+        # 一个词典词都没切出来的短词，外面已经把整串加过了，不用再拆
+        if not solid and n < GRAM_MIN_LEN:
+            return []
+        return solid + fuzzy
+
     def gallery_search(
         self, keywords: str = "", folder: str = "", limit: int = 8
     ) -> list[sqlite3.Row]:
@@ -383,7 +487,7 @@ class TgPresence(Star):
         交集就是空，整句话什么都搜不到。改成打分——命中 5 个词的图排在
         命中 2 个的前面，漏词只降排名不至于让图消失。
         """
-        words = [w for w in keywords.replace("，", " ").split() if w][:8]
+        words = self._split_query(keywords)
         args: list = []
         if words:
             score = " + ".join(["(descr LIKE ?)"] * len(words))  # SQLite 里布尔就是 0/1
@@ -579,7 +683,8 @@ class TgPresence(Star):
         加权。这一步是在「匹配度」这个维度内部合成，不影响时间/发送条件
         压在它上面的分层结构。
         """
-        words = [w for w in (keywords or "").replace("，", " ").split() if w][:8]
+        # 分母必须和 gallery_search 用同一套切分，否则命中率算出来大于 1
+        words = self._split_query(keywords or want)
         kw_rows = self.gallery_search(keywords or want, folder, limit=pool)
 
         vw = float(self.conf.get("vector_weight", 0.4) or 0)
