@@ -708,6 +708,8 @@ class TgPresence(Star):
         for pid, row in by_id.items():
             kw = min(1.0, float(row.get("score") or 0) / n_words)
             sim = vec_hits.get(pid)
+            # 留痕给 /gallery search 看：这张是词面命中的，还是语义捞回来的
+            row["kw_score"], row["sim_score"] = kw, sim
             # 只有真启用了向量、且这张图在语义 top 里，才把两者混起来
             row["score"] = kw * (1 - vw) + sim * vw if sim is not None and vw > 0 else kw
         merged = sorted(
@@ -3757,16 +3759,43 @@ class TgPresence(Star):
             return
 
         if action == "search":
-            rows = self.gallery_search(rest, limit=10)
-            if not rows:
-                yield event.plain_result("没找到。")
+            if not rest.strip():
+                yield event.plain_result("要搜什么？例如 /gallery search 红色情趣内衣")
                 return
-            yield event.plain_result(
-                "\n".join(
-                    f"g{r['id']} · [{r['folder'] or '根目录'}] {(r['descr'] or '')[:60]}"
-                    for r in rows
+            # 走 _recall 而不是 gallery_search——那才是桃桃调 browse_gallery 时
+            # 实际走的路径。只测关键词那条路的话，向量有没有生效根本看不出来
+            pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
+            rows = await self._recall(rest, "", "", pool)
+            if not rows:
+                yield event.plain_result(
+                    "没找到。\n切词：" + " / ".join(self._split_query(rest))
                 )
-            )
+                return
+
+            vw = float(self.conf.get("vector_weight", 0.4) or 0)
+            n_kw = sum(1 for r in rows if (r.get("kw_score") or 0) > 0)
+            n_vec = sum(1 for r in rows if r.get("sim_score") is not None)
+            head = [
+                "切词：" + " / ".join(self._split_query(rest)),
+                f"候选 {len(rows)} 张（词面命中 {n_kw} · 语义召回 {n_vec}）",
+            ]
+            if vw <= 0:
+                head.append("⚠ 语义权重是 0，向量路没启用")
+            elif not n_vec:
+                head.append("⚠ 语义一张都没召回，/gallery embed 转过向量没有？")
+            head.append("─" * 18)
+
+            lines = []
+            for r in rows[:10]:
+                kw, sim = r.get("kw_score") or 0, r.get("sim_score")
+                mark = "词+义" if kw > 0 and sim is not None else ("义" if sim is not None else "词 ")
+                detail = f"词{kw:.2f}" + (f" 义{sim:.2f}" if sim is not None else "")
+                # 描述本身是多行的，不压平的话十条结果会散成几十行糊在一起
+                snippet = " ".join((r["descr"] or "").split())[:50]
+                lines.append(
+                    f"g{r['id']} {r['score']:.3f} [{mark}] {detail}\n   {snippet}"
+                )
+            yield event.plain_result("\n".join(head + lines))
             return
 
         if action == "index":
