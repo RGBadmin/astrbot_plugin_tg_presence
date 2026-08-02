@@ -3700,9 +3700,17 @@ class TgPresence(Star):
                 "现在由你主动给他发一条消息。直接写你要发的原话，"
                 "用你平时的语气和分段习惯。不要复述或引用这段提示，"
                 "不要写旁白、解释、心理描写，也不要加引号。"
+                "也不要在开头写 [月-日 时:分] 这样的时间戳——"
+                "你在历史里看到的那些是系统加的，不是你写的。"
             ),
         )
-        return (getattr(resp, "completion_text", "") or "").strip()
+        text = (getattr(resp, "completion_text", "") or "").strip()
+        # 还是会写的话在这儿剥掉。导演这条路不经过 AstrBot 管线，
+        # on_llm_response / on_decorating_result 那两道闸都够不着
+        if OWN_STAMP_RE.search(text):
+            logger.info("[tg_presence] 剥掉她在导演回复里自写的时间戳")
+            text = OWN_STAMP_RE.sub("", text).strip()
+        return text
 
     @filter.command("whoami")
     async def cmd_whoami(self, event: AstrMessageEvent):
