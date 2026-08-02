@@ -3923,15 +3923,33 @@ class TgPresence(Star):
             got = (getattr(resp, "completion_text", "") or "").strip()
             if got:
                 return got
-            # 返空时把现场全记下来。这种失败不抛异常、日志里一片空白，
-            # 不留证据的话只能靠猜
+
+            # 返空时把整个响应对象摊开记下来。这种失败不抛异常、
+            # 日志里一片空白，不留证据只能靠猜。thinking 模型尤其要看
+            # reasoning_content——正文空而思考满，说明配额全烧在思考上了
+            try:
+                dump = {
+                    k: (v if isinstance(v, (int, float, bool, type(None))) else str(v))
+                    for k, v in vars(resp).items()
+                }
+            except Exception:  # dataclass 用了 __slots__ 之类
+                dump = {
+                    k: str(getattr(resp, k, None))
+                    for k in (
+                        "_completion_text", "reasoning_content", "role",
+                        "tools_call_name", "raw_completion", "usage", "id",
+                    )
+                }
+            reason = str(dump.get("reasoning_content") or "")
             logger.warning(
                 f"[tg_presence] 导演生成返回空。provider={provider_id} "
                 f"人格 {len(system_prompt)} 字 · 历史 {len(ctx)} 条 · "
-                f"提示 {len(prompt)} 字 · resp={type(resp).__name__} "
-                f"chain={getattr(resp, 'result_chain', None) is not None} "
-                f"raw={str(getattr(resp, 'raw_completion', ''))[:120]}"
+                f"提示 {len(prompt)} 字"
+                + (f" · 思考 {len(reason)} 字" if reason else " · 思考也是空的")
             )
+            for k, v in dump.items():
+                if v not in (None, "", "[]", "{}", "None"):
+                    logger.warning(f"[tg_presence]   {k} = {str(v)[:600]}")
             return ""
 
         text = await call(head + f"{brief}\n\n" + act + tail)
