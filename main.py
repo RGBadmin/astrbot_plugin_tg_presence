@@ -3374,14 +3374,14 @@ class TgPresence(Star):
             return
         if not text:
             yield event.plain_result("让她自己想…")
-            text = await self._improvise(
+            text, err = await self._improvise(
                 "你想在自己的频道发一条动态。这条动态是发给所有人看的，"
                 "不是私聊。可以是此刻的心情、刚做完的事、看到的东西，"
                 "也可以没有由头。",
                 "直接写动态正文，一两句话就够，符合你平时发动态的语气。",
             )
             if not text:
-                yield event.plain_result("她没想出来（模型返回空）。直接给内容：/moment 正文")
+                yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/moment 正文")
                 return
             yield event.plain_result(f"她想发：\n{text}")
         yield event.plain_result(await self._do_post(event, text, "", enforce_limits=False))
@@ -3459,7 +3459,7 @@ class TgPresence(Star):
             cats = self._list_categories(self.conf.get("avatar_dir") or "")
             if cats:
                 yield event.plain_result("让她自己挑…")
-                pick = await self._improvise(
+                pick, err = await self._improvise(
                     "你要换个头像。可选的类别有：" + "、".join(cats) + "。",
                     "只回复一个类别名，从上面那些里挑，不要解释，不要加标点。",
                 )
@@ -3468,6 +3468,8 @@ class TgPresence(Star):
                 if hit:
                     category = hit
                     yield event.plain_result(f"她挑了：{hit}")
+                elif err:
+                    yield event.plain_result(f"她没挑成：{err}\n随机来一张")
                 else:
                     yield event.plain_result(f"她没挑出来（回的是「{pick[:20]}」），随机来一张")
         yield event.plain_result(
@@ -3551,13 +3553,13 @@ class TgPresence(Star):
             return
         if not text:
             yield event.plain_result("让她自己想…")
-            text = await self._improvise(
+            text, err = await self._improvise(
                 "你要改一下自己的个性签名。签名是别人点开你资料时看到的那一行，"
                 "所有人都看得见。",
                 f"直接写签名内容，一行，不超过 {SIGNATURE_MAX // 2} 个字。只写签名本身。",
             )
             if not text:
-                yield event.plain_result("她没想出来（模型返回空）。直接给内容：/signature 新签名")
+                yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/signature 新签名")
                 return
             yield event.plain_result(f"她想改成：\n{text}")
         yield event.plain_result(
@@ -3816,18 +3818,27 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 取人格失败，这次不带人格生成：{e}")
             return ""
 
-    async def _improvise(self, brief: str, instruct: str) -> str:
-        """让她自己想内容。生成失败只记日志、返回空，由调用方决定怎么退。
+    async def _improvise(self, brief: str, instruct: str) -> tuple[str, str]:
+        """让她自己想内容。返回 (内容, 没成的原因)。
 
         指令后面留空时走这条路：与其让人再想一遍措辞，不如让她自己拿主意
         ——反正内容本来就该是她的。
+
+        原因必须带出来。吞掉异常只回一句"模型返回空"，会把配置错、
+        没绑会话、模型拒答这三种完全不同的毛病显示成同一句话，
+        人就只能去翻日志。
         """
+        if not (self.state.get("director_target") or "").strip():
+            return "", "还没绑定目标会话，取不到她的人格和历史。先 /umo 看看有哪些，再 /link 绑一个"
         try:
             now = datetime.now(self._tz()).strftime("%m-%d %H:%M")
-            return await self._director_generate(f"现在是 {now}。{brief}", instruct)
+            text = await self._director_generate(f"现在是 {now}。{brief}", instruct)
         except Exception as e:
-            logger.error(f"[tg_presence] 即兴生成失败：{e}")
-            return ""
+            logger.error(f"[tg_presence] 即兴生成失败：{e}", exc_info=True)
+            return "", f"{type(e).__name__}: {e}"
+        if not text:
+            return "", "模型返回了空内容（可能是拒答，或者上下文里有它处理不了的东西）"
+        return text, ""
 
     async def _improvise_photo(self) -> tuple[str, str]:
         """让她自己从相册里挑一张，顺带写句配文。返回 (gN, 配文)。
@@ -3838,7 +3849,7 @@ class TgPresence(Star):
         """
         if not self.gallery_stat()["indexed"]:
             return "", "相册还没建索引，挑不了。先 /gallery index auto。"
-        raw = await self._improvise(
+        raw, err = await self._improvise(
             "你想给他发一张自己的照片。先想清楚要发什么样的——"
             "什么场景、穿什么、什么姿态、露到什么程度。",
             "第一行写检索用的关键词，几个短语用逗号隔开，"
@@ -3847,7 +3858,7 @@ class TgPresence(Star):
             "只输出这两行。",
         )
         if not raw:
-            return "", "她没想出来（模型返回空）。"
+            return "", f"没想出来：{err}"
         parts = [x.strip() for x in raw.splitlines() if x.strip()]
         words = parts[0].replace("，", ",").replace(",", " ") if parts else ""
         caption = parts[1] if len(parts) > 1 else ""
@@ -4430,10 +4441,10 @@ class TgPresence(Star):
         try:
             text = await self._director_generate(self._proactive_brief())
         except Exception as e:
-            logger.error(f"[tg_presence] 主动消息生成失败：{e}")
+            logger.error(f"[tg_presence] 主动消息生成失败：{e}", exc_info=True)
             st["due"] = time.time() + 1800  # 半小时后再试，别把这次倒计时白扔
             self._save_state()
-            return f"生成失败：{e}"
+            return f"生成失败：{type(e).__name__}: {e}"
         if not text:
             st["due"] = time.time() + 1800
             self._save_state()
@@ -4572,11 +4583,15 @@ class TgPresence(Star):
         try:
             text = await self._director_generate(brief)
         except Exception as e:
-            logger.error(f"[tg_presence] 导演生成失败: {e}")
-            yield event.plain_result(f"生成失败：{e}")
+            logger.error(f"[tg_presence] 导演生成失败: {e}", exc_info=True)
+            yield event.plain_result(f"生成失败：{type(e).__name__}: {e}")
             return
         if not text:
-            yield event.plain_result("她没说出话来（模型返回空），换个提示试试。")
+            yield event.plain_result(
+                "她没说出话来——模型返回了空内容。\n"
+                "可能是拒答，也可能是上下文里有它处理不了的东西。"
+                "换个提示试试，或者 /link show 看人格读到没有。"
+            )
             return
         yield event.plain_result(await self._director_deliver(text))
 
