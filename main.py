@@ -211,6 +211,7 @@ CONSOLE_ROUTES = {
     "vision": "cmd_vision",
     "presence": "cmd_presence",
     "proactive": "cmd_proactive",
+    "umo": "cmd_umo",
     "link": "cmd_link",
     "say": "cmd_say",
     "act": "cmd_act",
@@ -3778,6 +3779,81 @@ class TgPresence(Star):
             logger.debug(f"[tg_presence] 取对话对象失败 {umo}: {e}")
             return None
 
+    @filter.command("umo")
+    async def cmd_umo(self, event: AstrMessageEvent, arg: str = ""):
+        """列出所有会话的 UMO，用来挑一个 /link 绑上。用法：/umo [关键词]"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            return
+
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None or not hasattr(cm, "get_filtered_conversations"):
+            yield event.plain_result(
+                "这个 AstrBot 版本列不出会话清单。\n"
+                "手动拼：机器人名称:FriendMessage:会话ID\n"
+                "机器人名称看 WebUI「平台配置」第一项，会话ID 在那个会话里发 /whoami 看。"
+            )
+            return
+
+        kw = (arg or "").strip()
+        try:
+            convs, total = await cm.get_filtered_conversations(
+                page=1, page_size=60, search_query=kw, include_history=False
+            )
+        except Exception as e:
+            logger.error(f"[tg_presence] 列会话失败：{e}")
+            yield event.plain_result(f"列不出来：{e}")
+            return
+        if not convs:
+            yield event.plain_result(
+                f"没有{'匹配「' + kw + '」的' if kw else ''}会话。"
+                + ("\n换个词，或者直接 /umo 看全部。" if kw else "\n先在角色那边正常聊一句，对话才会建起来。")
+            )
+            return
+
+        cur = (self.state.get("director_target") or "").strip()
+        did = self._director_id()
+        tz = self._tz()
+        # 同一个会话可能有多个对话（AstrBot 支持一个会话开多轮），
+        # 这里只关心 UMO，按会话归并，取最近活跃的那条
+        seen: dict[str, dict] = {}
+        for c in convs:
+            umo = getattr(c, "user_id", "") or ""
+            if not umo:
+                continue
+            ts = int(getattr(c, "updated_at", 0) or 0)
+            got = seen.setdefault(umo, {"ts": 0, "n": 0, "title": ""})
+            got["n"] += 1
+            if ts >= got["ts"]:
+                got["ts"] = ts
+                got["title"] = (getattr(c, "title", "") or "").strip()
+
+        rows = sorted(seen.items(), key=lambda kv: -kv[1]["ts"])
+        lines = [f"共 {len(rows)} 个会话" + (f"（库里 {total} 条对话）" if total else "") + "："]
+        for umo, info in rows[:25]:
+            mark = ""
+            if umo == cur:
+                mark = "  ← 当前绑定"
+            elif self._umo_platform(umo) in ("console", did or "\0"):
+                mark = "  （控制台自己，别绑）"
+            when = (
+                datetime.fromtimestamp(info["ts"], tz).strftime("%m-%d %H:%M")
+                if info["ts"]
+                else "时间未知"
+            )
+            lines.append(f"\n{umo}{mark}")
+            detail = f"  {when}"
+            if info["n"] > 1:
+                detail += f" · {info['n']} 个对话"
+            if info["title"]:
+                detail += f" · {info['title'][:18]}"
+            lines.append(detail)
+        if len(rows) > 25:
+            lines.append(f"\n…还有 {len(rows) - 25} 个，用 /umo 关键词 缩小范围")
+        lines.append("\n绑定：/link 上面任意一个 UMO")
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("link")
     async def cmd_link(self, event: AstrMessageEvent, target: str = ""):
         """在控制台里绑定投递目标。用法：/link 目标UMO，或 /link show 查看当前绑定。"""
@@ -3810,28 +3886,31 @@ class TgPresence(Star):
                 )
             lines += [
                 "",
+                "/umo          列出所有会话，从里面挑一个",
                 # 别用尖括号占位：Telegram 按 HTML 解析，<UMO> 会被当成标签整段吃掉
-                "绑定：/link 目标UMO",
-                "  例：/link AstrLover:FriendMessage:8338355157",
-                "  UMO = 机器人名称:消息类型:会话ID",
-                "  私聊是 FriendMessage，群聊是 GroupMessage",
+                "/link 目标UMO  绑上它",
+                "",
+                "多个角色就靠这两条来回切：绑谁，/say 和 /act 就发给谁。",
             ]
             yield event.plain_result("\n".join(lines))
             return
 
         # 绑定只在控制台做 —— 在角色那边发指令会在你俩的聊天记录里留痕，
-        # 那正是导演模式要避免的事
-        if not did:
-            yield event.plain_result(
-                "先在插件配置里填「控制台机器人名称」，再来绑定。"
-            )
-            return
-        if here != did:
-            yield event.plain_result(
-                "这条指令只能在控制台那个 bot 里发。\n"
-                "在角色那边发会在你俩的聊天记录里留下一条与剧情无关的消息。"
-            )
-            return
+        # 那正是导演模式要避免的事。插件自带的控制台天生就是"另一头"
+        if here != "console":
+            if not did:
+                yield event.plain_result(
+                    "先配一个控制台再来绑定。两种办法：\n"
+                    "  填「控制台 Bot Token」用插件自带的（推荐，不占 AstrBot 通道）\n"
+                    "  或填「控制台机器人名称」，沿用 AstrBot 里接入的另一个 bot"
+                )
+                return
+            if here != did:
+                yield event.plain_result(
+                    "这条指令只能在控制台里发。\n"
+                    "在角色那边发会在你俩的聊天记录里留下一条与剧情无关的消息。"
+                )
+                return
 
         try:
             from astrbot.core.platform.astr_message_event import MessageSesion
@@ -3847,10 +3926,11 @@ class TgPresence(Star):
             )
             return
 
-        if self._umo_platform(arg) == did:
+        if self._umo_platform(arg) in ("console", did or "\0"):
             yield event.plain_result(
-                f"这是控制台自己（{did}），绑它没意义。\n"
-                "第一段要填角色那个 bot 的机器人名称。"
+                f"这是控制台自己（{self._umo_platform(arg)}），绑它没意义——"
+                "消息会发回控制台，角色那边什么都收不到。\n"
+                "第一段要填角色那个 bot 的机器人名称，/umo 能列出来。"
             )
             return
 
