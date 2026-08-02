@@ -3,6 +3,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import mimetypes
 import random
 import re
@@ -477,21 +478,89 @@ class TgPresence(Star):
             return []
         return solid + fuzzy
 
+    def _df(self, words: list[str], folder: str = "") -> tuple[int, list[int]]:
+        """一次全表扫描算出每个词的文档频率。返回 (总数, 各词的 df)。"""
+        if not words:
+            return 0, []
+        sums = ", ".join(["SUM(descr LIKE ?)"] * len(words))
+        sql = f"SELECT COUNT(*) n, {sums} FROM photos WHERE descr IS NOT NULL"
+        args: list = [f"%{w}%" for w in words]
+        if folder.strip():
+            sql += " AND folder LIKE ?"
+            args.append(f"%{folder.strip()}%")
+        try:
+            row = self.db().execute(sql, args).fetchone()
+        except sqlite3.Error as e:
+            logger.warning(f"[tg_presence] 词频统计失败：{e}")
+            return 0, [0] * len(words)
+        return (row[0] or 0), [(row[i + 1] or 0) for i in range(len(words))]
+
+    def _rescue_dead(self, words: list[str], folder: str = "") -> list[str]:
+        """一个都匹配不上的词，降级成单字再试。
+
+        人说「车上」，库里写的是「汽车座椅」——两个字不连着出现，
+        整词 df 为 0，IDF 给它再高的权重也是零贡献。拆成单字，
+        「车」就能命中了。
+
+        单字噪声大，但这里有两道闸：df 为 0 的原词才拆（能整词命中的
+        不动），以及拆出来的字只保留没到处都是的。真漏进来一两个常见字
+        也不致命——IDF 会把它压到最低权重，而且它命中所有图，
+        对排序而言只是个常数项。
+        """
+        total, dfs = self._df(words, folder)
+        dead = [w for w, df in zip(words, dfs) if df == 0 and len(w) > 1]
+        if not dead or not total:
+            return words
+        alive = [w for w, df in zip(words, dfs) if df > 0]
+        chars = list(
+            dict.fromkeys(c for w in dead for c in w if c.strip() and c not in alive)
+        )
+        if not chars:
+            return alive or words
+        _, cdfs = self._df(chars, folder)
+        good = [c for c, df in zip(chars, cdfs) if 0 < df <= total * 0.6]
+        return (alive + good)[:20] or words
+
+    def _idf(self, words: list[str], folder: str = "") -> tuple[list[float], float]:
+        """给每个词算权重：库里越常见的词越不值钱。
+
+        只数命中几个词是不行的。一个博主的图张张都是「黑丝」「细高跟」，
+        搜「黑丝车上细高跟」时每张都命中这两个，词面分全都一样，排序
+        等于没排。真正能区分的是「车」——只有三张有，命中它几乎就
+        锁定目标了，可它的分量和「黑丝」一模一样。
+
+        所以按 IDF 加权：df 越大权重越低。加常数 1 是保底，免得所有词
+        都是共性词时总权重归零除不了。
+        """
+        if not words:
+            return [], 1.0
+        total, dfs = self._df(words, folder)
+        total = total or 1
+        weights = [math.log((total + 1) / (df + 1)) + 1 for df in dfs]
+        return weights, sum(weights) or 1.0
+
     def gallery_search(
         self, keywords: str = "", folder: str = "", limit: int = 8
     ) -> list[sqlite3.Row]:
-        """按关键词和分类找图，按命中词数排序。
+        """按关键词和分类找图，按 IDF 加权的命中分排序。
 
         不用 AND 取交集：一句「酒店里穿灰丝踩红底细高跟」拆出六七个词，
         只要一个词跟描述里的用词对不上（说「足底」而档案里写「脚底」），
-        交集就是空，整句话什么都搜不到。改成打分——命中 5 个词的图排在
-        命中 2 个的前面，漏词只降排名不至于让图消失。
+        交集就是空，整句话什么都搜不到。改成打分——漏词只降排名，
+        不至于让图消失。
+
+        分数已按总权重归一化到 0~1，调用方直接用，不用再除词数。
         """
         words = self._split_query(keywords)
         args: list = []
         if words:
-            score = " + ".join(["(descr LIKE ?)"] * len(words))  # SQLite 里布尔就是 0/1
-            args += [f"%{w}%" for w in words]
+            words = self._rescue_dead(words, folder)
+            weights, total_w = self._idf(words, folder)
+            # SQLite 里布尔就是 0/1，乘上各自的权重再求和
+            expr = " + ".join(["(descr LIKE ?) * ?"] * len(words))
+            for w, wt in zip(words, weights):
+                args += [f"%{w}%", wt]
+            score = f"({expr}) / {total_w:.6f}"
         else:
             score = "0"
 
@@ -683,8 +752,6 @@ class TgPresence(Star):
         加权。这一步是在「匹配度」这个维度内部合成，不影响时间/发送条件
         压在它上面的分层结构。
         """
-        # 分母必须和 gallery_search 用同一套切分，否则命中率算出来大于 1
-        words = self._split_query(keywords or want)
         kw_rows = self.gallery_search(keywords or want, folder, limit=pool)
 
         vw = float(self.conf.get("vector_weight", 0.4) or 0)
@@ -704,9 +771,9 @@ class TgPresence(Star):
                     continue
                 by_id[int(r["id"])] = dict(r)
 
-        n_words = len(words) or 1
         for pid, row in by_id.items():
-            kw = min(1.0, float(row.get("score") or 0) / n_words)
+            # gallery_search 已按 IDF 总权重归一化过，这儿直接用
+            kw = min(1.0, max(0.0, float(row.get("score") or 0)))
             sim = vec_hits.get(pid)
             # 留痕给 /gallery search 看：这张是词面命中的，还是语义捞回来的
             row["kw_score"], row["sim_score"] = kw, sim
