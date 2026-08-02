@@ -217,6 +217,19 @@ CONSOLE_ROUTES = {
     "act": "cmd_act",
     "whoami": "cmd_whoami",
 }
+# 注册到 Telegram 的指令菜单，输入 / 就能看见。顺序即菜单顺序，
+# 按「先绑谁、再让她说什么、最后管相册」排
+CONSOLE_MENU = [
+    ("umo", "列出所有会话，挑一个绑"),
+    ("link", "绑定目标会话 · /link UMO"),
+    ("say", "让她原样说一句 · /say 内容"),
+    ("act", "给个方向，她自己组织语言 · /act 方向"),
+    ("proactive", "主动消息状态 · /proactive now 立即发"),
+    ("gallery", "相册 · index auto / search 词 / show / embed"),
+    ("vision", "视觉 API 配置诊断"),
+    ("presence", "插件状态：动态、冷却、图片存档"),
+    ("whoami", "这个会话里你是谁"),
+]
 # 九宫格的逐格描述。挑图时它们没有判别力——十张图开头都是「左上：白色墙面」
 GRID_RE = re.compile(r"^(左上|中上|右上|左中|正中|右中|左下|中下|右下)\s*[：:]")
 # 描述一变，所有分段向量都得作废，不能只清主向量
@@ -3818,9 +3831,14 @@ class TgPresence(Star):
         # 同一个会话可能有多个对话（AstrBot 支持一个会话开多轮），
         # 这里只关心 UMO，按会话归并，取最近活跃的那条
         seen: dict[str, dict] = {}
+        skipped = 0
         for c in convs:
             umo = getattr(c, "user_id", "") or ""
             if not umo:
+                continue
+            # 控制台自己的会话不列——绑它没意义，只会挤占列表
+            if self._umo_platform(umo) in ("console", did or "\0"):
+                skipped += 1
                 continue
             ts = int(getattr(c, "updated_at", 0) or 0)
             got = seen.setdefault(umo, {"ts": 0, "n": 0, "title": ""})
@@ -3830,13 +3848,16 @@ class TgPresence(Star):
                 got["title"] = (getattr(c, "title", "") or "").strip()
 
         rows = sorted(seen.items(), key=lambda kv: -kv[1]["ts"])
-        lines = [f"共 {len(rows)} 个会话" + (f"（库里 {total} 条对话）" if total else "") + "："]
+        if not rows:
+            yield event.plain_result(
+                "除了控制台自己，没有别的会话。\n"
+                "先在角色那边正常聊一句，对话建起来才能绑。"
+            )
+            return
+
+        lines = [f"共 {len(rows)} 个会话："]
         for umo, info in rows[:25]:
-            mark = ""
-            if umo == cur:
-                mark = "  ← 当前绑定"
-            elif self._umo_platform(umo) in ("console", did or "\0"):
-                mark = "  （控制台自己，别绑）"
+            mark = "  ← 当前绑定" if umo == cur else ""
             when = (
                 datetime.fromtimestamp(info["ts"], tz).strftime("%m-%d %H:%M")
                 if info["ts"]
@@ -4049,9 +4070,16 @@ class TgPresence(Star):
         if backlog := await self._tg_api("getUpdates", timeout=10, offset=-1, limit=1):
             offset = backlog[-1]["update_id"] + 1
         me = await self._tg_api("getMe", timeout=10)
+        # 注册指令菜单，输入 / 就有提示，不用记
+        ok = await self._tg_api(
+            "setMyCommands",
+            timeout=10,
+            commands=[{"command": c, "description": d} for c, d in CONSOLE_MENU],
+        )
         logger.info(
             f"[tg_presence] 控制台已上线：@{(me or {}).get('username', '?')}，"
             f"管理员 {len(self._console_admins())} 人"
+            + ("，指令菜单已注册" if ok else "")
         )
         while True:
             try:
