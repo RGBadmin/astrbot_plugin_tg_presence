@@ -258,6 +258,8 @@ class TgPresence(Star):
         # /gallery index auto 的后台任务，一次只允许有一个
         self._index_task: asyncio.Task | None = None
         self._index_note: str = ""
+        # 主动消息的倒计时循环。懒启动——__init__ 时还不一定有事件循环
+        self._proactive_task: asyncio.Task | None = None
 
     @staticmethod
     def _walk_conf(node, out: dict) -> dict:
@@ -332,9 +334,10 @@ class TgPresence(Star):
 
     async def terminate(self):
         """插件卸载或热重载时收尾，别把数据库句柄漏掉。"""
-        if self._index_task and not self._index_task.done():
-            self._index_task.cancel()  # 后台索引跟着插件一起走
-            self._index_task = None
+        for task in (self._index_task, self._proactive_task):
+            if task and not task.done():
+                task.cancel()  # 后台任务跟着插件一起走
+        self._index_task = self._proactive_task = None
         if self._db is not None:
             try:
                 self._db.commit()
@@ -2744,8 +2747,7 @@ class TgPresence(Star):
         return await self._do_send_photo(event, photo_id, caption)
 
     async def _do_send_photo(
-        self, event: AstrMessageEvent, photo_id: str, caption: str = "",
-        enforce_limits: bool = True,
+        self, event: AstrMessageEvent, photo_id: str, caption: str = ""
     ) -> str:
         client = self._client(event)
         if client is None:
@@ -2764,16 +2766,6 @@ class TgPresence(Star):
             path = Path(stored) if stored and Path(stored).exists() else None
         if not path:
             return f"找不到 {raw} 这张照片。"
-
-        if enforce_limits:
-            cd = self._cooldown_left(
-                "photo", int(self.conf.get("photo_cooldown_minutes", 10))
-            )
-            if cd:
-                return f"刚发过照片，等 {cd} 分钟再发。先正常聊。"
-            left = self._daily_left("photo", int(self.conf.get("photo_daily_limit", 20)))
-            if left == 0:
-                return "今天发的照片够多了，明天再说。"
 
         try:
             with open(path, "rb") as fp:
@@ -2797,9 +2789,6 @@ class TgPresence(Star):
             # 「刚那张真好看」她接不上，过两轮还可能把同一张再发一遍
             if pid := self._remember_sent(path, row["descr"] or "", f"g{row['id']}"):
                 note = f" 在你们的对话里它是 #{pid}"
-        if enforce_limits:
-            self._mark_done("photo")
-            self._bump_daily("photo")
         logger.info(f"[tg_presence] 已发送照片 {raw} -> {path.name}")
         return f"照片发出去了（{raw}）。{note}"
 
@@ -2835,7 +2824,7 @@ class TgPresence(Star):
             yield event.plain_result("用法：/photo g123 [附言]，编号从 /gallery search 查。")
             return
         yield event.plain_result(
-            await self._do_send_photo(event, photo_id, caption, enforce_limits=False)
+            await self._do_send_photo(event, photo_id, caption)
         )
 
     @filter.on_llm_request(priority=-60)
@@ -3548,6 +3537,62 @@ class TgPresence(Star):
             + "\n日志里搜「写历史失败」看原因。"
         )
 
+    @staticmethod
+    def _persona_prompt(p) -> str:
+        """从人格对象里取出正文。
+
+        字段名有两套：AstrBot 内部的 Persona 用 system_prompt，而
+        persona_manager 对外给的 v3 形态用 prompt——
+        get_v3_persona_data 里明摆着写的 {"prompt": persona.system_prompt}。
+        而且 v3 可能是 dict 也可能是对象，dict 用 getattr 取永远是空。
+        两套字段名、两种容器都认，才不会白白丢掉人格。
+        """
+        if not p:
+            return ""
+        if isinstance(p, dict):
+            return str(p.get("prompt") or p.get("system_prompt") or "").strip()
+        for attr in ("prompt", "system_prompt"):
+            if v := getattr(p, attr, None):
+                return str(v).strip()
+        return ""
+
+    async def _persona_of(self, umo: str, conv=None) -> str:
+        """解析这个会话最终生效的人格正文。取不到返回空串。"""
+        pm = getattr(self.context, "persona_manager", None)
+        if pm is None:
+            return ""
+        pid = getattr(conv, "persona_id", None) if conv else None
+
+        # 优先走官方的解析入口：它还会考虑会话级强制人格（/persona 设的那个），
+        # 那是 conversation.persona_id 看不到的一层
+        if resolve := getattr(pm, "resolve_selected_persona", None):
+            try:
+                cfg = self.context.astrbot_config_mgr.get_conf(umo)
+                _, persona, _, _ = await resolve(
+                    umo=umo,
+                    conversation_persona_id=pid,
+                    platform_name=self._umo_platform(umo),
+                    provider_settings=(cfg or {}).get("provider_settings", {}),
+                )
+                if text := self._persona_prompt(persona):
+                    logger.debug(f"[tg_presence] 人格来自 resolve，{len(text)} 字")
+                    return text
+            except Exception as e:
+                logger.debug(f"[tg_presence] resolve_selected_persona 用不了：{e}")
+
+        try:
+            p = pm.get_persona_v3_by_id(pid) if pid else None
+            if p is None:
+                p = await pm.get_default_persona_v3(umo=umo)
+            text = self._persona_prompt(p)
+            if text:
+                name = p.get("name") if isinstance(p, dict) else getattr(p, "name", "?")
+                logger.debug(f"[tg_presence] 人格「{name}」{len(text)} 字")
+            return text
+        except Exception as e:
+            logger.warning(f"[tg_presence] 取人格失败，这次不带人格生成：{e}")
+            return ""
+
     async def _director_generate(self, brief: str) -> str:
         """按导演提示，用角色的人格和历史生成一条主动消息。抛异常给调用方。"""
         target = (self.state.get("director_target") or "").strip()
@@ -3563,20 +3608,12 @@ class TgPresence(Star):
                 history = []
         limit = max(2, int(self.conf.get("director_context_turns", 40) or 40))
 
-        system_prompt = ""
-        pm = getattr(self.context, "persona_manager", None)
-        if pm is not None:
-            try:
-                p = None
-                if conv and conv.persona_id:
-                    p = pm.get_persona_v3_by_id(conv.persona_id)
-                if p is None:
-                    p = await pm.get_default_persona_v3(umo=target)
-                system_prompt = getattr(p, "system_prompt", "") or ""
-            except Exception as e:
-                logger.warning(f"[tg_presence] 取人格失败，这次不带人格生成: {e}")
+        system_prompt = await self._persona_of(target, conv)
         if not system_prompt:
-            logger.warning("[tg_presence] 没拿到人格，生成的话可能不像她")
+            logger.warning(
+                "[tg_presence] 没拿到人格，这次只靠历史模仿语气——"
+                "人格里的硬设定（背景、行为准则、禁忌）都不会生效"
+            )
 
         provider_id = await self.context.get_current_chat_provider_id(target)
         resp = await self.context.llm_generate(
@@ -3669,6 +3706,18 @@ class TgPresence(Star):
             logger.debug(f"[tg_presence] 探查会话失败 {umo}: {e}")
             return False, 0
 
+    async def _peek_conv_obj(self, umo: str):
+        """取目标会话的 conversation 对象，用来读它绑的人格。取不到返回 None。"""
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None:
+            return None
+        try:
+            cid = await cm.get_curr_conversation_id(umo)
+            return await cm.get_conversation(umo, cid) if cid else None
+        except Exception as e:
+            logger.debug(f"[tg_presence] 取对话对象失败 {umo}: {e}")
+            return None
+
     @filter.command("link")
     async def cmd_link(self, event: AstrMessageEvent, target: str = ""):
         """在控制台里绑定投递目标。用法：/link 目标UMO，或 /link show 查看当前绑定。"""
@@ -3692,6 +3741,12 @@ class TgPresence(Star):
                 ok, n = await self._peek_conversation(cur)
                 lines.append(
                     f"目标会话：{'有对话，历史 ' + str(n) + ' 条' if ok else '⚠️ 查不到对话'}"
+                )
+                # 人格取不到时，/act 和主动消息只能靠历史模仿语气，
+                # 人格里的硬设定一条都不生效——这事不报出来根本发现不了
+                persona = await self._persona_of(cur, await self._peek_conv_obj(cur))
+                lines.append(
+                    f"人格：    {'读到 ' + str(len(persona)) + ' 字' if persona else '⚠️ 没读到，/act 会不像她'}"
                 )
             lines += [
                 "",
@@ -3759,6 +3814,191 @@ class TgPresence(Star):
             "  /act 给她的方向，她自己组织语言",
         ]
         yield event.plain_result("\n".join(msg))
+
+    # --------------------------------------------------------------- 主动消息
+
+    def _next_gap(self) -> float:
+        """摇一个新的倒计时。
+
+        随机而不是固定周期——固定的话几天就被看出来了，随机才像
+        「想起你」而不是「定时任务」。
+        """
+        lo = float(self.conf.get("proactive_min_hours", 4) or 4)
+        hi = float(self.conf.get("proactive_max_hours", 14) or 14)
+        if hi < lo:
+            lo, hi = hi, lo
+        return max(60.0, random.uniform(lo, hi) * 3600)
+
+    def _touch_proactive(self, umo: str) -> None:
+        """他一说话就重排倒计时，未回复计数清零。"""
+        st = self.state.setdefault("proactive", {})
+        now = time.time()
+        st.update({"last_user": now, "unanswered": 0, "due": now + self._next_gap(), "umo": umo})
+        self._save_state()
+
+    def _in_quiet(self) -> bool:
+        """现在是不是静默时段。支持跨零点，如 23:30-08:30。"""
+        raw = (self.conf.get("proactive_quiet") or "").strip()
+        if "-" not in raw:
+            return False
+        try:
+            a, b = (x.strip() for x in raw.split("-", 1))
+            ah, am = (int(x) for x in a.split(":"))
+            bh, bm = (int(x) for x in b.split(":"))
+        except ValueError:
+            logger.warning(f"[tg_presence] 静默时段「{raw}」格式不对，按不静默处理")
+            return False
+        now = datetime.now(self._tz())
+        cur, start, end = now.hour * 60 + now.minute, ah * 60 + am, bh * 60 + bm
+        return start <= cur < end if start <= end else (cur >= start or cur < end)
+
+    @staticmethod
+    def _human_gap(sec: float) -> str:
+        h = sec / 3600
+        if h < 1:
+            return f"{int(sec // 60)} 分钟"
+        return f"{h:.0f} 小时" if h < 48 else f"{h / 24:.1f} 天"
+
+    def _proactive_brief(self) -> str:
+        """把提示词模板填上时间和未回复次数。"""
+        st = self.state.get("proactive") or {}
+        tz, now = self._tz(), time.time()
+        last = st.get("last_user")
+        tpl = (self.conf.get("proactive_prompt") or "").strip() or (
+            "你跟他上一次说话是 {last}（距今 {gap}），现在是 {now}。你现在要主动联系他。"
+            "回复必须完全符合你的人格设定，是继续之前的话题、开始新话题，"
+            "还是说说你今天遇到的事，由你自己决定。"
+        )
+        n = int(st.get("unanswered", 0) or 0)
+        brief = tpl.format(
+            last=datetime.fromtimestamp(last, tz).strftime("%m-%d %H:%M") if last else "不记得了",
+            now=datetime.now(tz).strftime("%m-%d %H:%M"),
+            gap=self._human_gap(now - last) if last else "很久",
+            n=n,
+        )
+        if n:
+            # 连着没等到回音，得让她自己知道，否则会写得像什么都没发生过
+            brief += (
+                f"\n注意：你已经连着主动找过他 {n} 次，他一次都没回。"
+                "这一条要体现出你察觉到了，别装作前面没发生过。"
+            )
+        return brief
+
+    async def _proactive_fire(self) -> str:
+        """生成并发出一条主动消息。返回结果说明，给指令回显用。"""
+        st = self.state.setdefault("proactive", {})
+        try:
+            text = await self._director_generate(self._proactive_brief())
+        except Exception as e:
+            logger.error(f"[tg_presence] 主动消息生成失败：{e}")
+            st["due"] = time.time() + 1800  # 半小时后再试，别把这次倒计时白扔
+            self._save_state()
+            return f"生成失败：{e}"
+        if not text:
+            st["due"] = time.time() + 1800
+            self._save_state()
+            return "模型返回空，没发。"
+
+        out = await self._director_deliver(text)
+        st["unanswered"] = int(st.get("unanswered", 0) or 0) + 1
+        st["due"] = time.time() + self._next_gap()
+        st["last_fire"] = time.time()
+        self._save_state()
+        logger.info(f"[tg_presence] 主动消息已发（第 {st['unanswered']} 次未获回复）：{text[:40]}")
+        return out
+
+    async def _proactive_loop(self) -> None:
+        """倒计时到点就让她开口。一分钟查一次——倒计时是小时级的，够用。"""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                if not self.conf.get("proactive_enable", False):
+                    continue
+                st = self.state.get("proactive") or {}
+                due = st.get("due")
+                if not due or time.time() < due:
+                    continue
+                if self._in_quiet():
+                    continue  # 不取消，等出了静默时段立刻发
+                cap = int(self.conf.get("proactive_max_unanswered", 3) or 0)
+                if cap > 0 and int(st.get("unanswered", 0) or 0) >= cap:
+                    continue  # 停下来等他，他一回复就清零
+                if not (self.state.get("director_target") or "").strip():
+                    logger.warning("[tg_presence] 主动消息到点了，但还没 /link 绑定目标会话")
+                    st["due"] = time.time() + 3600
+                    self._save_state()
+                    continue
+                await self._proactive_fire()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[tg_presence] 主动消息循环出错：{e}")
+
+    def _ensure_proactive(self) -> None:
+        """懒启动倒计时循环。__init__ 时不一定有事件循环，这里才有。"""
+        if self._proactive_task and not self._proactive_task.done():
+            return
+        try:
+            self._proactive_task = asyncio.create_task(self._proactive_loop())
+        except RuntimeError:
+            pass
+
+    @filter.on_llm_request(priority=-95)
+    async def note_user_activity(self, event: AstrMessageEvent, req: ProviderRequest):
+        """他一开口就重排倒计时。控制台那边的指令不算互动。"""
+        umo = event.unified_msg_origin
+        if self._umo_platform(umo) == self._director_id():
+            return
+        self._ensure_proactive()
+        if self.conf.get("proactive_enable", False):
+            self._touch_proactive(umo)
+
+    @filter.command("proactive")
+    async def cmd_proactive(self, event: AstrMessageEvent, arg: str = ""):
+        """看主动消息的倒计时状态。用法：/proactive [now]"""
+        self._seal_command(event)
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            return
+
+        st = self.state.get("proactive") or {}
+        on = bool(self.conf.get("proactive_enable", False))
+        tz, now = self._tz(), time.time()
+
+        if arg.strip().lower() in ("now", "试试", "立刻"):
+            if err := self._director_guard(event):
+                yield event.plain_result(err)
+                return
+            yield event.plain_result("让她想想…")
+            yield event.plain_result(await self._proactive_fire())
+            return
+
+        lines = [f"主动消息：{'开' if on else '关'}"]
+        if last := st.get("last_user"):
+            lines.append(
+                f"他上次说话：{datetime.fromtimestamp(last, tz).strftime('%m-%d %H:%M')}"
+                f"（{self._human_gap(now - last)}前）"
+            )
+        if due := st.get("due"):
+            left = due - now
+            lines.append(
+                f"下次开口：{datetime.fromtimestamp(due, tz).strftime('%m-%d %H:%M')}"
+                + (f"（还有 {self._human_gap(left)}）" if left > 0 else "（已到点）")
+            )
+        else:
+            lines.append("下次开口：还没排（等他先说一句话）")
+        n = int(st.get("unanswered", 0) or 0)
+        cap = int(self.conf.get("proactive_max_unanswered", 3) or 0)
+        if n:
+            lines.append(f"连续未获回复：{n} 次" + (f"，满 {cap} 次就停" if cap else ""))
+        if self._in_quiet():
+            lines.append(f"⏸ 正在静默时段（{self.conf.get('proactive_quiet')}），到点也不发")
+        if not (self.state.get("director_target") or "").strip():
+            lines.append("⚠️ 还没绑定目标会话，发不出去。先在控制台 /link")
+        lines.append(f"间隔范围：{self.conf.get('proactive_min_hours', 4)}"
+                     f"~{self.conf.get('proactive_max_hours', 14)} 小时随机")
+        lines.append("\n/proactive now 立刻让她发一条（不等倒计时）")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("say")
     async def cmd_say(self, event: AstrMessageEvent, *, text: str = ""):

@@ -374,27 +374,8 @@
       }
     }
   },
-  "photo": {
-    "description": "⑤ 发照片",
-    "type": "object",
-    "hint": "她主动发图的频率上限。",
-    "items": {
-      "photo_cooldown_minutes": {
-        "description": "发照片最短间隔（分钟）",
-        "type": "int",
-        "default": 10,
-        "hint": "两张照片之间至少隔多久。真人不会连着刷图。填 0 表示不限制。只约束她自主发的，不影响 /photo 指令。"
-      },
-      "photo_daily_limit": {
-        "description": "每日发照片上限",
-        "type": "int",
-        "default": 20,
-        "hint": "按角色所在时区的自然日计算。填 0 表示不限制。同样不约束 /photo 指令。"
-      }
-    }
-  },
   "moment": {
-    "description": "⑥ 动态",
+    "description": "⑤ 动态",
     "type": "object",
     "hint": "她往频道发动态，以及把发过的动态注回上下文让她记得。",
     "items": {
@@ -458,7 +439,7 @@
     }
   },
   "profile": {
-    "description": "⑦ 头像与签名",
+    "description": "⑥ 头像与签名",
     "type": "object",
     "hint": "换头像、改签名的素材和冷却。",
     "items": {
@@ -484,7 +465,7 @@
     }
   },
   "presence": {
-    "description": "⑧ 时间感与表情",
+    "description": "⑦ 时间感与表情",
     "type": "object",
     "hint": "给她自己的消息打时间戳（她能看见，用户看不见），以及对消息点表情。",
     "items": {
@@ -509,7 +490,7 @@
     }
   },
   "director": {
-    "description": "⑨ 导演模式",
+    "description": "⑧ 导演模式",
     "type": "object",
     "hint": "从另一个 bot 发指令让她说话，指令不进她的上下文，也不出现在聊天窗口。",
     "items": {
@@ -525,6 +506,51 @@
         "type": "int",
         "default": 40,
         "hint": "/act 让角色自己组织语言时，往前取多少条对话作为上下文。太少了会接不上最近的话题，太多了费 token。"
+      }
+    }
+  },
+  "proactive": {
+    "description": "⑨ 主动消息",
+    "type": "object",
+    "hint": "你不说话时，隔一段随机的时间由她开口。走的是导演模式那条链路：用她的人格和完整历史现生成一句话，发出去并记进她自己的对话历史——所以她记得说过什么，你回复时也能接上。必须先在控制台 /link 绑好目标会话。",
+    "items": {
+      "proactive_enable": {
+        "description": "启用主动消息",
+        "type": "bool",
+        "default": false,
+        "hint": "关着的时候她永远不会先开口。开启前先确认两件事：控制台已 /link 绑好目标会话（否则消息发不出去），以及下面的静默时段设得合理（不然半夜会响）。",
+        "obvious_hint": true
+      },
+      "proactive_min_hours": {
+        "description": "最短间隔（小时）",
+        "type": "float",
+        "default": 4,
+        "hint": "你最后一条消息之后，至少隔这么久她才可能开口。每次你说话都会重新摇一个倒计时，所以聊得正欢的时候不会被打断。"
+      },
+      "proactive_max_hours": {
+        "description": "最长间隔（小时）",
+        "type": "float",
+        "default": 14,
+        "hint": "倒计时在最短和最长之间随机取，不是固定周期——固定周期几天就会被看出来，随机才像真人想起你的节奏。填得比最短小的话两者会自动对调。"
+      },
+      "proactive_max_unanswered": {
+        "description": "连续几次没回就不再发",
+        "type": "int",
+        "default": 3,
+        "hint": "她主动发了这么多条你都没回，就停下来等你。0 = 不限制（不建议，那会变成对着空气自言自语）。你一回复，计数立刻清零。"
+      },
+      "proactive_quiet": {
+        "description": "静默时段",
+        "type": "string",
+        "default": "23:30-08:30",
+        "hint": "这个区间内不主动发消息，跨零点写法照常（23:30-08:30）。倒计时到点但正处在静默里的话不会取消，等出了这个区间就发。留空则全天都可以发。"
+      },
+      "proactive_prompt": {
+        "description": "主动消息提示词",
+        "type": "text",
+        "default": "你跟他上一次说话是 {last}（距今 {gap}），现在是 {now}。你现在要主动联系他。回复必须完全符合你的人格设定，是继续之前的话题、开始新话题，还是说说你今天遇到的事，由你自己决定。",
+        "hint": "以导演身份发给她的指令，她看不到这段话本身，只会按它生成一句要发出去的消息。可用占位符：{last} 你上次说话的时间、{now} 现在的时间、{gap} 隔了多久、{n} 这是连续第几次没等到你回复。连续没回复时插件会自动追加一句说明，不用你在模板里写。",
+        "obvious_hint": true
       }
     }
   },
