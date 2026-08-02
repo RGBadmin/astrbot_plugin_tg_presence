@@ -757,8 +757,12 @@ class TgPresence(Star):
             bits.append(" ".join(env)[:56])
         if body := " ".join(layers.get(2, "").split()):
             bits.append(body[:76])
+        # 末尾若有关键词行就用它，没有就退回第四层——描述里最能说清
+        # 「这张在干什么」的一段。两种提示词版本都能给出有用的摘要
         if tag := self._tag_line(descr):
             bits.append(tag[:130])
+        elif act := " ".join(layers.get(4, "").split()):
+            bits.append(act[:96])
         return " ｜ ".join(bits) or " ".join((descr or "").split())[:120]
 
     @staticmethod
@@ -2108,10 +2112,12 @@ class TgPresence(Star):
         """
         strict = bool(self.conf.get("tag_strict", False)) and bool(FIELDS)
         want = (
-            len(FIELDS)
-            if strict and FIELDS
-            else max(2, int(self.conf.get("tag_min_words", 12) or 12))
+            len(FIELDS) if strict and FIELDS else int(self.conf.get("tag_min_words", 0) or 0)
         )
+        if want <= 0:
+            # 提示词把 44 项化进了自然语言，末尾不再有关键词行，
+            # 这时候整个标签校验都不适用——全判 ok，别让 redo 把全库捞去重跑
+            return "ok", []
         # 取分隔符最多的那一行。三点考虑：
         # · 不要求「1.」开头——模型基本不照做，硬卡这条会让校验对新格式全盲
         # · 不取最后一行——结束标记、模型自己补的备注都可能跟在后面
