@@ -234,7 +234,7 @@ class VisionError(Exception):
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.conf = config
+        self.conf = self._flatten_conf(config)
         self.data_dir = StarTools.get_data_dir("astrbot_plugin_tg_presence")
         self.state_path = self.data_dir / "state.json"
         self.state = self._load_state()
@@ -258,6 +258,77 @@ class TgPresence(Star):
         # /gallery index auto 的后台任务，一次只允许有一个
         self._index_task: asyncio.Task | None = None
         self._index_note: str = ""
+
+    @staticmethod
+    def _walk_conf(node, out: dict) -> dict:
+        """深度优先把嵌套配置收进一层。插件没有 dict 类型的配置项，
+        所以见到 dict 一律当分组递归。"""
+        for k, v in node.items():
+            if isinstance(v, dict):
+                TgPresence._walk_conf(v, out)
+            else:
+                out.setdefault(k, v)
+        return out
+
+    @staticmethod
+    def _schema_defaults() -> dict:
+        """从 _conf_schema.json 读出每项的默认值，用来判断某项有没有被改过。"""
+        out: dict = {}
+
+        def walk(node: dict) -> None:
+            for k, v in node.items():
+                if not isinstance(v, dict):
+                    continue
+                if v.get("type") == "object" and isinstance(v.get("items"), dict):
+                    walk(v["items"])
+                elif "default" in v:
+                    out[k] = v["default"]
+
+        try:
+            raw = (Path(__file__).parent / "_conf_schema.json").read_text(encoding="utf-8")
+            walk(json.loads(raw))
+        except (OSError, ValueError) as e:
+            logger.warning(f"[tg_presence] 读不到配置模板，旧配置迁移跳过：{e}")
+        return out
+
+    @staticmethod
+    def _flatten_conf(config) -> dict:
+        """把分组后的配置压平成一层。
+
+        _conf_schema.json 里配置项是按功能分组嵌套的，那纯粹是给配置页看的——
+        六十多项平铺一列谁也找不着东西。但代码里一律按扁平 key 读：
+        分组是排版，不该让上百处读取点跟着改名。
+
+        麻烦在升级：旧版本的配置是扁平存的，AstrBot 会把那些键留在顶层，
+        而新 schema 生成的分组内是默认值。不能简单地"非空者胜"——
+        并发数默认就是 2，你调成 6 存在顶层，一样非空，谁赢全看遍历顺序。
+
+        判据是 schema 里的 default：分组内还等于默认值，说明你没在新页面
+        动过它，那就沿用旧值；分组内已经不是默认值了，说明你刚在新页面
+        填过，那当然以新的为准。
+        """
+        flat = TgPresence._walk_conf(config, {})
+        stale = {
+            k: v
+            for k, v in config.items()
+            if not isinstance(v, dict) and k in flat and v != flat[k]
+        }
+        if not stale:
+            return flat
+        defaults = TgPresence._schema_defaults()
+        kept = [
+            k for k, v in stale.items() if k in defaults and flat[k] == defaults[k]
+        ]
+        for k in kept:
+            flat[k] = stale[k]
+        if kept:
+            logger.info(
+                f"[tg_presence] 沿用旧版配置 {len(kept)} 项："
+                + "、".join(kept[:6])
+                + ("…" if len(kept) > 6 else "")
+                + "。在配置页保存一次即可清掉这些遗留键。"
+            )
+        return flat
 
     async def terminate(self):
         """插件卸载或热重载时收尾，别把数据库句柄漏掉。"""

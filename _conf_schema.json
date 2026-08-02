@@ -1,413 +1,549 @@
 {
-  "channel_id": {
-    "description": "动态频道 ID",
-    "type": "string",
-    "default": "",
-    "hint": "角色发动态的目标 Telegram 频道。私密频道填数字 ID（-100 开头），公开频道可填 @频道用户名。留空则禁用发动态功能。获取方法：从频道转发一条消息给 @userinfobot。",
-    "obvious_hint": true
+  "vision": {
+    "description": "① 视觉解析",
+    "type": "object",
+    "hint": "调独立的视觉模型把图片读成文字。这一块决定了描述质量，也是整条链路里最花钱的部分。",
+    "items": {
+      "vision_api_format": {
+        "description": "视觉接口格式",
+        "type": "string",
+        "default": "openai",
+        "options": [
+          "openai",
+          "anthropic",
+          "gemini"
+        ],
+        "hint": "三家的请求体、鉴权头、图片包装方式完全不同，必须选对。openai = OpenAI 兼容的 /chat/completions（绝大多数中转站、国产模型、vLLM 都是这个）；anthropic = Claude 原生 /v1/messages；gemini = Google 原生 generateContent。用中转站的话选 openai，除非它明确说自己转发原生格式。",
+        "obvious_hint": true
+      },
+      "vision_base_url": {
+        "description": "视觉 API 接口地址",
+        "type": "string",
+        "default": "",
+        "hint": "只填到根即可，插件按上面选的格式补路径。openai：https://api.openai.com/v1 → /chat/completions；anthropic：https://api.anthropic.com 或 .../v1 → /v1/messages；gemini：https://generativelanguage.googleapis.com/v1beta → /models/{模型}:generateContent。填全了也认。这套配置独立于 AstrBot 的服务提供商——主对话模型贵、这个便宜，本来就不该共用。三项必填（地址、Key、模型 ID）齐了才启用。",
+        "obvious_hint": true
+      },
+      "vision_api_key": {
+        "description": "视觉 API Key",
+        "type": "string",
+        "default": "",
+        "hint": "按格式自动选鉴权头：openai 用 Authorization: Bearer，anthropic 用 x-api-key，gemini 用 x-goog-api-key（走请求头而不是 URL 参数，免得密钥被各级日志抄走）。",
+        "obvious_hint": true
+      },
+      "vision_model": {
+        "description": "视觉模型 ID",
+        "type": "string",
+        "default": "",
+        "hint": "必须是支持图片输入的多模态模型。openai 格式如 gpt-4o-mini、qwen-vl-max；anthropic 格式如 claude-haiku-4-5；gemini 格式如 gemini-2.5-flash（gemini 的模型名会拼进 URL 路径，别写成 models/xxx）。",
+        "obvious_hint": true
+      },
+      "vision_stream": {
+        "description": "流式接收",
+        "type": "bool",
+        "default": false,
+        "hint": "结果整体存档，没人盯着看逐字输出，所以默认关。开启只为一个理由：有些中转网关对非流式的长响应直接返回 504 或干脆挂断，那种情况下只有流式能跑通。插件会把增量拼回完整文本再存。",
+        "obvious_hint": true
+      },
+      "vision_context_window": {
+        "description": "视觉模型上下文窗口",
+        "type": "int",
+        "default": 128000,
+        "hint": "该模型的上下文窗口大小。插件用它校验「最大输出长度」是否合理——输出上限接近窗口的话图片就塞不进去了，会自动压到窗口的四分之一并记一条警告。这个值不会发给 API。"
+      },
+      "vision_max_tokens": {
+        "description": "最大输出长度",
+        "type": "int",
+        "default": 1024,
+        "hint": "请求里的 max_tokens。解析一张图 1024 通常够用；模型经常被这个值截断的话再往上调。"
+      },
+      "vision_extra_body": {
+        "description": "附加请求参数",
+        "type": "text",
+        "default": "",
+        "hint": "一段 JSON 对象，合并进请求体顶层（同名的字典会合并，其余直接覆盖）。用来填插件没单独做成配置项的东西，按你选的格式写：gemini 的 safetySettings、temperature/top_p、anthropic 的 thinking 等。留空则不加。格式不合法会记一条警告并忽略，不影响请求。",
+        "obvious_hint": true
+      },
+      "vision_gemini": {
+        "description": "Gemini 专项",
+        "type": "object",
+        "hint": "只对「Gemini 原生」格式生效。这两项是 Gemini 这条链路能不能用的分水岭，不是调优项。",
+        "items": {
+          "gemini_safety": {
+            "description": "Gemini 安全阈值",
+            "type": "string",
+            "default": "BLOCK_NONE",
+            "options": [
+              "BLOCK_NONE",
+              "OFF",
+              "默认"
+            ],
+            "hint": "只对「Gemini 原生」格式生效。不设的话成人向图片会被安全策略拦掉，而且拦得毫无痕迹——HTTP 200、正文空着，从状态码完全看不出问题。BLOCK_NONE 通用；OFF 更彻底但只有较新的模型认，老模型收到会报 400；选「默认」则完全不传这个字段。注意 finishReason=PROHIBITED_CONTENT 这一类是关不掉的，遇到只能换模型。",
+            "obvious_hint": true
+          },
+          "gemini_thinking_budget": {
+            "description": "Gemini 思考预算",
+            "type": "string",
+            "default": "",
+            "hint": "只对「Gemini 原生」格式生效，填整数。2.5 系列的思考 token 跟正文共用「最大输出长度」，不限制的话模型会先在思维链里把描述打一遍草稿，等正式输出时配额已经见底——草稿和正文双双被截断，还会被拼成一条记录存进库。gemini-2.5-flash 填 0 直接关掉思考；gemini-2.5-pro 关不掉，填 128（最小值）。留空则完全不传这个字段，1.5 及更早的老模型必须留空，它们不认识这个参数会报 400。",
+            "obvious_hint": true
+          }
+        }
+      },
+      "vision_prompts": {
+        "description": "提示词",
+        "type": "object",
+        "hint": "决定模型怎么看、写多细、用什么词。改了要重跑索引才生效。",
+        "items": {
+          "vision_system_prompt": {
+            "description": "视觉系统提示词",
+            "type": "text",
+            "default": "",
+            "hint": "作为 system 角色发送。留空用内置的（要求只输出客观描述、不加开场白和免责声明）。模型总是拒答或者总在描述前后加废话时，改这里。",
+            "obvious_hint": true
+          },
+          "vision_prompt": {
+            "description": "视觉解析提示词",
+            "type": "text",
+            "default": "",
+            "hint": "作为 user 消息和图片一起发送。留空用内置提示词（覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围）。⚠️ 自己写的话务必保留「口语简称也要写」这一条——检索是按词面匹配的，描述里只有「黑色丝袜」，搜「黑丝」就找不到。这段解析只进档案、不发给任何人，写得越细检索越准。"
+          }
+        }
+      },
+      "vision_check": {
+        "description": "输出校验",
+        "type": "object",
+        "hint": "拦住写了一半、模型拒答、敷衍了事的输出，别让它们进库污染检索。",
+        "items": {
+          "vision_end_mark": {
+            "description": "结束标记",
+            "type": "string",
+            "default": "",
+            "hint": "让模型在每次输出的最末尾写一串固定符号，代表「写完了」。填了之后：标记之前的算正文，标记之后的一律丢掉；整段里找不到标记就判定为没写完，按失败重试。配套的提示词必须明确要求模型输出这个标记，否则每张图都会被判未完成——所以默认留空不启用。推荐填六个间隔号「······」，提示词那边要求写十个，留四个的余量。写「······」时会自动兼容 ・ • ‧ ∙ ⋅ 这些形近符号。这一项的真正价值是揪出被截断的输出：秃尾巴的描述看上去和正常的一样，但丢掉的恰好是末尾那行标签。",
+            "obvious_hint": true
+          },
+          "vision_max_chars": {
+            "description": "细节记录最长字数",
+            "type": "int",
+            "default": 600,
+            "hint": "存档时按这个长度截断，是对模型实际输出的兜底。⚠️ 如果你在提示词里加了结构化标签行，务必调大——标签本身就要 300~600 字，加上自然语言描述很容易超过 600 而被从尾部砍掉，丢的正好是排在最后的那些项。带标签的话建议 1500。这份记录只在角色主动 inspect_photo 时才进上下文，放宽些不影响日常开销。"
+          },
+          "vision_min_chars": {
+            "description": "描述最少多少字才算数",
+            "type": "int",
+            "default": 0,
+            "hint": "短于这个字数就当模型敷衍了事，按失败重试。0 = 不检查。用详细描述提示词的话建议填 600~800——正常输出上千字，只回一两百字的基本都是没好好看图。注意跟你的提示词配套，提示词只要一句话概括就别开这个。拒答和思维链有专门的检测，不靠这一项。"
+          }
+        }
+      },
+      "vision_retry": {
+        "description": "并发与重试",
+        "type": "object",
+        "hint": "上游限流、网关抽风时的行为。重试用尽也不会算成图片自己的失败次数。",
+        "items": {
+          "vision_concurrency": {
+            "description": "视觉解析并发数",
+            "type": "int",
+            "default": 2,
+            "hint": "同时最多跑几个解析请求。一次涌入多张图时靠它限流，避免打爆 API 配额。批量索引图库时可以提到 10~20，上游扛不住会自动降速。"
+          },
+          "vision_retries": {
+            "description": "单张图最多尝试几次",
+            "type": "int",
+            "default": 4,
+            "hint": "只对「值得重试」的失败生效：限流、网关 503、超时、Gemini 的 200 空回、模型拒答。key 错、模型名错这类会立刻中止，不浪费次数；重试用尽也不会算成这张图的失败次数——上游的锅不该让图片背。"
+          },
+          "vision_retry_wait": {
+            "description": "视觉解析重试前等待（秒）",
+            "type": "int",
+            "default": 10,
+            "hint": "固定等待，不做指数退避。上游是一组账号轮换的话，等十秒足够换到下一个，翻倍只会拖慢整批。连续失败到熔断时，全局暂停时长是这个值的三倍。"
+          }
+        }
+      }
+    }
   },
-
-  "post_cooldown_minutes": {
-    "description": "发动态最短间隔（分钟）",
-    "type": "int",
-    "default": 180,
-    "hint": "两条动态之间至少间隔多久。填 0 表示不限制。"
+  "embed": {
+    "description": "② 语义向量",
+    "type": "object",
+    "hint": "把描述转成向量，让「晚上在外面那张」这种说不出关键词的话也能搜到。一张图转四段：全文、环境、身体、动作。",
+    "items": {
+      "embed_model": {
+        "description": "向量模型 ID",
+        "type": "string",
+        "default": "",
+        "hint": "填了才启用语义检索。关键词是词面匹配——你说「足底」而描述里写「脚底」、你说「红底」而标签里是「红色」，就永远搜不到。向量按语义找，能补上这一块。只支持 OpenAI 兼容的 /embeddings 接口（Gemini 的兼容层、各中转站、本地 ollama 都提供）。例：text-embedding-3-small、bge-m3、Qwen3-Embedding。留空则完全不启用，检索退回纯关键词。",
+        "obvious_hint": true
+      },
+      "embed_base_url": {
+        "description": "向量接口地址",
+        "type": "string",
+        "default": "",
+        "hint": "留空则复用视觉 API 的地址。填到 /v1 即可，插件补 /embeddings。注意 Anthropic 不提供向量服务，如果视觉用的是 anthropic 原生格式，这里必须单独填一个 OpenAI 兼容的地址。"
+      },
+      "embed_api_key": {
+        "description": "向量 API Key",
+        "type": "string",
+        "default": "",
+        "hint": "留空则复用视觉 API 的 Key。"
+      },
+      "embed_dim": {
+        "description": "向量维度",
+        "type": "int",
+        "default": 1024,
+        "hint": "要和模型实际输出的维度一致，填错会导致检索结果全乱——/gallery embed test 会当场报出实际维度供核对。支持指定维度的模型会把这个值一起发过去，不支持的会被忽略（插件收到 400 会自动去掉重试）。一万张 × 1024 维常驻内存约 40 MB，用 3072 维也才 120 MB，这个量级不必省。"
+      },
+      "embed_run": {
+        "description": "转换与重试",
+        "type": "object",
+        "hint": "向量接口比视觉接口更容易撞限流——分段之后请求数翻四倍，而这类接口常按文本条数算配额。",
+        "items": {
+          "embed_max_chars": {
+            "description": "送去转向量的最长字数",
+            "type": "int",
+            "default": 1800,
+            "hint": "超出会截断，但**结尾的标签行一定保留**——那一行口语词最密集（黑丝、细高跟、M腿），丢了等于把语义检索最该抓住的东西扔掉。注意模型的输入上限：gemini-embedding-001 只有 2048 token（约 1300 汉字），gemini-embedding-2 有 8192。描述加标签通常 1200~1500 字，用 001 的话这里要调到 1200 以下。"
+          },
+          "embed_batch": {
+            "description": "向量批量条数",
+            "type": "int",
+            "default": 32,
+            "hint": "一次请求送多少条描述去转向量。大一点快，但单条描述近千字，太大容易超模型的输入上限。"
+          },
+          "embed_retries": {
+            "description": "转向量最多尝试几次",
+            "type": "int",
+            "default": 5,
+            "hint": "撞上 429 限流或网关抽风时的重试次数。向量接口比视觉接口更容易撞限流：一张图要转四段（全文＋环境＋身体＋动作），请求数直接翻四倍，而这类接口往往按文本条数而不是请求数算配额。"
+          },
+          "embed_retry_wait": {
+            "description": "转向量重试前等待（秒）",
+            "type": "int",
+            "default": 60,
+            "hint": "固定等待，不做指数退避。限流配额按分钟计窗口，等满一分钟正好跨过去，翻倍只是白等。加了更多 key、或者换成配额宽松的接口之后可以调小。"
+          }
+        }
+      }
+    }
   },
-  "post_daily_limit": {
-    "description": "每日动态条数上限",
-    "type": "int",
-    "default": 5,
-    "hint": "按角色所在时区的自然日计算。填 0 表示不限制。"
+  "gallery": {
+    "description": "③ 相册",
+    "type": "object",
+    "hint": "她自己的图库：扫描登记、批量索引、检索挑图。",
+    "items": {
+      "gallery_dir": {
+        "description": "相册目录",
+        "type": "string",
+        "default": "",
+        "hint": "角色发给对方的照片从这里挑，绝对路径。顶层子文件夹名即分类（一个博主/一个主题一个文件夹），她挑图时可以按分类筛。支持 jpg/png/webp，会递归扫描。填好后先用 /gallery scan 登记，再用 /gallery index 分批建视觉索引——不建索引就只能靠分类名挑，建完才能按画面内容找。留空则禁用发照片功能。",
+        "obvious_hint": true
+      },
+      "gallery_index": {
+        "description": "后台索引",
+        "type": "object",
+        "hint": "/gallery index auto 的行为。上游挂了会拉长间隔守着，不会把图标成坏图。",
+        "items": {
+          "index_auto_batch": {
+            "description": "后台索引每批张数",
+            "type": "int",
+            "default": 30,
+            "hint": "/gallery index auto 每轮取几张。批内并发由「视觉解析并发数」控制，这里只决定多久汇总一次进度和落一次库。"
+          },
+          "index_report_gap": {
+            "description": "后台索引进度回报间隔（秒）",
+            "type": "int",
+            "default": 600,
+            "hint": "后台索引最少隔这么久报一次进度。跑一万张要好几个小时，报太勤会刷屏。完成、上游异常、被停这三种情况不受此限制，总会立刻通知。"
+          },
+          "index_max_dry": {
+            "description": "后台索引空转多少轮才收工",
+            "type": "int",
+            "default": 12,
+            "hint": "连续这么多轮一张都没成功就停下并通知你。每轮之间的等待会翻倍（2、4、8 分钟，最长 15 分钟），默认 12 轮约能守住两个多小时的上游故障，中途恢复了会自动接着跑。"
+          }
+        }
+      },
+      "gallery_search": {
+        "description": "检索与排序",
+        "type": "object",
+        "hint": "两路召回：关键词按 IDF 加权，语义按分段向量取最大。召回之后按固定逻辑重排，不调 AI。",
+        "items": {
+          "vector_weight": {
+            "description": "向量在匹配度里的占比",
+            "type": "float",
+            "default": 0.4,
+            "hint": "最终匹配度 = 关键词命中率 × (1 - 这个值) + 语义相似度 × 这个值。调高更宽容、更能找到换了说法的图，调低更精确。只影响匹配度这一项，时间和发送条件仍然分层压在它上面。"
+          },
+          "rank_pool": {
+            "description": "参与权重计算的候选数",
+            "type": "int",
+            "default": 60,
+            "hint": "先按关键词命中数取这么多张，再对这一批做加权重排。池子越大越不容易漏掉正确答案，但排序结果也越容易被权重扰动。这一步是纯计算，不调模型，加大它不花钱。",
+            "obvious_hint": true
+          },
+          "rank_return": {
+            "description": "最终返回几张",
+            "type": "int",
+            "default": 10,
+            "hint": "重排后把前几张交给角色，由她自己挑一张发。给太多她挑得费劲、也吃上下文；给太少容易漏掉对的那张。"
+          },
+          "sent_window_days": {
+            "description": "「最近发过」的天数",
+            "type": "int",
+            "default": 30,
+            "hint": "多少天以内发过算「最近发过」。角色调工具时传 prefer_sent=recent（他说「上次那张」），这个窗口内发过的会整体排到前面，组内再按关键词匹配度。默认 30 天。"
+          }
+        }
+      },
+      "gallery_picker": {
+        "description": "挑图",
+        "type": "object",
+        "hint": "候选给到她之后，要不要再过一遍模型精排。默认不过——她自己看摘要挑就够了。",
+        "items": {
+          "picker_enable": {
+            "description": "额外的模型精排",
+            "type": "bool",
+            "default": false,
+            "hint": "权重重排之后，再把结果交给模型逐张比对一遍。默认关——角色拿到候选列表后本来就会自己挑，这一步是额外的一次调用。只有当她填了「想找的画面」时才会触发。",
+            "obvious_hint": true
+          },
+          "picker_mode": {
+            "description": "精排依据",
+            "type": "string",
+            "default": "text",
+            "options": [
+              "text",
+              "image"
+            ],
+            "hint": "text = 把候选图的文字描述交给模型比对，便宜。image = 直接把候选图片本身发给多模态模型看图选，准得多——描述再细也是二手信息，当初漏写的东西永远找不回来，而看图不受这个限制。代价是贵：一张图 1500~4800 token，比一段描述贵好几倍，延迟也高。",
+            "obvious_hint": true
+          },
+          "picker_model": {
+            "description": "选图模型 ID",
+            "type": "string",
+            "default": "",
+            "hint": "精排是纯文字比对，不需要多模态，可以换个更便宜或更长上下文的模型。留空则复用视觉模型。接口地址、Key、格式跟视觉 API 共用一套。"
+          },
+          "picker_image_max": {
+            "description": "看图精排最多几张",
+            "type": "int",
+            "default": 6,
+            "hint": "仅在精排依据选 image 时生效。粗筛结果会先截到这个数再发图，避免一次传十几张。6 张约 1~3 万 token。"
+          }
+        }
+      },
+      "gallery_audit": {
+        "description": "质量校验",
+        "type": "object",
+        "hint": "/gallery audit 判定描述合不合格的口径。",
+        "items": {
+          "tag_min_words": {
+            "description": "关键词行最少几个词",
+            "type": "int",
+            "default": 0,
+            "hint": "0 = 不检查，适用于把 44 项维度化进自然语言、末尾不再单列关键词行的提示词（当前默认那版就是）。如果你的提示词要求末尾输出一行 --- 分隔的检索关键词，填 12 左右，少于这个数的会判为不合格，/gallery redo 排队重跑。还在用固定 44 项候选值的话，改用「标签严格校验」，那时要求项数完全对齐。填错的后果很直接：提示词不输出关键词行却把这里设成非 0，全库都会被判「无标签」，redo 一按就是整库重跑。",
+            "obvious_hint": true
+          },
+          "tag_strict": {
+            "description": "严格校验标签取值",
+            "type": "bool",
+            "default": false,
+            "hint": "索引时是否检查标签的每个值都在 tag_schema.py 的候选集里。只有当你的提示词给模型列了固定候选值时才该开——让模型自由用词的话，开了会把几乎每张都标成「有问题」，全是噪声。关掉后仍然校验结构（段数、编号连续性），那才是真正会毁数据的错误。"
+          }
+        }
+      }
+    }
   },
-
-  "inject_history": {
-    "description": "注入历史动态文字",
-    "type": "bool",
-    "default": true,
-    "hint": "每次对话前把角色发过的全部动态文字注入上下文，让她记得自己发过什么、避免重复。"
+  "memory": {
+    "description": "④ 图片记忆",
+    "type": "object",
+    "hint": "把聊天里出现过的图折叠成文字，省 token 又不失忆。她发出去的照片也会记进来。",
+    "items": {
+      "describe_images": {
+        "description": "让角色自己描述图片",
+        "type": "bool",
+        "default": true,
+        "hint": "上下文里出现还没存过描述的图片时，请角色在这次回复末尾附一段 <img_note> 描述。这段会被插件抽走存档、不会发给用户。这是检索的「目录」层——带着她自己的视角和当时的语境（「阿泽加班时拍的」），折叠后的占位显示的就是它。不额外调模型，跟正文一次生成。配了独立视觉模型时会自动只要一句话，细节交给视觉层。",
+        "obvious_hint": true
+      },
+      "max_context_images": {
+        "description": "上下文里最多保留几张真图",
+        "type": "int",
+        "default": 0,
+        "hint": "AstrBot 把图片以 base64 永久写进对话历史，之后每轮都原样重发——几十张之后既吃 token 又稀释注意力。设成正数后，只保留最近这么多张真图，更早的换成 [图片 #N] 文字占位，角色需要时可用 inspect_photo 查画面细节（只回文字，便宜）或 recall_photo 把原图整个取回。⚠️ 折叠是写回历史的、不可逆，但图片在首次进入上下文时就已存到 plugin_data/astrbot_plugin_tg_presence/context_photos/ 下，不会真的丢。填 0 表示不折叠（配了视觉模型的话仍会存盘和解析）。",
+        "obvious_hint": true
+      }
+    }
   },
-  "inject_history_limit": {
-    "description": "注入动态条数上限",
-    "type": "int",
-    "default": 0,
-    "hint": "只注入最近 N 条。填 0 表示注入全部（1M 上下文足够）。"
+  "photo": {
+    "description": "⑤ 发照片",
+    "type": "object",
+    "hint": "她主动发图的频率上限。",
+    "items": {
+      "photo_cooldown_minutes": {
+        "description": "发照片最短间隔（分钟）",
+        "type": "int",
+        "default": 10,
+        "hint": "两张照片之间至少隔多久。真人不会连着刷图。填 0 表示不限制。只约束她自主发的，不影响 /photo 指令。"
+      },
+      "photo_daily_limit": {
+        "description": "每日发照片上限",
+        "type": "int",
+        "default": 20,
+        "hint": "按角色所在时区的自然日计算。填 0 表示不限制。同样不约束 /photo 指令。"
+      }
+    }
   },
-  "inject_history_images": {
-    "description": "同时注入动态配图",
-    "type": "bool",
-    "default": false,
-    "hint": "除文字外，把动态的配图也一并送进上下文。会显著增加 token 消耗和首字延迟，且依赖模型的多模态能力。"
+  "moment": {
+    "description": "⑥ 动态",
+    "type": "object",
+    "hint": "她往频道发动态，以及把发过的动态注回上下文让她记得。",
+    "items": {
+      "channel_id": {
+        "description": "动态频道 ID",
+        "type": "string",
+        "default": "",
+        "hint": "角色发动态的目标 Telegram 频道。私密频道填数字 ID（-100 开头），公开频道可填 @频道用户名。留空则禁用发动态功能。获取方法：从频道转发一条消息给 @userinfobot。",
+        "obvious_hint": true
+      },
+      "moment_photo_dir": {
+        "description": "动态配图目录",
+        "type": "string",
+        "default": "",
+        "hint": "存放动态配图的目录，绝对路径。目录下可再建子文件夹作为分类，子文件夹名即角色调用时可指定的分类名。留空则动态只能发纯文字。",
+        "obvious_hint": true
+      },
+      "post_cooldown_minutes": {
+        "description": "发动态最短间隔（分钟）",
+        "type": "int",
+        "default": 180,
+        "hint": "两条动态之间至少间隔多久。填 0 表示不限制。"
+      },
+      "post_daily_limit": {
+        "description": "每日动态条数上限",
+        "type": "int",
+        "default": 5,
+        "hint": "按角色所在时区的自然日计算。填 0 表示不限制。"
+      },
+      "moment_inject": {
+        "description": "历史注入",
+        "type": "object",
+        "hint": "把发过的动态按时间顺序插回上下文，她才知道自己什么时候说过什么。",
+        "items": {
+          "inject_history": {
+            "description": "注入历史动态文字",
+            "type": "bool",
+            "default": true,
+            "hint": "每次对话前把角色发过的全部动态文字注入上下文，让她记得自己发过什么、避免重复。"
+          },
+          "inject_history_limit": {
+            "description": "注入动态条数上限",
+            "type": "int",
+            "default": 0,
+            "hint": "只注入最近 N 条。填 0 表示注入全部（1M 上下文足够）。"
+          },
+          "inject_history_images": {
+            "description": "同时注入动态配图",
+            "type": "bool",
+            "default": false,
+            "hint": "除文字外，把动态的配图也一并送进上下文。会显著增加 token 消耗和首字延迟，且依赖模型的多模态能力。"
+          },
+          "inject_images_limit": {
+            "description": "注入配图张数上限",
+            "type": "int",
+            "default": 10,
+            "hint": "仅在上一项开启时生效，取最近 N 张。填 0 表示不限制（不建议）。"
+          }
+        }
+      }
+    }
   },
-  "inject_images_limit": {
-    "description": "注入配图张数上限",
-    "type": "int",
-    "default": 10,
-    "hint": "仅在上一项开启时生效，取最近 N 张。填 0 表示不限制（不建议）。"
+  "profile": {
+    "description": "⑦ 头像与签名",
+    "type": "object",
+    "hint": "换头像、改签名的素材和冷却。",
+    "items": {
+      "avatar_dir": {
+        "description": "候选头像目录",
+        "type": "string",
+        "default": "",
+        "hint": "存放候选头像的目录，绝对路径。只会读取 .jpg / .jpeg 文件（Telegram 头像接口只收 JPEG）。可建子文件夹作为分类。留空则禁用换头像功能。",
+        "obvious_hint": true
+      },
+      "avatar_cooldown_minutes": {
+        "description": "换头像最短间隔（分钟）",
+        "type": "int",
+        "default": 720,
+        "hint": "Telegram 官方未公布该接口的频率上限，间隔太短可能触发限流。填 0 表示不限制。"
+      },
+      "signature_cooldown_minutes": {
+        "description": "改签名最短间隔（分钟）",
+        "type": "int",
+        "default": 360,
+        "hint": "签名是资料页上那句会变的话（setMyShortDescription，120 字符以内），点开 bot 头像就能看到。填 0 表示不限制。"
+      }
+    }
   },
-
-  "moment_photo_dir": {
-    "description": "动态配图目录",
-    "type": "string",
-    "default": "",
-    "hint": "存放动态配图的目录，绝对路径。目录下可再建子文件夹作为分类，子文件夹名即角色调用时可指定的分类名。留空则动态只能发纯文字。",
-    "obvious_hint": true
+  "presence": {
+    "description": "⑧ 时间感与表情",
+    "type": "object",
+    "hint": "给她自己的消息打时间戳（她能看见，用户看不见），以及对消息点表情。",
+    "items": {
+      "stamp_own_messages": {
+        "description": "给角色自己的消息打时间戳",
+        "type": "bool",
+        "default": true,
+        "hint": "AstrBot 只给用户消息带时间，角色自己说的话没有任何时间锚点——主动消息尤其如此。开启后会在角色消息正文前加上形如 [08-01 14:30] 的简略时间戳，随对话历史一起保存。"
+      },
+      "stamp_min_gap_minutes": {
+        "description": "打戳最短间隔（分钟）",
+        "type": "int",
+        "default": 5,
+        "hint": "距上次打戳不足这么久就不再重复打，避免连续对话里每条都是时间戳。填 0 表示每条都打。"
+      },
+      "enable_reaction": {
+        "description": "启用表情回应",
+        "type": "bool",
+        "default": true,
+        "hint": "允许角色对你的消息打表情，作为轻量的非文字回应。"
+      }
+    }
   },
-
-  "gallery_dir": {
-    "description": "相册目录",
-    "type": "string",
-    "default": "",
-    "hint": "角色发给对方的照片从这里挑，绝对路径。顶层子文件夹名即分类（一个博主/一个主题一个文件夹），她挑图时可以按分类筛。支持 jpg/png/webp，会递归扫描。填好后先用 /gallery scan 登记，再用 /gallery index 分批建视觉索引——不建索引就只能靠分类名挑，建完才能按画面内容找。留空则禁用发照片功能。",
-    "obvious_hint": true
+  "director": {
+    "description": "⑨ 导演模式",
+    "type": "object",
+    "hint": "从另一个 bot 发指令让她说话，指令不进她的上下文，也不出现在聊天窗口。",
+    "items": {
+      "director_platform_id": {
+        "description": "控制台机器人名称",
+        "type": "string",
+        "default": "",
+        "hint": "填另一个 bot 的「机器人名称」——就是 WebUI「平台配置」里点开那个实例后的第一项（字段名 id，Telegram 默认值是 telegram）。不是 bot 用户名、不是 Token、也不是「适配器类型」（那项所有 tg 实例都是 telegram，区分不了）。两个实例的机器人名称必须不同，建议控制台那个改成 control。填对之后，在控制台 bot 里发 /say 和 /act，角色就会在她自己的会话里发出对应的话，而你的指令既不进她的上下文、也不出现在你俩的聊天窗口里。留空则禁用。用法：先在角色的私聊里发一次 /link 绑定目标。",
+        "obvious_hint": true
+      },
+      "director_context_turns": {
+        "description": "导演生成时带多少条历史",
+        "type": "int",
+        "default": 40,
+        "hint": "/act 让角色自己组织语言时，往前取多少条对话作为上下文。太少了会接不上最近的话题，太多了费 token。"
+      }
+    }
   },
-  "photo_cooldown_minutes": {
-    "description": "发照片最短间隔（分钟）",
-    "type": "int",
-    "default": 10,
-    "hint": "两张照片之间至少隔多久。真人不会连着刷图。填 0 表示不限制。只约束她自主发的，不影响 /photo 指令。"
-  },
-  "photo_daily_limit": {
-    "description": "每日发照片上限",
-    "type": "int",
-    "default": 20,
-    "hint": "按角色所在时区的自然日计算。填 0 表示不限制。同样不约束 /photo 指令。"
-  },
-
-  "avatar_dir": {
-    "description": "候选头像目录",
-    "type": "string",
-    "default": "",
-    "hint": "存放候选头像的目录，绝对路径。只会读取 .jpg / .jpeg 文件（Telegram 头像接口只收 JPEG）。可建子文件夹作为分类。留空则禁用换头像功能。",
-    "obvious_hint": true
-  },
-  "avatar_cooldown_minutes": {
-    "description": "换头像最短间隔（分钟）",
-    "type": "int",
-    "default": 720,
-    "hint": "Telegram 官方未公布该接口的频率上限，间隔太短可能触发限流。填 0 表示不限制。"
-  },
-
-  "signature_cooldown_minutes": {
-    "description": "改签名最短间隔（分钟）",
-    "type": "int",
-    "default": 360,
-    "hint": "签名是资料页上那句会变的话（setMyShortDescription，120 字符以内），点开 bot 头像就能看到。填 0 表示不限制。"
-  },
-
-  "describe_images": {
-    "description": "让角色自己描述图片",
-    "type": "bool",
-    "default": true,
-    "hint": "上下文里出现还没存过描述的图片时，请角色在这次回复末尾附一段 <img_note> 描述。这段会被插件抽走存档、不会发给用户。这是检索的「目录」层——带着她自己的视角和当时的语境（「阿泽加班时拍的」），折叠后的占位显示的就是它。不额外调模型，跟正文一次生成。配了独立视觉模型时会自动只要一句话，细节交给视觉层。",
-    "obvious_hint": true
-  },
-
-  "vision_api_format": {
-    "description": "视觉接口格式",
-    "type": "string",
-    "default": "openai",
-    "options": ["openai", "anthropic", "gemini"],
-    "hint": "三家的请求体、鉴权头、图片包装方式完全不同，必须选对。openai = OpenAI 兼容的 /chat/completions（绝大多数中转站、国产模型、vLLM 都是这个）；anthropic = Claude 原生 /v1/messages；gemini = Google 原生 generateContent。用中转站的话选 openai，除非它明确说自己转发原生格式。",
-    "obvious_hint": true
-  },
-  "vision_base_url": {
-    "description": "视觉 API 接口地址",
-    "type": "string",
-    "default": "",
-    "hint": "只填到根即可，插件按上面选的格式补路径。openai：https://api.openai.com/v1 → /chat/completions；anthropic：https://api.anthropic.com 或 .../v1 → /v1/messages；gemini：https://generativelanguage.googleapis.com/v1beta → /models/{模型}:generateContent。填全了也认。这套配置独立于 AstrBot 的服务提供商——主对话模型贵、这个便宜，本来就不该共用。三项必填（地址、Key、模型 ID）齐了才启用。",
-    "obvious_hint": true
-  },
-  "vision_api_key": {
-    "description": "视觉 API Key",
-    "type": "string",
-    "default": "",
-    "hint": "按格式自动选鉴权头：openai 用 Authorization: Bearer，anthropic 用 x-api-key，gemini 用 x-goog-api-key（走请求头而不是 URL 参数，免得密钥被各级日志抄走）。",
-    "obvious_hint": true
-  },
-  "vision_model": {
-    "description": "视觉模型 ID",
-    "type": "string",
-    "default": "",
-    "hint": "必须是支持图片输入的多模态模型。openai 格式如 gpt-4o-mini、qwen-vl-max；anthropic 格式如 claude-haiku-4-5；gemini 格式如 gemini-2.5-flash（gemini 的模型名会拼进 URL 路径，别写成 models/xxx）。",
-    "obvious_hint": true
-  },
-  "vision_stream": {
-    "description": "流式接收",
-    "type": "bool",
-    "default": false,
-    "hint": "结果整体存档，没人盯着看逐字输出，所以默认关。开启只为一个理由：有些中转网关对非流式的长响应直接返回 504 或干脆挂断，那种情况下只有流式能跑通。插件会把增量拼回完整文本再存。",
-    "obvious_hint": true
-  },
-  "vision_context_window": {
-    "description": "视觉模型上下文窗口",
-    "type": "int",
-    "default": 128000,
-    "hint": "该模型的上下文窗口大小。插件用它校验「最大输出长度」是否合理——输出上限接近窗口的话图片就塞不进去了，会自动压到窗口的四分之一并记一条警告。这个值不会发给 API。"
-  },
-  "vision_max_tokens": {
-    "description": "最大输出长度",
-    "type": "int",
-    "default": 1024,
-    "hint": "请求里的 max_tokens。解析一张图 1024 通常够用；模型经常被这个值截断的话再往上调。"
-  },
-  "vision_system_prompt": {
-    "description": "视觉系统提示词",
-    "type": "text",
-    "default": "",
-    "hint": "作为 system 角色发送。留空用内置的（要求只输出客观描述、不加开场白和免责声明）。模型总是拒答或者总在描述前后加废话时，改这里。",
-    "obvious_hint": true
-  },
-  "vision_prompt": {
-    "description": "视觉解析提示词",
-    "type": "text",
-    "default": "",
-    "hint": "作为 user 消息和图片一起发送。留空用内置提示词（覆盖主体、衣着材质颜色、场景光线、画面物品与文字、色调氛围）。⚠️ 自己写的话务必保留「口语简称也要写」这一条——检索是按词面匹配的，描述里只有「黑色丝袜」，搜「黑丝」就找不到。这段解析只进档案、不发给任何人，写得越细检索越准。"
-  },
-  "vision_extra_body": {
-    "description": "附加请求参数",
-    "type": "text",
-    "default": "",
-    "hint": "一段 JSON 对象，合并进请求体顶层（同名的字典会合并，其余直接覆盖）。用来填插件没单独做成配置项的东西，按你选的格式写：gemini 的 safetySettings、temperature/top_p、anthropic 的 thinking 等。留空则不加。格式不合法会记一条警告并忽略，不影响请求。",
-    "obvious_hint": true
-  },
-  "vision_max_chars": {
-    "description": "细节记录最长字数",
-    "type": "int",
-    "default": 600,
-    "hint": "存档时按这个长度截断，是对模型实际输出的兜底。⚠️ 如果你在提示词里加了结构化标签行，务必调大——标签本身就要 300~600 字，加上自然语言描述很容易超过 600 而被从尾部砍掉，丢的正好是排在最后的那些项。带标签的话建议 1500。这份记录只在角色主动 inspect_photo 时才进上下文，放宽些不影响日常开销。"
-  },
-  "rank_pool": {
-    "description": "参与权重计算的候选数",
-    "type": "int",
-    "default": 60,
-    "hint": "先按关键词命中数取这么多张，再对这一批做加权重排。池子越大越不容易漏掉正确答案，但排序结果也越容易被权重扰动。这一步是纯计算，不调模型，加大它不花钱。",
-    "obvious_hint": true
-  },
-  "rank_return": {
-    "description": "最终返回几张",
-    "type": "int",
-    "default": 10,
-    "hint": "重排后把前几张交给角色，由她自己挑一张发。给太多她挑得费劲、也吃上下文；给太少容易漏掉对的那张。"
-  },
-  "embed_model": {
-    "description": "向量模型 ID",
-    "type": "string",
-    "default": "",
-    "hint": "填了才启用语义检索。关键词是词面匹配——你说「足底」而描述里写「脚底」、你说「红底」而标签里是「红色」，就永远搜不到。向量按语义找，能补上这一块。只支持 OpenAI 兼容的 /embeddings 接口（Gemini 的兼容层、各中转站、本地 ollama 都提供）。例：text-embedding-3-small、bge-m3、Qwen3-Embedding。留空则完全不启用，检索退回纯关键词。",
-    "obvious_hint": true
-  },
-  "embed_base_url": {
-    "description": "向量接口地址",
-    "type": "string",
-    "default": "",
-    "hint": "留空则复用视觉 API 的地址。填到 /v1 即可，插件补 /embeddings。注意 Anthropic 不提供向量服务，如果视觉用的是 anthropic 原生格式，这里必须单独填一个 OpenAI 兼容的地址。"
-  },
-  "embed_api_key": {
-    "description": "向量 API Key",
-    "type": "string",
-    "default": "",
-    "hint": "留空则复用视觉 API 的 Key。"
-  },
-  "embed_dim": {
-    "description": "向量维度",
-    "type": "int",
-    "default": 1024,
-    "hint": "要和模型实际输出的维度一致，填错会导致检索结果全乱——/gallery embed test 会当场报出实际维度供核对。支持指定维度的模型会把这个值一起发过去，不支持的会被忽略（插件收到 400 会自动去掉重试）。一万张 × 1024 维常驻内存约 40 MB，用 3072 维也才 120 MB，这个量级不必省。"
-  },
-  "embed_max_chars": {
-    "description": "送去转向量的最长字数",
-    "type": "int",
-    "default": 1800,
-    "hint": "超出会截断，但**结尾的标签行一定保留**——那一行口语词最密集（黑丝、细高跟、M腿），丢了等于把语义检索最该抓住的东西扔掉。注意模型的输入上限：gemini-embedding-001 只有 2048 token（约 1300 汉字），gemini-embedding-2 有 8192。描述加标签通常 1200~1500 字，用 001 的话这里要调到 1200 以下。"
-  },
-  "embed_batch": {
-    "description": "向量批量条数",
-    "type": "int",
-    "default": 32,
-    "hint": "一次请求送多少条描述去转向量。大一点快，但单条描述近千字，太大容易超模型的输入上限。"
-  },
-  "vector_weight": {
-    "description": "向量在匹配度里的占比",
-    "type": "float",
-    "default": 0.4,
-    "hint": "最终匹配度 = 关键词命中率 × (1 - 这个值) + 语义相似度 × 这个值。调高更宽容、更能找到换了说法的图，调低更精确。只影响匹配度这一项，时间和发送条件仍然分层压在它上面。"
-  },
-  "sent_window_days": {
-    "description": "「最近发过」的天数",
-    "type": "int",
-    "default": 30,
-    "hint": "多少天以内发过算「最近发过」。角色调工具时传 prefer_sent=recent（他说「上次那张」），这个窗口内发过的会整体排到前面，组内再按关键词匹配度。默认 30 天。"
-  },
-  "picker_enable": {
-    "description": "额外的模型精排",
-    "type": "bool",
-    "default": false,
-    "hint": "权重重排之后，再把结果交给模型逐张比对一遍。默认关——角色拿到候选列表后本来就会自己挑，这一步是额外的一次调用。只有当她填了「想找的画面」时才会触发。",
-    "obvious_hint": true
-  },
-  "tag_strict": {
-    "description": "严格校验标签取值",
-    "type": "bool",
-    "default": false,
-    "hint": "索引时是否检查标签的每个值都在 tag_schema.py 的候选集里。只有当你的提示词给模型列了固定候选值时才该开——让模型自由用词的话，开了会把几乎每张都标成「有问题」，全是噪声。关掉后仍然校验结构（段数、编号连续性），那才是真正会毁数据的错误。"
-  },
-  "picker_mode": {
-    "description": "精排依据",
-    "type": "string",
-    "default": "text",
-    "options": ["text", "image"],
-    "hint": "text = 把候选图的文字描述交给模型比对，便宜。image = 直接把候选图片本身发给多模态模型看图选，准得多——描述再细也是二手信息，当初漏写的东西永远找不回来，而看图不受这个限制。代价是贵：一张图 1500~4800 token，比一段描述贵好几倍，延迟也高。",
-    "obvious_hint": true
-  },
-  "picker_image_max": {
-    "description": "看图精排最多几张",
-    "type": "int",
-    "default": 6,
-    "hint": "仅在精排依据选 image 时生效。粗筛结果会先截到这个数再发图，避免一次传十几张。6 张约 1~3 万 token。"
-  },
-  "picker_model": {
-    "description": "选图模型 ID",
-    "type": "string",
-    "default": "",
-    "hint": "精排是纯文字比对，不需要多模态，可以换个更便宜或更长上下文的模型。留空则复用视觉模型。接口地址、Key、格式跟视觉 API 共用一套。"
-  },
-  "vision_concurrency": {
-    "description": "视觉解析并发数",
-    "type": "int",
-    "default": 2,
-    "hint": "同时最多跑几个解析请求。一次涌入多张图时靠它限流，避免打爆 API 配额。批量索引图库时可以提到 10~20，上游扛不住会自动降速。"
-  },
-  "gemini_safety": {
-    "description": "Gemini 安全阈值",
-    "type": "string",
-    "default": "BLOCK_NONE",
-    "options": ["BLOCK_NONE", "OFF", "默认"],
-    "hint": "只对「Gemini 原生」格式生效。不设的话成人向图片会被安全策略拦掉，而且拦得毫无痕迹——HTTP 200、正文空着，从状态码完全看不出问题。BLOCK_NONE 通用；OFF 更彻底但只有较新的模型认，老模型收到会报 400；选「默认」则完全不传这个字段。注意 finishReason=PROHIBITED_CONTENT 这一类是关不掉的，遇到只能换模型。",
-    "obvious_hint": true
-  },
-  "gemini_thinking_budget": {
-    "description": "Gemini 思考预算",
-    "type": "string",
-    "default": "",
-    "hint": "只对「Gemini 原生」格式生效，填整数。2.5 系列的思考 token 跟正文共用「最大输出长度」，不限制的话模型会先在思维链里把描述打一遍草稿，等正式输出时配额已经见底——草稿和正文双双被截断，还会被拼成一条记录存进库。gemini-2.5-flash 填 0 直接关掉思考；gemini-2.5-pro 关不掉，填 128（最小值）。留空则完全不传这个字段，1.5 及更早的老模型必须留空，它们不认识这个参数会报 400。",
-    "obvious_hint": true
-  },
-  "vision_end_mark": {
-    "description": "结束标记",
-    "type": "string",
-    "default": "",
-    "hint": "让模型在每次输出的最末尾写一串固定符号，代表「写完了」。填了之后：标记之前的算正文，标记之后的一律丢掉；整段里找不到标记就判定为没写完，按失败重试。配套的提示词必须明确要求模型输出这个标记，否则每张图都会被判未完成——所以默认留空不启用。推荐填六个间隔号「······」，提示词那边要求写十个，留四个的余量。写「······」时会自动兼容 ・ • ‧ ∙ ⋅ 这些形近符号。这一项的真正价值是揪出被截断的输出：秃尾巴的描述看上去和正常的一样，但丢掉的恰好是末尾那行标签。",
-    "obvious_hint": true
-  },
-  "tag_min_words": {
-    "description": "关键词行最少几个词",
-    "type": "int",
-    "default": 0,
-    "hint": "0 = 不检查，适用于把 44 项维度化进自然语言、末尾不再单列关键词行的提示词（当前默认那版就是）。如果你的提示词要求末尾输出一行 --- 分隔的检索关键词，填 12 左右，少于这个数的会判为不合格，/gallery redo 排队重跑。还在用固定 44 项候选值的话，改用「标签严格校验」，那时要求项数完全对齐。填错的后果很直接：提示词不输出关键词行却把这里设成非 0，全库都会被判「无标签」，redo 一按就是整库重跑。",
-    "obvious_hint": true
-  },
-  "vision_min_chars": {
-    "description": "描述最少多少字才算数",
-    "type": "int",
-    "default": 0,
-    "hint": "短于这个字数就当模型敷衍了事，按失败重试。0 = 不检查。用详细描述提示词的话建议填 600~800——正常输出上千字，只回一两百字的基本都是没好好看图。注意跟你的提示词配套，提示词只要一句话概括就别开这个。拒答和思维链有专门的检测，不靠这一项。"
-  },
-  "embed_retries": {
-    "description": "转向量最多尝试几次",
-    "type": "int",
-    "default": 5,
-    "hint": "撞上 429 限流或网关抽风时的重试次数。向量接口比视觉接口更容易撞限流：一张图要转四段（全文＋环境＋身体＋动作），请求数直接翻四倍，而这类接口往往按文本条数而不是请求数算配额。"
-  },
-  "embed_retry_wait": {
-    "description": "转向量重试前等待（秒）",
-    "type": "int",
-    "default": 60,
-    "hint": "固定等待，不做指数退避。限流配额按分钟计窗口，等满一分钟正好跨过去，翻倍只是白等。加了更多 key、或者换成配额宽松的接口之后可以调小。"
-  },
-  "vision_retries": {
-    "description": "单张图最多尝试几次",
-    "type": "int",
-    "default": 4,
-    "hint": "只对「值得重试」的失败生效：限流、网关 503、超时、Gemini 的 200 空回、模型拒答。key 错、模型名错这类会立刻中止，不浪费次数；重试用尽也不会算成这张图的失败次数——上游的锅不该让图片背。"
-  },
-  "vision_retry_wait": {
-    "description": "视觉解析重试前等待（秒）",
-    "type": "int",
-    "default": 10,
-    "hint": "固定等待，不做指数退避。上游是一组账号轮换的话，等十秒足够换到下一个，翻倍只会拖慢整批。连续失败到熔断时，全局暂停时长是这个值的三倍。"
-  },
-  "index_auto_batch": {
-    "description": "后台索引每批张数",
-    "type": "int",
-    "default": 30,
-    "hint": "/gallery index auto 每轮取几张。批内并发由「视觉解析并发数」控制，这里只决定多久汇总一次进度和落一次库。"
-  },
-  "index_report_gap": {
-    "description": "后台索引进度回报间隔（秒）",
-    "type": "int",
-    "default": 600,
-    "hint": "后台索引最少隔这么久报一次进度。跑一万张要好几个小时，报太勤会刷屏。完成、上游异常、被停这三种情况不受此限制，总会立刻通知。"
-  },
-  "index_max_dry": {
-    "description": "后台索引空转多少轮才收工",
-    "type": "int",
-    "default": 12,
-    "hint": "连续这么多轮一张都没成功就停下并通知你。每轮之间的等待会翻倍（2、4、8 分钟，最长 15 分钟），默认 12 轮约能守住两个多小时的上游故障，中途恢复了会自动接着跑。"
-  },
-
-  "max_context_images": {
-    "description": "上下文里最多保留几张真图",
-    "type": "int",
-    "default": 0,
-    "hint": "AstrBot 把图片以 base64 永久写进对话历史，之后每轮都原样重发——几十张之后既吃 token 又稀释注意力。设成正数后，只保留最近这么多张真图，更早的换成 [图片 #N] 文字占位，角色需要时可用 inspect_photo 查画面细节（只回文字，便宜）或 recall_photo 把原图整个取回。⚠️ 折叠是写回历史的、不可逆，但图片在首次进入上下文时就已存到 plugin_data/astrbot_plugin_tg_presence/context_photos/ 下，不会真的丢。填 0 表示不折叠（配了视觉模型的话仍会存盘和解析）。",
-    "obvious_hint": true
-  },
-
-  "stamp_own_messages": {
-    "description": "给角色自己的消息打时间戳",
-    "type": "bool",
-    "default": true,
-    "hint": "AstrBot 只给用户消息带时间，角色自己说的话没有任何时间锚点——主动消息尤其如此。开启后会在角色消息正文前加上形如 [08-01 14:30] 的简略时间戳，随对话历史一起保存。"
-  },
-  "stamp_min_gap_minutes": {
-    "description": "打戳最短间隔（分钟）",
-    "type": "int",
-    "default": 5,
-    "hint": "距上次打戳不足这么久就不再重复打，避免连续对话里每条都是时间戳。填 0 表示每条都打。"
-  },
-
-  "enable_reaction": {
-    "description": "启用表情回应",
-    "type": "bool",
-    "default": true,
-    "hint": "允许角色对你的消息打表情，作为轻量的非文字回应。"
-  },
-
-  "director_platform_id": {
-    "description": "控制台机器人名称",
-    "type": "string",
-    "default": "",
-    "hint": "填另一个 bot 的「机器人名称」——就是 WebUI「平台配置」里点开那个实例后的第一项（字段名 id，Telegram 默认值是 telegram）。不是 bot 用户名、不是 Token、也不是「适配器类型」（那项所有 tg 实例都是 telegram，区分不了）。两个实例的机器人名称必须不同，建议控制台那个改成 control。填对之后，在控制台 bot 里发 /say 和 /act，角色就会在她自己的会话里发出对应的话，而你的指令既不进她的上下文、也不出现在你俩的聊天窗口里。留空则禁用。用法：先在角色的私聊里发一次 /link 绑定目标。",
-    "obvious_hint": true
-  },
-  "director_context_turns": {
-    "description": "导演生成时带多少条历史",
-    "type": "int",
-    "default": 40,
-    "hint": "/act 让角色自己组织语言时，往前取多少条对话作为上下文。太少了会接不上最近的话题，太多了费 token。"
-  },
-
-  "timezone": {
-    "description": "时区",
-    "type": "string",
-    "default": "Asia/Shanghai",
-    "hint": "IANA 时区名，用于计算「每日上限」的自然日边界和动态时间戳显示。"
-  },
-
-  "admin_only_commands": {
-    "description": "手动指令仅管理员可用",
-    "type": "bool",
-    "default": true,
-    "hint": "关闭后任何人都能用 /moment /avatar /bio 指令操作这个 bot 的资料。这些资料是全局生效的，建议保持开启。"
+  "misc": {
+    "description": "⑩ 通用",
+    "type": "object",
+    "items": {
+      "timezone": {
+        "description": "时区",
+        "type": "string",
+        "default": "Asia/Shanghai",
+        "hint": "IANA 时区名，用于计算「每日上限」的自然日边界和动态时间戳显示。"
+      },
+      "admin_only_commands": {
+        "description": "手动指令仅管理员可用",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后任何人都能用 /moment /avatar /bio 指令操作这个 bot 的资料。这些资料是全局生效的，建议保持开启。"
+      }
+    }
   }
 }
