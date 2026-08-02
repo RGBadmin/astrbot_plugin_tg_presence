@@ -76,6 +76,10 @@ SIGNATURE_MAX = 120  # setMyShortDescription 的上限
 # 角色自己消息的时间戳格式，形如 [08-01 14:30]
 STAMP_FMT = "[%m-%d %H:%M]"
 STAMP_RE = re.compile(r"^\[\d{2}-\d{2} \d{2}:\d{2}\]")
+# 她会照着上下文里的戳自己也写一个——历史里每条自己的消息都以它开头，
+# 这就是一份天然的 few-shot 示范。而且她写的时间是猜的，跟真实时钟对不上。
+# 发出去之前按行首剥掉：打戳是插件的事，轮不到她自己动手
+OWN_STAMP_RE = re.compile(r"^[ \t]*\[\d{2}-\d{2} \d{2}:\d{2}\][ \t]*", re.M)
 
 # AstrBot 把当前时间写进 user 消息正文（astr_main_agent.py:980），
 # 这是历史里唯一可靠的时间锚点，用来给动态定位插入点
@@ -2418,15 +2422,22 @@ class TgPresence(Star):
         property 的 getter/setter 两种存储形态都覆盖，而且 result_chain 存在时
         setter 只替换 Plain 组件、不动图片之类的其它组件。
         """
-        if not self.conf.get("describe_images", True):
-            return
         text = getattr(resp, "completion_text", None)
-        if not isinstance(text, str) or "<img_note" not in text:
+        if not isinstance(text, str) or not text:
             return
 
-        if found := self._harvest_notes(text):
-            logger.info(f"[tg_presence] 收到 {found} 条图片描述")
-        resp.completion_text = IMG_NOTE_RE.sub("", text).strip()
+        out = text
+        if self.conf.get("describe_images", True) and "<img_note" in out:
+            if found := self._harvest_notes(out):
+                logger.info(f"[tg_presence] 收到 {found} 条图片描述")
+            out = IMG_NOTE_RE.sub("", out)
+        # 她模仿上下文自己写的时间戳，剥掉——真正的戳由 _stamp_own 事后打，
+        # 用的是真实时钟，她猜的那个多半是错的
+        if OWN_STAMP_RE.search(out):
+            logger.info("[tg_presence] 剥掉她自己写的时间戳")
+            out = OWN_STAMP_RE.sub("", out)
+        if (out := out.strip()) != text:
+            resp.completion_text = out
 
     @filter.on_decorating_result()
     async def strip_notes_before_send(self, event: AstrMessageEvent):
@@ -2436,27 +2447,37 @@ class TgPresence(Star):
         分段回复重组等），这里照最终要发的内容再兜一次底。
         正常情况下这里什么都匹配不到 —— 一旦日志里出现，说明上一步漏了。
         """
-        if not self.conf.get("describe_images", True):
-            return
         result = event.get_result()
         chain = getattr(result, "chain", None)
         if not chain:
             return
 
-        keep, found = [], 0
+        notes_on = bool(self.conf.get("describe_images", True))
+        keep, found, stamps = [], 0, 0
         for comp in chain:
             text = getattr(comp, "text", None)
-            if not isinstance(text, str) or "<img_note" not in text:
+            if not isinstance(text, str) or not text:
                 keep.append(comp)
                 continue
-            found += self._harvest_notes(text)
-            comp.text = IMG_NOTE_RE.sub("", text).strip()
+            out = text
+            if notes_on and "<img_note" in out:
+                found += self._harvest_notes(out)
+                out = IMG_NOTE_RE.sub("", out)
+            if OWN_STAMP_RE.search(out):
+                stamps += 1
+                out = OWN_STAMP_RE.sub("", out)
+            if out == text:
+                keep.append(comp)
+                continue
+            comp.text = out.strip()
             # 整条只有描述标记时剥完是空的，别把空消息发出去
             if comp.text:
                 keep.append(comp)
 
         if found:
             logger.warning(f"[tg_presence] 发送前兜底剥掉 {found} 条图片描述")
+        if stamps:
+            logger.warning(f"[tg_presence] 发送前兜底剥掉 {stamps} 处她自写的时间戳")
         if len(keep) != len(chain):
             result.chain = keep
 
