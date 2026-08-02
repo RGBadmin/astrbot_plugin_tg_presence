@@ -2092,24 +2092,26 @@ class TgPresence(Star):
 
         归类：ok / 无标签 / 段数不齐 / 有问题
 
-        分两级：
-        · 结构校验（总是做）——段数够不够。少一项就是少一个维度的信息，
-          而且这种输出看上去跟正常的毫无区别，不数根本发现不了。
-        · 值校验（仅 tag_strict 开启）——值在不在候选集里。提示词让模型
-          自由用词时这一级会把几乎每张都标成「有问题」，纯噪声，默认关。
+        提示词早期要求固定 44 项、按位置对齐，那时候校验的是「段数够不够」。
+        后来改成自由列举关键词——检索的两路都不看词在第几个位置，固定格子
+        除了增加模型负担没有别的作用，而约束越多遵守率越低（编号那条就是
+        活例子）。所以现在只校验数量下限：关键词太少说明模型没好好列，
+        那一行是检索命中率的主要来源。
 
-        编号在这儿是可选的。检索走的是全文匹配加语义向量，两路都不看
-        标签在第几项，所以序号对检索毫无价值，反而会稀释向量——提示词
-        里已经不再要求它了。但历史数据带编号，带了就顺便校验连续性，
-        那能多抓一种错误（段数正好 44、内容却整体前移一格）。
+        「段数不齐」这个归类名保留着，redo 和历史数据都认它。
 
-        「无标签」是中性的：提示词不要求标签时全库都这样，不该报警。
+        值校验（仅 tag_strict 开启）留给还在用固定候选集的场景，自由用词
+        时会把几乎每张都标成「有问题」，纯噪声，默认关。
 
         只诊断不改数据——非法值往往仍是有意义的词（模型写"项圈"而候选集
         里只有"皮革项圈"），删了反而丢信息，留着还能被 substring 命中。
         """
         strict = bool(self.conf.get("tag_strict", False)) and bool(FIELDS)
-        want = len(FIELDS) if FIELDS else 44
+        want = (
+            len(FIELDS)
+            if strict and FIELDS
+            else max(2, int(self.conf.get("tag_min_words", 12) or 12))
+        )
         # 取分隔符最多的那一行。三点考虑：
         # · 不要求「1.」开头——模型基本不照做，硬卡这条会让校验对新格式全盲
         # · 不取最后一行——结束标记、模型自己补的备注都可能跟在后面
@@ -2121,13 +2123,11 @@ class TgPresence(Star):
         if not line:
             return "无标签", []
 
-        segs = [s.strip() for s in line.split("---")]
-        issues, nums = [], []
+        segs = [s.strip() for s in line.split("---") if s.strip()]
+        issues = []
         for pos, seg in enumerate(segs, 1):
             m = re.match(r"^(\d+)\.(.*)$", seg, re.S)
             i, val = (int(m.group(1)), m.group(2)) if m else (pos, seg)
-            if m:
-                nums.append(i)
             if not strict or not 1 <= i <= len(FIELDS):
                 continue
             name, cand = FIELDS[i - 1]
@@ -2143,12 +2143,15 @@ class TgPresence(Star):
                 else:
                     issues.append(f"{i}.{name}「{one}」不在候选集")
 
-        if len(segs) != want:
-            issues.insert(0, f"只有 {len(segs)} 段，应该是 {want} 段")
-            return "段数不齐", issues
-        # 带编号的顺便查连续性，能多抓「段数够但整体错位」这一种
-        if nums and nums != list(range(1, len(segs) + 1)):
-            issues.insert(0, f"编号不连续：{nums[:5]}…")
+        # 严格模式要求逐项对齐，看总数；自由用词只看够不够多
+        short = len(segs) != want if strict and FIELDS else len(segs) < want
+        if short:
+            issues.insert(
+                0,
+                f"只有 {len(segs)} 段，应该是 {want} 段"
+                if strict and FIELDS
+                else f"只有 {len(segs)} 个关键词，少于下限 {want}",
+            )
             return "段数不齐", issues
         return ("有问题" if issues else "ok"), issues
 
@@ -3945,10 +3948,18 @@ class TgPresence(Star):
             miss = db.execute(
                 "SELECT COUNT(*) c FROM photos WHERE tag_state = '段数不齐'"
             ).fetchone()["c"]
-            if miss:
-                lines.append(f"\n{miss} 张编号不连续，/gallery redo 排队重跑。")
-            lines.append("\n注：检索是拿描述+标签全文做匹配的，值填在第几项不影响，")
-            lines.append("「有问题」不用重跑；「无标签」也正常（提示词没要求标签时如此）。")
+            none_n = db.execute(
+                "SELECT COUNT(*) c FROM photos WHERE tag_state = '无标签'"
+            ).fetchone()["c"]
+            if miss or none_n:
+                lines.append(
+                    f"\n{miss + none_n} 张关键词不合格，/gallery redo 排队重跑。"
+                )
+            lines.append(
+                f"\n注：关键词行是检索命中率的主要来源，少于 "
+                f"{max(2, int(self.conf.get('tag_min_words', 12) or 12))} 个就算不合格。"
+            )
+            lines.append("词在第几个位置不影响检索，「有问题」不用重跑。")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -4005,7 +4016,8 @@ class TgPresence(Star):
             db = self.db()
             n = db.execute(
                 f"UPDATE photos SET descr = NULL, {VEC_NULLS}, tag_state = NULL, "
-                "tag_issues = NULL, fails = 0 WHERE tag_state = '段数不齐'"
+                "tag_issues = NULL, fails = 0 "
+                "WHERE tag_state IN ('段数不齐', '无标签')"
             ).rowcount
             db.commit()
             self._vec_cache.clear()
