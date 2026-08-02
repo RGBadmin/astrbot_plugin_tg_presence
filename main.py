@@ -3901,25 +3901,47 @@ class TgPresence(Star):
             )
 
         provider_id = await self.context.get_current_chat_provider_id(target)
-        resp = await self.context.llm_generate(
-            chat_provider_id=provider_id,
-            system_prompt=system_prompt,
-            contexts=history[-limit:] if isinstance(history, list) else [],
-            prompt=(
-                "【以下是导演提示，只有你能看到，对方完全不知道这段存在】\n"
-                f"{brief}\n\n"
-                + (
-                    instruct
-                    or "现在由你主动给他发一条消息。直接写你要发的原话，"
-                    "用你平时的语气和分段习惯。"
-                )
-                + "\n不要复述或引用这段提示，不要写旁白、解释、心理描写，"
-                "也不要加引号。不要在开头写 [月-日 时:分] 这样的时间戳——"
-                "你在历史里看到的那些是系统加的，不是你写的。"
-            ),
+        ctx = history[-limit:] if isinstance(history, list) else []
+        act = instruct or (
+            "现在由你主动给他发一条消息。直接写你要发的原话，"
+            "用你平时的语气和分段习惯。"
         )
-        text = (getattr(resp, "completion_text", "") or "").strip()
-        # 还是会写的话在这儿剥掉。导演这条路不经过 AstrBot 管线，
+        head = "【以下是导演提示，只有你能看到，对方完全不知道这段存在】\n"
+        tail = (
+            "\n不要复述或引用这段提示，不要写旁白、解释、心理描写，"
+            "也不要加引号。不要在开头写 [月-日 时:分] 这样的时间戳——"
+            "你在历史里看到的那些是系统加的，不是你写的。"
+        )
+
+        async def call(prompt: str) -> str:
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=system_prompt,
+                contexts=ctx,
+                prompt=prompt,
+            )
+            got = (getattr(resp, "completion_text", "") or "").strip()
+            if got:
+                return got
+            # 返空时把现场全记下来。这种失败不抛异常、日志里一片空白，
+            # 不留证据的话只能靠猜
+            logger.warning(
+                f"[tg_presence] 导演生成返回空。provider={provider_id} "
+                f"人格 {len(system_prompt)} 字 · 历史 {len(ctx)} 条 · "
+                f"提示 {len(prompt)} 字 · resp={type(resp).__name__} "
+                f"chain={getattr(resp, 'result_chain', None) is not None} "
+                f"raw={str(getattr(resp, 'raw_completion', ''))[:120]}"
+            )
+            return ""
+
+        text = await call(head + f"{brief}\n\n" + act + tail)
+        if not text:
+            # 那一串"不要写这不要写那"对指令型任务容易适得其反——
+            # 模型把它读成"什么都别写"。去掉再来一次，别让人干等着
+            logger.info("[tg_presence] 去掉否定句式重试一次")
+            text = await call(f"{brief}\n\n{act}")
+
+        # 她还是会写时间戳的话在这儿剥掉。导演这条路不经过 AstrBot 管线，
         # on_llm_response / on_decorating_result 那两道闸都够不着
         if OWN_STAMP_RE.search(text):
             logger.info("[tg_presence] 剥掉她在导演回复里自写的时间戳")
