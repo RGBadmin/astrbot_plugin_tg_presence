@@ -119,11 +119,7 @@ RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 509, 520, 521,
 # 这类必须立刻中止整批，否则跑一整夜醒来发现一张没成
 FATAL_STATUS = frozenset({400, 401, 403, 404, 405, 413, 414, 422})
 
-VISION_BACKOFF_BASE = 4      # 退避基数秒，第 n 次退 BASE * 2^(n-1)
-VISION_BACKOFF_MAX = 90      # 单次退避上限，别让一张图睡太久
-TRIP_STREAK = 8              # 连续失败这么多次就熔断，全局歇一会儿
-TRIP_COOL = 45               # 首次熔断冷却秒数，连续熔断翻倍
-TRIP_COOL_MAX = 600
+TRIP_STREAK = 8              # 连续失败这么多次就熔断，全局歇一轮
 
 # Gemini 不传这个的话，成人向图片会被安全策略拦掉——而且是 HTTP 200 空回，
 # 从状态码完全看不出来。flash 尤其严，几乎全军覆没
@@ -667,16 +663,48 @@ class TgPresence(Star):
                             ) as r2:
                                 body = await r2.text()
                                 if r2.status != 200:
-                                    raise VisionError(f"HTTP {r2.status} {body[:200]}")
+                                    raise VisionError(
+                                        f"HTTP {r2.status} {body[:200]}",
+                                        retryable=r2.status in RETRY_STATUS,
+                                        fatal=r2.status in FATAL_STATUS,
+                                    )
                         else:
-                            raise VisionError(f"HTTP {r.status} {body[:200]}")
+                            raise VisionError(
+                                f"HTTP {r.status} {body[:200]}",
+                                retryable=r.status in RETRY_STATUS,
+                                fatal=r.status in FATAL_STATUS,
+                            )
                     data = json.loads(body)
             items = sorted(data["data"], key=lambda x: x.get("index", 0))
             return [it["embedding"] for it in items]
         except VisionError:
             raise
+        except asyncio.TimeoutError:
+            raise VisionError(f"超时（{VISION_TIMEOUT} 秒）", retryable=True) from None
         except Exception as e:
-            raise VisionError(f"{type(e).__name__}: {e}") from e
+            raise VisionError(f"{type(e).__name__}: {e}", retryable=True) from e
+
+    async def _embed_retry(self, texts: list[str]) -> list[list[float]] | None:
+        """带退避的转向量。
+
+        向量接口的限流比视觉接口容易撞得多：一张图要转四段，请求数直接
+        翻四倍，而且这类接口往往按文本条数而不是按请求数计配额。
+        没有重试的话撞一次 429 就整批丢掉，跑到一半全废。
+
+        等待固定六十秒——限流配额按分钟计窗口，等满一分钟就跨过去了，
+        指数翻倍只是白等。
+        """
+        tries = max(1, int(self.conf.get("embed_retries", 5) or 5))
+        last: VisionError | None = None
+        for attempt in range(1, tries + 1):
+            try:
+                return await self._embed(texts)
+            except VisionError as e:
+                if e.fatal or not e.retryable or attempt >= tries:
+                    raise
+                last = e
+                await asyncio.sleep(self._retry_wait("embed_retry_wait", 60))
+        raise last  # 循环只在重试耗尽时跳出
 
     def _embed_text(self, descr: str) -> str:
         """裁出送去转向量的文本。超长时必须保住结尾的标签行。
@@ -2002,19 +2030,19 @@ class TgPresence(Star):
                 self._note_upstream_fail()
                 if attempt >= tries:
                     break
-                await asyncio.sleep(self._backoff(attempt))
+                await asyncio.sleep(self._retry_wait("vision_retry_wait", 10))
 
         raise last  # 循环只在重试耗尽时跳出，last 必定有值
 
-    @staticmethod
-    def _backoff(attempt: int) -> float:
-        """指数退避，带抖动。
+    def _retry_wait(self, key: str, default: int) -> float:
+        """重试前等多久。固定值，不做指数退避。
 
-        抖动不是锦上添花——上一批 41 张是在 0.6 秒内一起失败的，
-        没有抖动它们就会一起醒来，拿同样一波并发再把上游撞一次。
+        指数退避是给「不知道上游什么时候好」准备的。这儿两条链路的
+        恢复窗口都是已知的：视觉侧有一组账号轮换，等十秒足够换一个；
+        向量侧的限流按分钟计窗口，等六十秒正好跨过去。
+        既然知道该等多久，翻倍只会白等。
         """
-        base = min(VISION_BACKOFF_BASE * (2 ** (attempt - 1)), VISION_BACKOFF_MAX)
-        return base * (0.6 + random.random() * 0.8)
+        return max(0.0, float(self.conf.get(key, default) or default))
 
     async def _wait_cooldown(self) -> None:
         """熔断期内原地等着。分段睡，好让 stop 能及时打断。"""
@@ -2023,16 +2051,13 @@ class TgPresence(Star):
 
     def _note_upstream_ok(self) -> None:
         self._fail_streak = 0
-        if self._trip_level:
-            self._trip_level -= 1  # 通了就往回收一级，别一直记仇
 
     def _note_upstream_fail(self) -> None:
-        """连续失败到一定程度就全局歇一会儿，别对着挂掉的上游猛捶。"""
+        """连续失败到一定程度就全局歇一轮，别对着挂掉的上游猛捶。"""
         self._fail_streak += 1
         if self._fail_streak < TRIP_STREAK or time.time() < self._cool_until:
             return
-        self._trip_level = min(self._trip_level + 1, 5)
-        cool = min(TRIP_COOL * (2 ** (self._trip_level - 1)), TRIP_COOL_MAX)
+        cool = self._retry_wait("vision_retry_wait", 10) * 3
         self._cool_until = time.time() + cool
         self._fail_streak = 0
         logger.warning(
@@ -3840,19 +3865,26 @@ class TgPresence(Star):
                 f"分段后共 {len(jobs)} 条文本（全文 {len(rows)} + 分段 {seg_n}），每批 {batch}。"
                 + ("\n⚠ 一段都没切出来，检查描述里的层标题" if not seg_n else "")
             )
-            ok = fail = 0
+            ok = fail = dry = 0
+            err = ""
             for i in range(0, len(jobs), batch):
                 chunk = jobs[i : i + batch]
                 try:
-                    vecs = await self._embed([t for _, _, t in chunk])
+                    vecs = await self._embed_retry([t for _, _, t in chunk])
                 except VisionError as e:
                     fail += len(chunk)
+                    err = err or str(e)
                     logger.warning(f"[tg_presence] 转向量失败：{e}")
-                    if fail >= batch * 3:  # 连着几批都挂，别再空转
+                    if e.fatal:
+                        break
+                    dry += 1
+                    if dry >= 3:  # 连着三批都挂，别再空转
                         break
                     continue
+                dry = 0
                 if not vecs or len(vecs) != len(chunk):
                     fail += len(chunk)
+                    err = err or "接口返回的条数和送进去的对不上"
                     continue
                 # 同一批里可能混着不同的列，按列分组写回
                 by_col: dict[str, list] = {}
@@ -3868,11 +3900,23 @@ class TgPresence(Star):
             left = db.execute(
                 "SELECT COUNT(*) c FROM photos WHERE descr IS NOT NULL AND vec IS NULL"
             ).fetchone()["c"]
-            yield event.plain_result(
+            msg = [
                 f"完成 {ok} 条文本" + (f"，失败 {fail} 条" if fail else "")
                 + f"。还剩 {left} 张图"
                 + ("，再发一次 /gallery embed 继续。" if left else "，全部转完。")
-            )
+            ]
+            if err:
+                msg.append(f"\n最后的错误：{err[:160]}")
+                if "429" in err:
+                    msg.append(
+                        "撞限流了。一张图要转四段，请求数是原来的四倍，"
+                        "而这类接口常按文本条数算配额。\n"
+                        "等一两分钟再发一次就行，进度不会丢；"
+                        "老撞就把「向量批大小」调小到 8~16。"
+                    )
+                elif "401" in err or "403" in err or "404" in err:
+                    msg.append("这是配置问题，重试没用。检查向量接口的地址、密钥、模型名。")
+            yield event.plain_result("\n".join(msg))
             return
 
         if action == "audit":
