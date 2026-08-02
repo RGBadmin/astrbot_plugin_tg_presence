@@ -185,6 +185,52 @@ CREATE INDEX IF NOT EXISTS idx_sent    ON photos(last_sent);
 """
 ANTHROPIC_VERSION = "2023-06-01"
 
+# 导演链路的提示词。全部可以在配置里覆盖，这儿是留空时的默认值。
+# 「不要调用任何工具」那句是必须的：她手上有 update_signature、send_photo
+# 这些工具，一看到「改签名」「发照片」就会去调，而这条路没给她工具，
+# tool_call 无处可去，回来就是一片空白
+DEFAULT_DIRECTOR_HEAD = "【以下是导演提示，只有你能看到，对方完全不知道这段存在】"
+DEFAULT_DIRECTOR_ACT = (
+    "现在由你主动给他发一条消息。直接写你要发的原话，用你平时的语气和分段习惯。"
+)
+DEFAULT_DIRECTOR_TAIL = (
+    "这一轮你只负责把内容想出来、用纯文本写下来。"
+    "不要调用任何工具，不要执行任何操作——写完自然有人去落实。\n"
+    "不要复述或引用这段提示，不要写旁白、解释、心理描写，也不要加引号。"
+    "不要在开头写 [月-日 时:分] 这样的时间戳——"
+    "你在历史里看到的那些是系统加的，不是你写的。"
+)
+DEFAULT_DIRECTOR_RETRY = (
+    "注意：这一轮禁止调用工具、禁止执行任何操作。"
+    "你要做的只有一件事——把内容用纯文本写出来，写完就停。"
+    "哪怕你觉得应该去执行，也先写出来给我看。"
+)
+DEFAULT_IMP_SIGNATURE = (
+    "你在想换一句新的个性签名。签名是别人点开你资料时看到的那一行，"
+    "所有人都看得见。现在只是想，还没到动手改的时候。\n\n"
+    "把你想好的那句签名写出来就行，一行，不超过 {max} 个字，只写签名本身。"
+)
+DEFAULT_IMP_MOMENT = (
+    "你在想往自己的频道发一条动态。那是发给所有人看的，不是私聊。"
+    "可以是此刻的心情、刚做完的事、看到的东西，也可以没有由头。"
+    "现在只是想内容，还没到发出去的时候。\n\n"
+    "把动态正文写出来就行，一两句话，符合你平时发动态的语气。"
+)
+DEFAULT_IMP_AVATAR = (
+    "你在想换个头像，正在挑用哪一类的照片。可选的有：{cats}。"
+    "现在只是挑，还没到换的时候。\n\n"
+    "回一个类别名就行，从上面那些里选，不要解释，不要加标点。"
+)
+DEFAULT_IMP_PHOTO = (
+    "你在想给他发一张自己的照片，正在回忆要挑什么样的——"
+    "什么场景、穿什么、什么姿态、露到什么程度。"
+    "现在只是想，还没到发的时候，也不用去翻相册。\n\n"
+    "第一行写这张照片的关键词，几个短语用逗号隔开，"
+    "例如：酒店,黑丝,细高跟,M腿。\n"
+    "第二行写你想配的一句话，不想配就留空。\n"
+    "只输出这两行。"
+)
+
 # 分段向量。整段描述只转一个向量的话，三千多字里九成是身体细节，
 # 环境那两百字会被彻底稀释——「黑色反光桌面，大片水渍」这种信息在
 # 全文向量里几乎看不见，搜「桌上喷水」全凭运气。按层切开各转一个，
@@ -3375,10 +3421,7 @@ class TgPresence(Star):
         if not text:
             yield event.plain_result("让她自己想…")
             text, err = await self._improvise(
-                "你在想往自己的频道发一条动态。那是发给所有人看的，不是私聊。"
-                "可以是此刻的心情、刚做完的事、看到的东西，也可以没有由头。"
-                "现在只是想内容，还没到发出去的时候。",
-                "把动态正文写出来就行，一两句话，符合你平时发动态的语气。",
+                self._prompt_of("improvise_moment", DEFAULT_IMP_MOMENT)
             )
             if not text:
                 yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/moment 正文")
@@ -3460,10 +3503,9 @@ class TgPresence(Star):
             if cats:
                 yield event.plain_result("让她自己挑…")
                 pick, err = await self._improvise(
-                    "你在想换个头像，正在挑用哪一类的照片。可选的有："
-                    + "、".join(cats)
-                    + "。现在只是挑，还没到换的时候。",
-                    "回一个类别名就行，从上面那些里选，不要解释，不要加标点。",
+                    self._prompt_of(
+                        "improvise_avatar", DEFAULT_IMP_AVATAR, cats="、".join(cats)
+                    )
                 )
                 # 她可能连着说一句话，只认里面出现的那个类别名
                 hit = next((c for c in cats if c and c in (pick or "")), "")
@@ -3556,10 +3598,9 @@ class TgPresence(Star):
         if not text:
             yield event.plain_result("让她自己想…")
             text, err = await self._improvise(
-                "你在想换一句新的个性签名。签名是别人点开你资料时看到的那一行，"
-                "所有人都看得见。现在只是想，还没到动手改的时候。",
-                f"把你想好的那句签名写出来就行，一行，"
-                f"不超过 {SIGNATURE_MAX // 2} 个字，只写签名本身。",
+                self._prompt_of(
+                    "improvise_signature", DEFAULT_IMP_SIGNATURE, max=SIGNATURE_MAX // 2
+                )
             )
             if not text:
                 yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/signature 新签名")
@@ -3821,7 +3862,7 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 取人格失败，这次不带人格生成：{e}")
             return ""
 
-    async def _improvise(self, brief: str, instruct: str) -> tuple[str, str]:
+    async def _improvise(self, prompt: str) -> tuple[str, str]:
         """让她自己想内容。返回 (内容, 没成的原因)。
 
         指令后面留空时走这条路：与其让人再想一遍措辞，不如让她自己拿主意
@@ -3835,7 +3876,8 @@ class TgPresence(Star):
             return "", "还没绑定目标会话，取不到她的人格和历史。先 /umo 看看有哪些，再 /link 绑一个"
         try:
             now = datetime.now(self._tz()).strftime("%m-%d %H:%M")
-            text = await self._director_generate(f"现在是 {now}。{brief}", instruct)
+            # instruct 传空串：要求已经写在 prompt 里了，别再叠一句"发条消息给他"
+            text = await self._director_generate(f"现在是 {now}。{prompt}", "")
         except Exception as e:
             logger.error(f"[tg_presence] 即兴生成失败：{e}", exc_info=True)
             return "", f"{type(e).__name__}: {e}"
@@ -3853,13 +3895,7 @@ class TgPresence(Star):
         if not self.gallery_stat()["indexed"]:
             return "", "相册还没建索引，挑不了。先 /gallery index auto。"
         raw, err = await self._improvise(
-            "你在想给他发一张自己的照片，正在回忆要挑什么样的——"
-            "什么场景、穿什么、什么姿态、露到什么程度。"
-            "现在只是想，还没到发的时候，也不用去翻相册。",
-            "第一行写这张照片的关键词，几个短语用逗号隔开，"
-            "例如：酒店,黑丝,细高跟,M腿。\n"
-            "第二行写你想配的一句话，不想配就留空。\n"
-            "只输出这两行。",
+            self._prompt_of("improvise_photo", DEFAULT_IMP_PHOTO)
         )
         if not raw:
             return "", f"没想出来：{err}"
@@ -3877,12 +3913,31 @@ class TgPresence(Star):
         best = self._rerank(rows, "fresh")[0]
         return f"g{best['id']}", caption
 
-    async def _director_generate(self, brief: str, instruct: str = "") -> str:
+    def _prompt_of(self, key: str, default: str, **fmt) -> str:
+        """取一段可配置的提示词，填好占位符。
+
+        留空是"用默认"而不是"不要"——AstrBot 的配置里没配和填空串是
+        同一个值，分不开。真想去掉某一段就填「无」，那是显式的关掉。
+        """
+        tpl = (self.conf.get(key) or "").strip()
+        if tpl in ("无", "-", "none", "None", "NONE"):
+            return ""
+        tpl = tpl or default
+        if not fmt:
+            return tpl
+        try:
+            return tpl.format(**fmt)
+        except (KeyError, IndexError, ValueError) as e:
+            # 占位符写错不该让整条指令瘫掉，原样用还能跑
+            logger.warning(f"[tg_presence] 提示词「{key}」的占位符有问题（{e}），按原文用")
+            return tpl
+
+    async def _director_generate(self, brief: str, instruct: str | None = None) -> str:
         """按导演提示，用角色的人格和历史生成一段文本。抛异常给调用方。
 
-        instruct 决定生成什么：留空是"发一条消息给他"，也可以换成
-        "写一条动态""想一句签名"。人格和历史是共用的——不管让她做什么，
-        都得是她来做。
+        instruct 决定生成什么：None 用配置里那句默认的（/act 走这条），
+        空串表示 brief 里已经把要求写全了（四条留空指令走这条）。
+        人格和历史是共用的——不管让她做什么，都得是她来做。
         """
         target = (self.state.get("director_target") or "").strip()
         cm = self.context.conversation_manager
@@ -3906,22 +3961,13 @@ class TgPresence(Star):
 
         provider_id = await self.context.get_current_chat_provider_id(target)
         ctx = history[-limit:] if isinstance(history, list) else []
-        act = instruct or (
-            "现在由你主动给他发一条消息。直接写你要发的原话，"
-            "用你平时的语气和分段习惯。"
-        )
-        head = "【以下是导演提示，只有你能看到，对方完全不知道这段存在】\n"
-        # 「不要调工具」这句是必须的。她手上有 update_signature、send_photo
-        # 这些工具，一看到"改签名""发照片"就会去调，而这条路没给她工具，
-        # tool_call 无处可去，回来就是一片空白——thinking 里全是
-        # "I need to use the update_signature tool"，正文一个字没有
-        tail = (
-            "\n这一轮你只负责把内容想出来、用纯文本写下来。"
-            "不要调用任何工具，不要执行任何操作——写完自然有人去落实。\n"
-            "不要复述或引用这段提示，不要写旁白、解释、心理描写，"
-            "也不要加引号。不要在开头写 [月-日 时:分] 这样的时间戳——"
-            "你在历史里看到的那些是系统加的，不是你写的。"
-        )
+        # instruct 传 None 表示"用默认那句"（/act 走这条），
+        # 传空串表示 brief 里已经把要求写全了（四条留空指令走这条）
+        act = self._prompt_of("director_act", DEFAULT_DIRECTOR_ACT) if instruct is None else instruct
+        head = self._prompt_of("director_head", DEFAULT_DIRECTOR_HEAD)
+        head = head + "\n" if head else ""
+        tail = self._prompt_of("director_tail", DEFAULT_DIRECTOR_TAIL)
+        tail = "\n" + tail if tail else ""
 
         async def call(prompt: str) -> str:
             resp = await self.context.llm_generate(
@@ -3962,16 +4008,13 @@ class TgPresence(Star):
                     logger.warning(f"[tg_presence]   {k} = {str(v)[:600]}")
             return ""
 
-        text = await call(head + f"{brief}\n\n" + act + tail)
+        body = f"{brief}\n\n{act}" if act else brief
+        text = await call(head + body + tail)
         if not text:
             # 还是空，多半还是奔着调工具去了。把话说死再来一次
             logger.info("[tg_presence] 返空，改用更硬的措辞重试一次")
-            text = await call(
-                f"{brief}\n\n{act}\n\n"
-                "注意：这一轮禁止调用工具、禁止执行任何操作。"
-                "你要做的只有一件事——把内容用纯文本写出来，写完就停。"
-                "哪怕你觉得应该去执行，也先写出来给我看。"
-            )
+            retry = self._prompt_of("director_retry", DEFAULT_DIRECTOR_RETRY)
+            text = await call(f"{body}\n\n{retry}" if retry else body)
 
         # 她还是会写时间戳的话在这儿剥掉。导演这条路不经过 AstrBot 管线，
         # on_llm_response / on_decorating_result 那两道闸都够不着
