@@ -3604,6 +3604,53 @@ class TgPresence(Star):
             )
             return
 
+        if action == "show":
+            db = self.db()
+            key = rest.strip().lstrip("gG")
+            cols = (
+                "id, path, folder, descr, tag_state, tag_issues, sent, last_sent, "
+                "file_time, vec IS NOT NULL AS has_vec"
+            )
+            if key.isdigit():
+                row = db.execute(
+                    f"SELECT {cols} FROM photos WHERE id = ?", (int(key),)
+                ).fetchone()
+            else:
+                # 随机抽，用来肉眼验描述质量——同一条看第二遍没什么意义
+                row = db.execute(
+                    f"SELECT {cols} FROM photos WHERE descr IS NOT NULL "
+                    "ORDER BY RANDOM() LIMIT 1"
+                ).fetchone()
+            if not row:
+                yield event.plain_result(
+                    "没这张图。" if key else "库里还没有已索引的图。"
+                )
+                return
+            if not row["descr"]:
+                yield event.plain_result(f"g{row['id']} 还没索引。")
+                return
+
+            descr = row["descr"]
+            when = (
+                datetime.fromtimestamp(row["file_time"], self._tz()).strftime("%Y-%m-%d")
+                if row["file_time"]
+                else "未知"
+            )
+            head = (
+                f"g{row['id']} · [{row['folder'] or '根目录'}] {Path(row['path']).name}\n"
+                f"{len(descr)} 字 · 标签 {row['tag_state'] or '未校验'} · "
+                f"向量 {'有' if row['has_vec'] else '无'} · "
+                f"文件日期 {when} · 发过 {row['sent']} 次\n"
+                + (f"标签问题：{row['tag_issues']}\n" if row["tag_issues"] else "")
+                + "─" * 18
+                + "\n"
+            )
+            # Telegram 单条上限 4096，描述本身就三四千字，必须分条发
+            text = head + descr
+            for i in range(0, len(text), 3500):
+                yield event.plain_result(text[i : i + 3500])
+            return
+
         if action == "search":
             rows = self.gallery_search(rest, limit=10)
             if not rows:
@@ -3694,10 +3741,11 @@ class TgPresence(Star):
             return
 
         yield event.plain_result(
-            "用法：/gallery [scan|index N|index auto|index stop|search 词|embed N|"
-            "audit|clean|redo|retry]\n"
-            "  index auto 后台跑到全部完成，embed 把描述转成语义向量，\n"
-            "  clean 揪出拒答和思维链，audit 看标签质量，redo 重跑结构坏的"
+            "用法：/gallery [scan|index N|index auto|index stop|search 词|show [gN]|"
+            "embed N|audit|clean|redo|retry]\n"
+            "  index auto 后台跑到全部完成，show 看某张的完整描述（不带参数随机抽），\n"
+            "  embed 把描述转成语义向量，clean 揪出拒答和思维链，\n"
+            "  audit 看标签质量，redo 重跑结构坏的"
         )
 
     @filter.command("vision")
