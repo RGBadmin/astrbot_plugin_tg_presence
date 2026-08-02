@@ -2903,6 +2903,19 @@ class TgPresence(Star):
             # 「刚那张真好看」她接不上，过两轮还可能把同一张再发一遍
             if pid := self._remember_sent(path, row["descr"] or "", f"g{row['id']}"):
                 note = f" 在你们的对话里它是 #{pid}"
+
+        # 记进她自己的历史，否则下一轮她不知道刚发过什么。
+        # 用摘要不用原文：原文开头是"第一层：环境与背景"那套层标题，
+        # 对她回忆自己发了什么毫无帮助，还占地方
+        pid = pid if row is not None else raw.lstrip("#")
+        raw_descr = (row["descr"] if row is not None else self.vision.get(pid, "")) or ""
+        brief = self._photo_brief(raw_descr) if raw_descr else ""
+        await self._log_action(
+            event,
+            f"我给他发了张照片。[图片 #{pid}]"
+            + (f" 画面是：{brief}" if brief else "")
+            + (f"\n我配的话：{caption.strip()}" if caption.strip() else ""),
+        )
         logger.info(f"[tg_presence] 已发送照片 {raw} -> {path.name}")
         return f"照片发出去了（{raw}）。{note}"
 
@@ -2935,8 +2948,13 @@ class TgPresence(Star):
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if not photo_id:
-            yield event.plain_result("用法：/photo g123 [附言]，编号从 /gallery search 查。")
-            return
+            yield event.plain_result("让她自己挑…")
+            picked, said = await self._improvise_photo()
+            if not picked:
+                yield event.plain_result(said or "她没挑出来。直接指定：/photo g123 [附言]")
+                return
+            photo_id, caption = picked, (caption or said)
+            yield event.plain_result(f"她挑了 {picked}" + (f"，配文：{said}" if said else ""))
         yield event.plain_result(
             await self._do_send_photo(event, photo_id, caption)
         )
@@ -3122,12 +3140,38 @@ class TgPresence(Star):
         """把一条动态渲染成时间线里的一个事件。"""
         stamp = datetime.fromtimestamp(moment["ts"], self._tz()).strftime(STAMP_FMT)
         bits = [f"{stamp}【我发了条动态】{moment['text']}"]
-        n = len(self._moment_photos(moment))
-        if n:
-            bits.append(f"配图 {n} 张")
+        photos = self._moment_photos(moment)
+        if photos:
+            # 只报"配图 N 张"的话，她知道发过图却不知道发的是什么，
+            # 对方提起"你那张桌上的照片"就接不上。把描述一并带出来
+            desc = [d for d in (self._photo_descr(p) for p in photos) if d]
+            bits.append(
+                f"配图 {len(photos)} 张"
+                + ("：" + "；".join(d[:60] for d in desc[:3]) if desc else "")
+            )
         if moment.get("quiet"):
             bits.append("当时没跟他提")
         return {"role": "assistant", "content": " · ".join(bits), "_no_save": True}
+
+    def _photo_descr(self, path: str) -> str:
+        """按文件路径找它的画面描述。图库里索引过的直接有，没有就返回空。"""
+        if not path:
+            return ""
+        try:
+            p = Path(path)
+            key = str(p)
+            if root := self._gallery_root():
+                try:
+                    key = p.resolve().relative_to(root.resolve()).as_posix()
+                except (ValueError, OSError):
+                    pass
+            row = self.db().execute(
+                "SELECT descr FROM photos WHERE path = ? OR path = ?", (key, str(p))
+            ).fetchone()
+            return self._photo_brief(row["descr"]) if row and row["descr"] else ""
+        except sqlite3.Error as e:
+            logger.debug(f"[tg_presence] 查配图描述失败 {path}: {e}")
+            return ""
 
     def _context_time(self, msg: dict) -> float | None:
         """解析一条历史消息的时间。
@@ -3329,8 +3373,17 @@ class TgPresence(Star):
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if not text:
-            yield event.plain_result("用法：/moment 动态正文")
-            return
+            yield event.plain_result("让她自己想…")
+            text = await self._improvise(
+                "你想在自己的频道发一条动态。这条动态是发给所有人看的，"
+                "不是私聊。可以是此刻的心情、刚做完的事、看到的东西，"
+                "也可以没有由头。",
+                "直接写动态正文，一两句话就够，符合你平时发动态的语气。",
+            )
+            if not text:
+                yield event.plain_result("她没想出来（模型返回空）。直接给内容：/moment 正文")
+                return
+            yield event.plain_result(f"她想发：\n{text}")
         yield event.plain_result(await self._do_post(event, text, "", enforce_limits=False))
 
     # --------------------------------------------------------------- 换头像
@@ -3378,6 +3431,12 @@ class TgPresence(Star):
         if enforce_limits:
             self._mark_done("avatar")
             self._save_state()
+        await self._log_action(
+            event,
+            "我换了头像"
+            + (f"，从「{category}」里挑的" if category else "")
+            + f"（{pic.name}）。头像换了没有通知，他不点开我资料是看不到的。",
+        )
         return f"头像换好了，用的是 {pic.name}。"
 
     @filter.llm_tool(name="change_avatar")
@@ -3396,6 +3455,21 @@ class TgPresence(Star):
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
+        if not category:
+            cats = self._list_categories(self.conf.get("avatar_dir") or "")
+            if cats:
+                yield event.plain_result("让她自己挑…")
+                pick = await self._improvise(
+                    "你要换个头像。可选的类别有：" + "、".join(cats) + "。",
+                    "只回复一个类别名，从上面那些里挑，不要解释，不要加标点。",
+                )
+                # 她可能连着说一句话，只认里面出现的那个类别名
+                hit = next((c for c in cats if c and c in (pick or "")), "")
+                if hit:
+                    category = hit
+                    yield event.plain_result(f"她挑了：{hit}")
+                else:
+                    yield event.plain_result(f"她没挑出来（回的是「{pick[:20]}」），随机来一张")
         yield event.plain_result(
             await self._do_avatar(event, category, enforce_limits=False)
         )
@@ -3444,6 +3518,11 @@ class TgPresence(Star):
             self._mark_done("signature")
             self._save_state()
 
+        await self._log_action(
+            event,
+            f"我把个性签名改成了：{text.strip()}"
+            + ("（没打算跟他提）" if quiet else ""),
+        )
         if quiet:
             return (
                 "签名换好了。改签名本来就没有通知，他不点开你资料页是看不到的——"
@@ -3471,8 +3550,16 @@ class TgPresence(Star):
             yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
             return
         if not text:
-            yield event.plain_result("用法：/signature 新的签名内容")
-            return
+            yield event.plain_result("让她自己想…")
+            text = await self._improvise(
+                "你要改一下自己的个性签名。签名是别人点开你资料时看到的那一行，"
+                "所有人都看得见。",
+                f"直接写签名内容，一行，不超过 {SIGNATURE_MAX // 2} 个字。只写签名本身。",
+            )
+            if not text:
+                yield event.plain_result("她没想出来（模型返回空）。直接给内容：/signature 新签名")
+                return
+            yield event.plain_result(f"她想改成：\n{text}")
         yield event.plain_result(
             await self._do_signature(event, text, enforce_limits=False)
         )
@@ -3587,6 +3674,24 @@ class TgPresence(Star):
                 "重新绑：/link 角色机器人名称:FriendMessage:会话ID"
             )
         return None
+
+    async def _log_action(self, event, text: str) -> None:
+        """把她刚做的事记进她自己的对话历史。
+
+        发照片、换头像、改签名这些动作，做完之后在她那边不留任何痕迹——
+        下一轮她既不知道自己发过什么，也不知道头像换成了哪张，
+        你提起时她只能装。从控制台执行时尤其明显：连工具回执都没有。
+
+        动态不走这儿：它有 inject_moments 按时间线注回上下文，
+        再写一条历史就成了同一件事说两遍。
+        """
+        umo = (getattr(event, "unified_msg_origin", "") or "").strip()
+        if not umo or self._umo_platform(umo) == "console":
+            return
+        try:
+            await self._append_assistant(umo, text)
+        except Exception as e:
+            logger.warning(f"[tg_presence] 记录动作失败：{e}")
 
     async def _append_assistant(self, umo: str, text: str) -> bool:
         """把一条角色消息写进目标会话的对话历史。
@@ -3711,8 +3816,59 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 取人格失败，这次不带人格生成：{e}")
             return ""
 
-    async def _director_generate(self, brief: str) -> str:
-        """按导演提示，用角色的人格和历史生成一条主动消息。抛异常给调用方。"""
+    async def _improvise(self, brief: str, instruct: str) -> str:
+        """让她自己想内容。生成失败只记日志、返回空，由调用方决定怎么退。
+
+        指令后面留空时走这条路：与其让人再想一遍措辞，不如让她自己拿主意
+        ——反正内容本来就该是她的。
+        """
+        try:
+            now = datetime.now(self._tz()).strftime("%m-%d %H:%M")
+            return await self._director_generate(f"现在是 {now}。{brief}", instruct)
+        except Exception as e:
+            logger.error(f"[tg_presence] 即兴生成失败：{e}")
+            return ""
+
+    async def _improvise_photo(self) -> tuple[str, str]:
+        """让她自己从相册里挑一张，顺带写句配文。返回 (gN, 配文)。
+
+        分两步：先让她说想发什么样的（几个短语），拿这些词去检索，
+        取排最前的那张。不直接把候选列表塞给她——那要先检索一遍才有
+        候选，而检索本身就需要她先说出想要什么。
+        """
+        if not self.gallery_stat()["indexed"]:
+            return "", "相册还没建索引，挑不了。先 /gallery index auto。"
+        raw = await self._improvise(
+            "你想给他发一张自己的照片。先想清楚要发什么样的——"
+            "什么场景、穿什么、什么姿态、露到什么程度。",
+            "第一行写检索用的关键词，几个短语用逗号隔开，"
+            "例如：酒店,黑丝,细高跟,M腿。\n"
+            "第二行写你要配的一句话，不想配就留空。\n"
+            "只输出这两行。",
+        )
+        if not raw:
+            return "", "她没想出来（模型返回空）。"
+        parts = [x.strip() for x in raw.splitlines() if x.strip()]
+        words = parts[0].replace("，", ",").replace(",", " ") if parts else ""
+        caption = parts[1] if len(parts) > 1 else ""
+        if not words:
+            return "", "她没说清想发什么样的。"
+
+        pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
+        rows = await self._recall(words, "", "", pool)
+        if not rows:
+            return "", f"她想找「{parts[0][:30]}」，但库里没有对得上的。"
+        # 默认偏好没发过的，免得老发同一张
+        best = self._rerank(rows, "fresh")[0]
+        return f"g{best['id']}", caption
+
+    async def _director_generate(self, brief: str, instruct: str = "") -> str:
+        """按导演提示，用角色的人格和历史生成一段文本。抛异常给调用方。
+
+        instruct 决定生成什么：留空是"发一条消息给他"，也可以换成
+        "写一条动态""想一句签名"。人格和历史是共用的——不管让她做什么，
+        都得是她来做。
+        """
         target = (self.state.get("director_target") or "").strip()
         cm = self.context.conversation_manager
         cid = await cm.get_curr_conversation_id(target)
@@ -3741,10 +3897,13 @@ class TgPresence(Star):
             prompt=(
                 "【以下是导演提示，只有你能看到，对方完全不知道这段存在】\n"
                 f"{brief}\n\n"
-                "现在由你主动给他发一条消息。直接写你要发的原话，"
-                "用你平时的语气和分段习惯。不要复述或引用这段提示，"
-                "不要写旁白、解释、心理描写，也不要加引号。"
-                "也不要在开头写 [月-日 时:分] 这样的时间戳——"
+                + (
+                    instruct
+                    or "现在由你主动给他发一条消息。直接写你要发的原话，"
+                    "用你平时的语气和分段习惯。"
+                )
+                + "\n不要复述或引用这段提示，不要写旁白、解释、心理描写，"
+                "也不要加引号。不要在开头写 [月-日 时:分] 这样的时间戳——"
                 "你在历史里看到的那些是系统加的，不是你写的。"
             ),
         )
