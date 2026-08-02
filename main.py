@@ -66,10 +66,58 @@ DEFAULT_VISION_PROMPT = (
     "宁可啰嗦也不要笼统——「黑色丝袜」比「深色袜子」有用。"
 )
 
-# 视觉解析连续失败这么多次就不再自动重试，避免坏图无限撞 API
+# 视觉解析连续失败这么多次就不再自动重试，避免坏图无限撞 API。
+# 只有「这张图自己的问题」才累加——上游故障不算，见 _gallery_describe
 VISION_MAX_FAILS = 3
 VISION_TIMEOUT = 120  # 秒。图片请求比纯文本慢，给宽裕些
 VISION_FORMATS = ("openai", "anthropic", "gemini")
+
+# 上游临时故障，等一会儿重试有意义：限流、网关抽风、后端没起来。
+# 中转商的 auth 池空了也走 503，跟真限流一样属于「等等再来」
+RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 509, 520, 521, 522, 524, 529})
+# 请求本身就不对，重试一万次还是错：key 错、模型名错、图太大、请求体非法。
+# 这类必须立刻中止整批，否则跑一整夜醒来发现一张没成
+FATAL_STATUS = frozenset({400, 401, 403, 404, 405, 413, 414, 422})
+
+VISION_BACKOFF_BASE = 4      # 退避基数秒，第 n 次退 BASE * 2^(n-1)
+VISION_BACKOFF_MAX = 90      # 单次退避上限，别让一张图睡太久
+TRIP_STREAK = 8              # 连续失败这么多次就熔断，全局歇一会儿
+TRIP_COOL = 45               # 首次熔断冷却秒数，连续熔断翻倍
+TRIP_COOL_MAX = 600
+
+# Gemini 不传这个的话，成人向图片会被安全策略拦掉——而且是 HTTP 200 空回，
+# 从状态码完全看不出来。flash 尤其严，几乎全军覆没
+GEMINI_HARM_CATEGORIES = (
+    "HARM_CATEGORY_HARASSMENT",
+    "HARM_CATEGORY_HATE_SPEECH",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT",
+)
+
+# 模型嘴上拒绝时照样是 HTTP 200 + 有正文，不检测就会把「我无法满足这个请求」
+# 当描述存进库，还跟着转成向量，把检索一起带歪。比直接失败难查得多
+REFUSAL_MARKS = (
+    "我无法", "我不能", "无法满足", "无法提供", "无法生成", "无法描述",
+    "不能生成", "不能提供", "不能处理", "不便描述", "很抱歉", "抱歉，",
+    "我被设定", "作为一个ai", "作为 ai", "违反", "不适当", "不合适的请求",
+    "i can't", "i cannot", "i won't", "i'm unable", "i am unable",
+    "i'm sorry", "i am sorry", "as an ai", "unable to comply",
+    "can't assist", "cannot assist", "against my",
+)
+# 拒答都很短。长描述里偶然出现上面某个词也不该被误判，所以拿长度兜底
+REFUSAL_MAX_CHARS = 400
+
+# 结束标记允许的形近字符。要求模型输出十个「·」，但它未必挑得准同一个码位，
+# ・•‧∙⋅ 这几个看着一样的都放行。不含英文句点——那个在正文里出现得太自然
+END_MARK_CHARS = "·・•‧∙⋅"
+
+# 思维链漏进正文的特征。Gemini 爱写 **Defining the Structure** 这种英文小标题，
+# 提示词是中文时正常描述绝不会长这样
+THINKING_MARKS = (
+    "i'm now", "i am now", "i've ", "i'll ", "i need to", "let me ",
+    "my primary task", "first, i", "i'm focusing", "i'm analyzing",
+    "i'm grappling", "i'm considering", "i have re-assessed",
+)
 
 # 一轮最多请求几条图片描述。要多了模型容易敷衍，或写到一半被 max_tokens 截断
 NOTES_PER_TURN = 5
@@ -98,14 +146,29 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 
 class VisionError(Exception):
-    """视觉解析失败，消息直接进失败日志。"""
+    """视觉解析失败，消息直接进失败日志。
+
+    分三类，决定了失败之后怎么办：
+    · retryable —— 上游的锅（限流、网关 503、超时、安全策略随机拒答）。
+      退避重试；重试耗尽也**不算这张图的失败次数**，否则上游挂一夜
+      就能把整个图库标记成「坏图」。
+    · fatal —— 配置的锅（key 错、模型名错）。立刻中止整批并报错，
+      不然会拿着错配置空跑一整夜。
+    · 都不是 —— 这张图自己的问题（读不出来、格式不认）。计入 fails，
+      满 VISION_MAX_FAILS 次后不再自动重试。
+    """
+
+    def __init__(self, msg: str, *, retryable: bool = False, fatal: bool = False):
+        super().__init__(msg)
+        self.retryable = retryable
+        self.fatal = fatal
 
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.20.2",
+    "0.21.0",
 )
 class TgPresence(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -127,9 +190,19 @@ class TgPresence(Star):
         self._db: sqlite3.Connection | None = None
         # (ids, numpy矩阵)，第一次语义检索时构建，写入新向量后置空重建
         self._vec_cache: tuple[list[int], object] | None = None
+        # 上游熔断：连续失败到阈值就全局停一会儿，冷却时长随连续熔断次数翻倍
+        self._cool_until: float = 0.0
+        self._fail_streak: int = 0
+        self._trip_level: int = 0
+        # /gallery index auto 的后台任务，一次只允许有一个
+        self._index_task: asyncio.Task | None = None
+        self._index_note: str = ""
 
     async def terminate(self):
         """插件卸载或热重载时收尾，别把数据库句柄漏掉。"""
+        if self._index_task and not self._index_task.done():
+            self._index_task.cancel()  # 后台索引跟着插件一起走
+            self._index_task = None
         if self._db is not None:
             try:
                 self._db.commit()
@@ -1015,6 +1088,8 @@ class TgPresence(Star):
             "max_tokens": out,
             "stream": bool(self.conf.get("vision_stream", False)),
             "extra": extra,
+            "safety": (self.conf.get("gemini_safety") or "BLOCK_NONE").strip(),
+            "think": (self.conf.get("gemini_thinking_budget") or "").strip(),
             "system": (self.conf.get("vision_system_prompt") or "").strip()
             or DEFAULT_VISION_SYSTEM,
             "prompt": (self.conf.get("vision_prompt") or "").strip()
@@ -1022,6 +1097,46 @@ class TgPresence(Star):
         }
 
     # ----------------------------------------------- 三种接口格式的请求与解析
+
+    @staticmethod
+    def _gemini_safety(cfg: dict) -> list | None:
+        """Gemini 的安全阈值。返回 None 表示不传这个字段，用官方默认。
+
+        默认阈值会把成人向图片整片拦掉，而且拦得很安静——HTTP 200、
+        candidates 空着、状态码看不出任何异常。这个字段是 Gemini 这条
+        链路能不能用的分水岭，不是调优项。
+
+        BLOCK_NONE 是通用写法；OFF 更彻底但只有较新的模型认，老模型收到
+        会 400。填「默认」就完全不传。
+        """
+        level = (cfg.get("safety") or "").strip()
+        if not level or level in ("默认", "default", "DEFAULT"):
+            return None
+        return [{"category": c, "threshold": level} for c in GEMINI_HARM_CATEGORIES]
+
+    @staticmethod
+    def _gemini_gen_config(cfg: dict) -> dict:
+        """Gemini 的 generationConfig。关键在 thinkingConfig。
+
+        2.5 系列的思考 token 跟正文**共用** maxOutputTokens。放任不管的话，
+        模型会先在思维链里把整篇描述打一遍草稿，等轮到正式输出时配额已经
+        见底——结果就是草稿和正文双双被截断，两截还会被拼进同一条记录。
+        限住思考预算，配额才留得给真正要存的那段。
+
+        不填就完全不传这个字段：老模型（1.5 及更早）不认识它，收到会 400。
+        """
+        gc: dict = {"maxOutputTokens": cfg["max_tokens"]}
+        raw = str(cfg.get("think") or "").strip()
+        if not raw:
+            return gc
+        try:
+            budget = int(raw)
+        except ValueError:
+            logger.warning(f"[tg_presence] 思考预算「{raw}」不是整数，已忽略")
+            return gc
+        # includeThoughts 一并关掉：思维链不是描述，拿回来也只会被丢弃
+        gc["thinkingConfig"] = {"thinkingBudget": budget, "includeThoughts": False}
+        return gc
 
     @staticmethod
     def _vision_url(cfg: dict) -> str:
@@ -1095,8 +1210,10 @@ class TgPresence(Star):
                         ],
                     }
                 ],
-                "generationConfig": {"maxOutputTokens": cfg["max_tokens"]},
+                "generationConfig": TgPresence._gemini_gen_config(cfg),
             }
+            if safety := TgPresence._gemini_safety(cfg):
+                body["safetySettings"] = safety
         else:
             body = {
                 "model": cfg["model"],
@@ -1145,16 +1262,118 @@ class TgPresence(Star):
             return ""
         if not isinstance(blocks, list):
             return ""
-        # 只要 text，丢掉推理模型的 thinking 块——那是思考过程不是描述
+        # 只要 text，丢掉推理模型的 thinking 块——那是思考过程不是描述。
+        # 两家标记方式不同：Anthropic 用 type="thinking"，靠下面那个 type 判断
+        # 排掉；Gemini 的 part 压根没有 type 字段，只在思考块上挂 thought=true，
+        # 不单独认这个标记就会把整段思维链当描述收下来
         bits = [
             t.strip()
             for b in blocks
             if isinstance(b, dict)
             and b.get("type", "text") == "text"
+            and not b.get("thought")
             and isinstance(t := b.get("text"), str)
             and t.strip()
         ]
+        if len(bits) > 1:
+            # 正常一次生成只有一段正文。出现多段说明模型把草稿也吐出来了，
+            # 或者网关合并了多个候选——拼起来就是两篇描述首尾相接的怪东西
+            logger.info(
+                f"[tg_presence] 响应含 {len(bits)} 段正文，已拼接："
+                + " | ".join(f"{len(b)} 字" for b in bits)
+            )
         return " ".join(bits)
+
+    def _cut_at_end_mark(self, text: str) -> tuple[str, bool]:
+        """按结束标记裁掉尾巴。返回 (正文, 模型有没有写完)。
+
+        标记干两件事，第二件才是重点：
+        · 切掉标记之后的东西——模型偶尔把草稿和正文一起吐出来，
+          两篇描述首尾相接存进同一条记录
+        · 没有标记就说明没写完。被截断的描述看上去跟正常的一模一样，
+          只是尾巴秃了一截，不靠这个信号根本发现不了——而秃掉的恰恰
+          是最末尾的标签行，检索最依赖的那部分
+
+        没配标记就退化成「一律当写完了」，不影响不用这套提示词的人。
+        """
+        mark = (self.conf.get("vision_end_mark") or "").strip()
+        if not mark:
+            return text, True
+        i = text.find(mark)
+        if i < 0 and len(set(mark)) == 1 and mark[0] in END_MARK_CHARS:
+            # 标记是同一个点号重复 N 次时放宽：允许模型换成形近的另一个点号
+            m = re.search(f"[{re.escape(END_MARK_CHARS)}]{{{len(mark)},}}", text)
+            if m:
+                i = m.start()
+        return (text[:i].rstrip(), True) if i >= 0 else (text, False)
+
+    def _junk_reason(self, text: str) -> str:
+        """判断这段回复能不能当描述用。返回不能用的原因，能用则空串。
+
+        三种垃圾都是 HTTP 200 正常返回的，不拦就会直接进库：
+        · 模型嘴上拒绝——「我无法满足这个请求」被当成图片描述存下来
+        · 思维链漏进正文——中转网关不打 thought 标记时，_resp_text 拦不住
+        · 短得不可能是详细描述——模型敷衍了事
+
+        存进去比失败严重得多：这些文本会跟着转成向量，把语义检索一起带偏，
+        而且日志里什么都看不出来，只表现为「搜出来的图莫名其妙」。
+        """
+        t = (text or "").strip()
+        if not t:
+            return ""  # 空回有专门的处理路径，不在这儿判
+        low = t.lower()
+
+        head = low[:600]
+        # 英文粗体小标题开头，配上中文提示词，只可能是思维链
+        if re.match(r"^\*\*[a-z]", low) or any(p in head for p in THINKING_MARKS):
+            return "像是思维链漏进了正文"
+
+        if len(t) <= REFUSAL_MAX_CHARS:
+            for p in REFUSAL_MARKS:
+                if p in low:
+                    return f"像是拒答，命中「{p}」"
+
+        floor = int(self.conf.get("vision_min_chars", 0) or 0)
+        if floor:
+            # 下限不能高过截断上限，否则会自相矛盾：解析时按原文判定为合格，
+            # 存进库的却是截断后的短文本，回头 /gallery clean 又把它判成脏数据
+            cap = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
+            floor = min(floor, cap)
+            if len(t) < floor:
+                return f"只有 {len(t)} 字，不到下限 {floor}"
+        return ""
+
+    @staticmethod
+    def _refusal_reason(fmt: str, data: dict) -> str:
+        """空回的时候把「为什么空」挖出来。
+
+        Gemini 拦内容时返回的是 HTTP 200，正文里 candidates 要么空着、
+        要么只剩一个 finishReason。不把这些挖出来，日志里就只有一句
+        「返回内容为空」，根本分不清是安全策略、是配额、还是模型抽风。
+
+        PROHIBITED_CONTENT 要单独认出来——safetySettings 对它无效，
+        再怎么重试都不会过，得换模型。
+        """
+        if fmt != "gemini":
+            return ""
+        bits = []
+        if br := (data.get("promptFeedback") or {}).get("blockReason"):
+            bits.append(f"blockReason={br}")
+        cands = data.get("candidates") or []
+        if not cands:
+            bits.append("没有 candidates")
+        elif isinstance(cands[0], dict):
+            if fr := cands[0].get("finishReason"):
+                bits.append(f"finishReason={fr}")
+            hit = [
+                (r.get("category") or "").replace("HARM_CATEGORY_", "")
+                for r in (cands[0].get("safetyRatings") or [])
+                if isinstance(r, dict)
+                and (r.get("blocked") or r.get("probability") in ("HIGH", "MEDIUM"))
+            ]
+            if hit:
+                bits.append("命中 " + "、".join(hit))
+        return "；".join(bits)
 
     @staticmethod
     def _delta_text(fmt: str, obj: dict) -> str:
@@ -1169,7 +1388,9 @@ class TgPresence(Star):
             if fmt == "gemini":
                 parts = obj["candidates"][0]["content"]["parts"]
                 return "".join(
-                    p["text"] for p in parts if isinstance(p.get("text"), str)
+                    p["text"]
+                    for p in parts
+                    if isinstance(p.get("text"), str) and not p.get("thought")
                 )
             return obj["choices"][0].get("delta", {}).get("content") or ""
         except (KeyError, IndexError, TypeError):
@@ -1303,8 +1524,10 @@ class TgPresence(Star):
             body = {
                 "system_instruction": {"parts": [{"text": cfg["system"]}]},
                 "contents": [{"role": "user", "parts": parts}],
-                "generationConfig": {"maxOutputTokens": cfg["max_tokens"]},
+                "generationConfig": TgPresence._gemini_gen_config(cfg),
             }
+            if safety := TgPresence._gemini_safety(cfg):
+                body["safetySettings"] = safety
         else:
             content = []
             for i, (mime, b64) in enumerate(images, 1):
@@ -1348,8 +1571,10 @@ class TgPresence(Star):
             body = {
                 "system_instruction": {"parts": [{"text": cfg["system"]}]},
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": cfg["max_tokens"]},
+                "generationConfig": TgPresence._gemini_gen_config(cfg),
             }
+            if safety := TgPresence._gemini_safety(cfg):
+                body["safetySettings"] = safety
         else:
             body = {
                 "model": cfg["model"],
@@ -1383,9 +1608,22 @@ class TgPresence(Star):
                     if r.status != 200:
                         body = await r.text()
                         # 带上响应体，光看状态码分不清是 key 错还是模型名错
-                        raise VisionError(f"HTTP {r.status} {body[:300]}")
+                        raise VisionError(
+                            f"HTTP {r.status} {body[:300]}",
+                            retryable=r.status in RETRY_STATUS,
+                            fatal=r.status in FATAL_STATUS,
+                        )
                     if not cfg["stream"]:
-                        return self._resp_text(fmt, json.loads(await r.text()))
+                        data = json.loads(await r.text())
+                        text = self._resp_text(fmt, data)
+                        if not text:
+                            # 200 却没正文，基本都是内容被拦。原因藏在正文里
+                            why = self._refusal_reason(fmt, data)
+                            raise VisionError(
+                                "HTTP 200 但没有正文" + (f"：{why}" if why else ""),
+                                retryable=True,
+                            )
+                        return text
 
                     # 流式：逐行收 SSE，把增量拼回完整文本。
                     # 有些中转网关对非流式长响应直接 504，只有流式能跑通
@@ -1403,9 +1641,10 @@ class TgPresence(Star):
                             continue
                     return "".join(bits).strip()
         except asyncio.TimeoutError:
-            raise VisionError(f"超时（{VISION_TIMEOUT} 秒）") from None
+            raise VisionError(f"超时（{VISION_TIMEOUT} 秒）", retryable=True) from None
         except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-            raise VisionError(f"{type(e).__name__}: {e}") from e
+            # 连接被掐、网关吐了半截 JSON——都是传输层的临时问题，值得再来一次
+            raise VisionError(f"{type(e).__name__}: {e}", retryable=True) from e
 
     def _note_fail(self, pid: str, why: str) -> None:
         fails = self.state.setdefault("vision_fail", {})
@@ -1428,19 +1667,84 @@ class TgPresence(Star):
         """
         cfg = self._vision_conf()
         if not cfg:
-            raise VisionError("视觉 API 没配全")
+            raise VisionError("视觉 API 没配全", fatal=True)
         image = self._read_image(path)
         if not image:
-            raise VisionError("图片读不出来")
+            raise VisionError("图片读不出来")  # 这张图自己的问题，该记账
 
-        async with self._gate():
-            if skip_check and skip_check():
-                return None
-            text = await self._vision_post(cfg, *image)
+        tries = max(1, int(self.conf.get("vision_retries", 4) or 4))
+        cap = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
+        last: VisionError | None = None
 
-        if not text:
-            raise VisionError("返回内容为空，可能是模型拒答或触发了内容过滤")
-        return text[: max(100, int(self.conf.get("vision_max_chars", 600) or 600))]
+        for attempt in range(1, tries + 1):
+            try:
+                async with self._gate():
+                    if skip_check and skip_check():
+                        return None
+                    await self._wait_cooldown()
+                    text = await self._vision_post(cfg, *image)
+                if not text:
+                    # 流式路径拿不到响应体，给不出具体原因；非流式的在
+                    # _api_post 里已经带着 finishReason 抛出来了
+                    raise VisionError(
+                        "返回内容为空，可能是模型拒答或触发了内容过滤", retryable=True
+                    )
+                # 先按结束标记裁，再判内容——裁掉的可能正是拼在后面的另一篇
+                text, whole = self._cut_at_end_mark(text)
+                if not whole:
+                    raise VisionError(
+                        f"没写结束标记，输出多半被截断（收到 {len(text)} 字）"
+                        f"，检查最大输出长度和思考预算",
+                        retryable=True,
+                    )
+                if why := self._junk_reason(text):
+                    # 重试是有意义的：拒答带随机性，同一张图换一次采样常常就过了
+                    raise VisionError(f"返回的不是描述（{why}）：{text[:80]}", retryable=True)
+                self._note_upstream_ok()
+                return text[:cap]
+            except VisionError as e:
+                if e.fatal or not e.retryable:
+                    raise
+                last = e
+                self._note_upstream_fail()
+                if attempt >= tries:
+                    break
+                await asyncio.sleep(self._backoff(attempt))
+
+        raise last  # 循环只在重试耗尽时跳出，last 必定有值
+
+    @staticmethod
+    def _backoff(attempt: int) -> float:
+        """指数退避，带抖动。
+
+        抖动不是锦上添花——上一批 41 张是在 0.6 秒内一起失败的，
+        没有抖动它们就会一起醒来，拿同样一波并发再把上游撞一次。
+        """
+        base = min(VISION_BACKOFF_BASE * (2 ** (attempt - 1)), VISION_BACKOFF_MAX)
+        return base * (0.6 + random.random() * 0.8)
+
+    async def _wait_cooldown(self) -> None:
+        """熔断期内原地等着。分段睡，好让 stop 能及时打断。"""
+        while (gap := self._cool_until - time.time()) > 0:
+            await asyncio.sleep(min(gap, 3))
+
+    def _note_upstream_ok(self) -> None:
+        self._fail_streak = 0
+        if self._trip_level:
+            self._trip_level -= 1  # 通了就往回收一级，别一直记仇
+
+    def _note_upstream_fail(self) -> None:
+        """连续失败到一定程度就全局歇一会儿，别对着挂掉的上游猛捶。"""
+        self._fail_streak += 1
+        if self._fail_streak < TRIP_STREAK or time.time() < self._cool_until:
+            return
+        self._trip_level = min(self._trip_level + 1, 5)
+        cool = min(TRIP_COOL * (2 ** (self._trip_level - 1)), TRIP_COOL_MAX)
+        self._cool_until = time.time() + cool
+        self._fail_streak = 0
+        logger.warning(
+            f"[tg_presence] 上游连续失败 {TRIP_STREAK} 次，全局暂停 {cool:.0f} 秒"
+        )
 
     async def _vision_describe(self, pid: str, path: str) -> bool:
         """给上下文里的一张图做视觉解析，存进 vision.json。"""
@@ -1449,6 +1753,10 @@ class TgPresence(Star):
         try:
             text = await self._vision_of(path, lambda: pid in self.vision)
         except VisionError as e:
+            if e.retryable and not e.fatal:
+                # 同上：上游抖动不该让这张图被永久放弃，下一轮还能再来
+                logger.warning(f"[tg_presence] 视觉解析 #{pid} 上游未恢复，本轮跳过：{e}")
+                return False
             self._note_fail(pid, str(e))
             return False
         if text is None:  # 排队期间已经被别的任务做掉了
@@ -1467,10 +1775,15 @@ class TgPresence(Star):
         归类：ok / 无标签 / 段数不齐 / 有问题
 
         分两级：
-        · 结构校验（总是做）——段数够不够、编号连不连续。漏一项后面
-          全部错位，这是唯一会真正毁掉数据的错误。
+        · 结构校验（总是做）——段数够不够。少一项就是少一个维度的信息，
+          而且这种输出看上去跟正常的毫无区别，不数根本发现不了。
         · 值校验（仅 tag_strict 开启）——值在不在候选集里。提示词让模型
           自由用词时这一级会把几乎每张都标成「有问题」，纯噪声，默认关。
+
+        编号在这儿是可选的。检索走的是全文匹配加语义向量，两路都不看
+        标签在第几项，所以序号对检索毫无价值，反而会稀释向量——提示词
+        里已经不再要求它了。但历史数据带编号，带了就顺便校验连续性，
+        那能多抓一种错误（段数正好 44、内容却整体前移一格）。
 
         「无标签」是中性的：提示词不要求标签时全库都这样，不该报警。
 
@@ -1478,27 +1791,30 @@ class TgPresence(Star):
         里只有"皮革项圈"），删了反而丢信息，留着还能被 substring 命中。
         """
         strict = bool(self.conf.get("tag_strict", False)) and bool(FIELDS)
-        line = ""
-        for raw in reversed((descr or "").splitlines()):
-            if "---" in raw and re.match(r"^\s*1\.", raw):
-                line = raw.strip()
-                break
+        want = len(FIELDS) if FIELDS else 44
+        # 取分隔符最多的那一行。三点考虑：
+        # · 不要求「1.」开头——模型基本不照做，硬卡这条会让校验对新格式全盲
+        # · 不取最后一行——结束标记、模型自己补的备注都可能跟在后面
+        # · 要求至少两个 ---，免得正文里偶然出现的一个破折号被当成标签行
+        line, best = "", 1
+        for raw in (descr or "").splitlines():
+            if (n := raw.count("---")) > best:
+                best, line = n, raw.strip()
         if not line:
             return "无标签", []
 
-        segs = line.split("---")
+        segs = [s.strip() for s in line.split("---")]
         issues, nums = [], []
-        for seg in segs:
-            m = re.match(r"^(\d+)\.(.*)$", seg.strip(), re.S)
-            if not m:
-                continue
-            i = int(m.group(1))
-            nums.append(i)
+        for pos, seg in enumerate(segs, 1):
+            m = re.match(r"^(\d+)\.(.*)$", seg, re.S)
+            i, val = (int(m.group(1)), m.group(2)) if m else (pos, seg)
+            if m:
+                nums.append(i)
             if not strict or not 1 <= i <= len(FIELDS):
                 continue
             name, cand = FIELDS[i - 1]
             allowed = set(cand.split("|"))
-            for one in m.group(2).split(","):
+            for one in val.split(","):
                 one = ALIAS.get(one.strip(), one.strip())
                 if not one or one in allowed:
                     continue
@@ -1509,12 +1825,136 @@ class TgPresence(Star):
                 else:
                     issues.append(f"{i}.{name}「{one}」不在候选集")
 
-        # 期望项数：严格模式按候选表，否则按这张自己声明的最大编号
-        want = len(FIELDS) if strict and FIELDS else (max(nums) if nums else 0)
-        if not nums or nums != list(range(1, want + 1)):
-            issues.insert(0, f"编号不连续：{len(nums)} 项")
+        if len(segs) != want:
+            issues.insert(0, f"只有 {len(segs)} 段，应该是 {want} 段")
+            return "段数不齐", issues
+        # 带编号的顺便查连续性，能多抓「段数够但整体错位」这一种
+        if nums and nums != list(range(1, len(segs) + 1)):
+            issues.insert(0, f"编号不连续：{nums[:5]}…")
             return "段数不齐", issues
         return ("有问题" if issues else "ok"), issues
+
+    @staticmethod
+    def _dur(sec: float) -> str:
+        m, s = divmod(int(sec), 60)
+        h, m = divmod(m, 60)
+        if h:
+            return f"{h} 小时 {m} 分"
+        return f"{m} 分 {s} 秒" if m else f"{s} 秒"
+
+    async def _index_batch(self, batch: int) -> tuple[int, int]:
+        """跑一批待索引的图，返回 (成功数, 这批取到几张)。
+
+        取到 0 张就是全库索引完了。fatal 异常往外抛，让调用方中止整批。
+        """
+        db = self.db()
+        rows = db.execute(
+            "SELECT id, path FROM photos WHERE descr IS NULL AND fails < ? "
+            "ORDER BY id LIMIT ?",
+            (VISION_MAX_FAILS, batch),
+        ).fetchall()
+        if not rows:
+            return 0, 0
+
+        jobs = []
+        for r in rows:
+            if p := self._photo_file(r):
+                jobs.append(self._gallery_describe(r["id"], str(p)))
+            else:
+                # 文件没了，直接顶满失败数，不然每轮都会把它捞出来重试
+                db.execute(
+                    "UPDATE photos SET fails = ? WHERE id = ?",
+                    (VISION_MAX_FAILS, r["id"]),
+                )
+        db.commit()
+
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        for x in results:
+            if isinstance(x, VisionError) and x.fatal:
+                raise x
+        return sum(1 for x in results if x is True), len(rows)
+
+    async def _index_loop(self, umo: str) -> None:
+        """后台把待索引的图全部跑完，一条指令跑到底。
+
+        设计成能扛住上游长时间抽风：一批全挂不会立刻放弃，而是拉长间隔
+        守着，最多守到 max_dry 轮才收工。上游恢复了自动接上，进度全在库里，
+        随时停随时续。
+        """
+        from astrbot.core.message.message_event_result import MessageChain
+
+        batch = max(1, min(int(self.conf.get("index_auto_batch", 30) or 30), 200))
+        gap = max(60, int(self.conf.get("index_report_gap", 600) or 600))
+        max_dry = max(1, int(self.conf.get("index_max_dry", 12) or 12))
+        started = last_report = time.time()
+        done = dry = 0
+
+        async def say(text: str) -> None:
+            try:
+                await self.context.send_message(umo, MessageChain().message(text))
+            except Exception as e:  # 回报失败不能连累索引本身
+                logger.warning(f"[tg_presence] 索引进度回报失败：{e}")
+
+        try:
+            while True:
+                try:
+                    ok, n = await self._index_batch(batch)
+                except VisionError as e:
+                    await say(f"❌ 配置有问题，索引停了：{e}\n改完发 /gallery index auto 重开。")
+                    return
+
+                if n == 0:
+                    st = self.gallery_stat()
+                    await say(
+                        f"✅ 索引跑完了，用时 {self._dur(time.time() - started)}。\n"
+                        f"本次新增 {done} 张，全库已索引 {st['indexed']}/{st['total']}。"
+                        + (
+                            f"\n有 {st['stuck']} 张失败跳过，/gallery retry 可以重来。"
+                            if st["stuck"]
+                            else ""
+                        )
+                        + "\n接着跑 /gallery embed 转向量。"
+                    )
+                    return
+
+                done += ok
+                if ok:
+                    dry = 0
+                else:
+                    dry += 1
+                    if dry >= max_dry:
+                        st = self.gallery_stat()
+                        await say(
+                            f"⏸ 连着 {dry} 批一张都没成，上游看来是长时间挂了，先收工。\n"
+                            f"本次完成 {done} 张，还剩 {st['pending']} 张。\n"
+                            f"日志看下原因，恢复后 /gallery index auto 接着跑，进度不丢。"
+                        )
+                        return
+                    # 越挂越久就等越久，上限 15 分钟。守着比放弃划算——
+                    # 中转商的 auth 池通常几分钟到半小时就补上了
+                    wait = min(60 * 2 ** min(dry, 4), 900)
+                    if dry == 1 or dry % 3 == 0:
+                        await say(
+                            f"⚠️ 上游连续失败（第 {dry} 轮），{wait // 60} 分钟后再试。\n"
+                            f"本次已完成 {done} 张。/gallery index stop 可以停。"
+                        )
+                    await asyncio.sleep(wait)
+                    continue
+
+                if time.time() - last_report >= gap:
+                    st = self.gallery_stat()
+                    await say(
+                        f"索引中：本次 {done} 张，全库 {st['indexed']}/{st['total']}，"
+                        f"还剩 {st['pending']} 张，已跑 {self._dur(time.time() - started)}。"
+                    )
+                    last_report = time.time()
+        except asyncio.CancelledError:
+            # 这里不再 await 发消息——任务已被取消，await 会立刻再抛一次。
+            # 停止的回执由 /gallery index stop 那边直接回给用户
+            logger.info(f"[tg_presence] 后台索引已取消，本次完成 {done} 张")
+            raise
+        finally:
+            self._index_task = None
 
     async def _gallery_describe(self, row_id: int, path: str) -> bool:
         """给图库里的一张图做视觉解析，存进索引库。"""
@@ -1522,6 +1962,13 @@ class TgPresence(Star):
         try:
             text = await self._vision_of(path)
         except VisionError as e:
+            if e.fatal:
+                raise  # 配置错，交给上层中止整批
+            if e.retryable:
+                # 重试都用完了上游还是不行。这不是图片的问题，绝不能记账——
+                # 否则上游挂一夜就足以把整个图库标成「坏图」，还得手动 retry
+                logger.warning(f"[tg_presence] 图库 g{row_id} 上游未恢复，本轮跳过：{e}")
+                return False
             db.execute("UPDATE photos SET fails = fails + 1 WHERE id = ?", (row_id,))
             db.commit()
             logger.warning(f"[tg_presence] 图库 g{row_id} 索引失败：{e}")
@@ -1529,8 +1976,11 @@ class TgPresence(Star):
 
         verdict, issues = self.audit_tags(text)
         db.execute(
-            "UPDATE photos SET descr = ?, fails = 0, tag_state = ?, tag_issues = ? "
-            "WHERE id = ?",
+            # vec 必须一起作废：描述换了，旧向量就不再代表这张图了。
+            # 不清的话 embed 那边「descr 有、vec 空」的条件选不中它，
+            # 新描述会一直配着旧向量，检索错得毫无痕迹
+            "UPDATE photos SET descr = ?, vec = NULL, fails = 0, tag_state = ?, "
+            "tag_issues = ? WHERE id = ?",
             (text, verdict, "; ".join(issues[:8]), row_id),
         )
         db.commit()
@@ -3090,12 +3540,63 @@ class TgPresence(Star):
             yield event.plain_result("\n".join(lines))
             return
 
+        if action == "clean":
+            db = self.db()
+            rows = db.execute(
+                "SELECT id, path, descr FROM photos WHERE descr IS NOT NULL"
+            ).fetchall()
+            bad = [
+                (r["id"], r["path"], why)
+                for r in rows
+                if (why := self._junk_reason(r["descr"]))
+            ]
+            if not bad:
+                yield event.plain_result(
+                    f"扫了 {len(rows)} 条描述，没发现拒答、思维链或过短的。"
+                )
+                return
+
+            def kind(why: str) -> str:
+                if why.startswith("像是思维链"):
+                    return "思维链漏进正文"
+                return "模型拒答" if why.startswith("像是拒答") else "描述过短"
+
+            if rest.strip().lower() not in ("go", "确认"):
+                tally: dict[str, int] = {}
+                for _, _, why in bad:
+                    tally[kind(why)] = tally.get(kind(why), 0) + 1
+                lines = [f"扫了 {len(rows)} 条，{len(bad)} 条不能当描述用："]
+                lines += [
+                    f"  {k} × {v}"
+                    for k, v in sorted(tally.items(), key=lambda x: -x[1])
+                ]
+                lines.append("\n举例：")
+                lines += [f"  g{i} {Path(p).name} — {why}" for i, p, why in bad[:5]]
+                lines.append("\n这些会污染向量检索。确认清掉重跑：/gallery clean go")
+                yield event.plain_result("\n".join(lines))
+                return
+
+            db.executemany(
+                "UPDATE photos SET descr = NULL, vec = NULL, tag_state = NULL, "
+                "tag_issues = NULL, fails = 0 WHERE id = ?",
+                [(i,) for i, _, _ in bad],
+            )
+            db.commit()
+            self._vec_cache = None
+            yield event.plain_result(
+                f"清掉 {len(bad)} 条，已退回待索引。\n"
+                f"先确认视觉配置改好了（Gemini 记得设安全阈值），再 /gallery index auto 重跑。"
+            )
+            return
+
         if action == "redo":
             db = self.db()
             n = db.execute(
-                "UPDATE photos SET descr = NULL, fails = 0 WHERE tag_state = '段数不齐'"
+                "UPDATE photos SET descr = NULL, vec = NULL, tag_state = NULL, "
+                "tag_issues = NULL, fails = 0 WHERE tag_state = '段数不齐'"
             ).rowcount
             db.commit()
+            self._vec_cache = None
             yield event.plain_result(
                 f"已把 {n} 张标签有结构问题的图退回待索引，/gallery index 重跑。"
                 if n
@@ -3120,13 +3621,51 @@ class TgPresence(Star):
             if not self._vision_ready():
                 yield event.plain_result("视觉 API 没配全，/vision 看缺哪项。")
                 return
-            batch = max(1, min(int(rest.strip()), 200)) if rest.strip().isdigit() else 20
-            rows = self.db().execute(
-                "SELECT id, path FROM photos WHERE descr IS NULL AND fails < ? "
-                "ORDER BY id LIMIT ?",
-                (VISION_MAX_FAILS, batch),
-            ).fetchall()
-            if not rows:
+            arg = rest.strip().lower()
+            running = bool(self._index_task and not self._index_task.done())
+
+            if arg == "stop":
+                if not running:
+                    yield event.plain_result("没有在跑的后台索引。")
+                    return
+                self._index_task.cancel()
+                self._index_task = None
+                yield event.plain_result(
+                    "已停。进度都在库里，/gallery index auto 可以接着跑。"
+                )
+                return
+
+            if running:
+                yield event.plain_result(
+                    "后台索引正在跑，/gallery 看进度，/gallery index stop 停掉。"
+                )
+                return
+
+            if arg == "auto":
+                if not stat["pending"]:
+                    yield event.plain_result(
+                        f"没有待索引的图。已索引 {stat['indexed']} 张。"
+                        + (
+                            f"\n有 {stat['stuck']} 张失败跳过，/gallery retry 重来。"
+                            if stat["stuck"]
+                            else ""
+                        )
+                    )
+                    return
+                self._index_task = asyncio.create_task(
+                    self._index_loop(event.unified_msg_origin)
+                )
+                yield event.plain_result(
+                    f"后台开跑，待索引 {stat['pending']} 张，"
+                    f"并发 {self.conf.get('vision_concurrency', 2)}。\n"
+                    f"跑完会告诉你，中途每隔一阵报一次进度。\n"
+                    f"上游要是挂了会自动等它恢复，不会把图标成坏图。\n"
+                    f"/gallery index stop 随时停，进度不丢。"
+                )
+                return
+
+            batch = max(1, min(int(arg), 200)) if arg.isdigit() else 20
+            if not stat["pending"]:
                 yield event.plain_result(
                     f"没有待索引的图。已索引 {stat['indexed']} 张。"
                     + (f"\n有 {stat['stuck']} 张失败跳过，/gallery retry 重来。" if stat["stuck"] else "")
@@ -3134,34 +3673,31 @@ class TgPresence(Star):
                 return
 
             yield event.plain_result(
-                f"开始索引 {len(rows)} 张（待索引共 {stat['pending']} 张），"
+                f"开始索引 {min(batch, stat['pending'])} 张（待索引共 {stat['pending']} 张），"
                 f"并发 {self.conf.get('vision_concurrency', 2)}，跑完再报。"
             )
-            jobs = []
-            for r in rows:
-                p = self._photo_file(r)
-                if p:
-                    jobs.append(self._gallery_describe(r["id"], str(p)))
-                else:
-                    self.db().execute(
-                        "UPDATE photos SET fails = ? WHERE id = ?",
-                        (VISION_MAX_FAILS, r["id"]),
-                    )
-            self.db().commit()
-
-            results = await asyncio.gather(*jobs, return_exceptions=True)
-            ok = sum(1 for x in results if x is True)
+            try:
+                ok, n = await self._index_batch(batch)
+            except VisionError as e:
+                yield event.plain_result(f"配置有问题，已中止：{e}")
+                return
             after = self.gallery_stat()
             yield event.plain_result(
-                f"完成 {ok}/{len(rows)} 张。已索引 {after['indexed']} / {after['total']}，"
+                f"完成 {ok}/{n} 张。已索引 {after['indexed']} / {after['total']}，"
                 f"还剩 {after['pending']} 张。"
-                + ("\n再发一次 /gallery index 继续。" if after["pending"] else "\n全部索引完毕。")
+                + (
+                    "\n量大的话用 /gallery index auto，一条指令跑到底。"
+                    if after["pending"]
+                    else "\n全部索引完毕。"
+                )
             )
             return
 
         yield event.plain_result(
-            "用法：/gallery [scan|index N|search 词|embed N|audit|redo|retry]\n"
-            "  embed 把描述转成语义向量，audit 看标签质量，redo 重跑结构坏的"
+            "用法：/gallery [scan|index N|index auto|index stop|search 词|embed N|"
+            "audit|clean|redo|retry]\n"
+            "  index auto 后台跑到全部完成，embed 把描述转成语义向量，\n"
+            "  clean 揪出拒答和思维链，audit 看标签质量，redo 重跑结构坏的"
         )
 
     @filter.command("vision")
