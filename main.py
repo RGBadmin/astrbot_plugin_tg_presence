@@ -184,6 +184,27 @@ CREATE INDEX IF NOT EXISTS idx_sent    ON photos(last_sent);
 """
 ANTHROPIC_VERSION = "2023-06-01"
 
+# 分段向量。整段描述只转一个向量的话，三千多字里九成是身体细节，
+# 环境那两百字会被彻底稀释——「黑色反光桌面，大片水渍」这种信息在
+# 全文向量里几乎看不见，搜「桌上喷水」全凭运气。按层切开各转一个，
+# 检索时取最大相似度，环境词就能直接撞上环境段。
+# 值是这一段取哪几层；None 表示整篇。第六层往后会连标签行一起带上，
+# 那正好——标签是特征清单，跟动作状态放一起不违和。
+VEC_SEGS: dict[str, tuple[int, ...] | None] = {
+    "vec": None,           # 全文，也是向后兼容的那一路
+    "vec_env": (1, 5),     # 环境与背景 + 物品道具
+    "vec_body": (2, 3),    # 人物整体 + 身体细节
+    "vec_act": (4, 6),     # 互动动作 + 体液痕迹 + 标签行
+}
+# 必须锚在行首。正文里「背景中的杂物见第一层」这种交叉引用很常见，
+# 不锚定的话它会被当成层标题，把真正的第一层内容整段吃掉
+LAYER_RE = re.compile(r"^[\s*·・-]*第\s*([一二三四五六])\s*层[^\n]*", re.M)
+LAYER_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
+# 九宫格的逐格描述。挑图时它们没有判别力——十张图开头都是「左上：白色墙面」
+GRID_RE = re.compile(r"^(左上|中上|右上|左中|正中|右中|左下|中下|右下)\s*[：:]")
+# 描述一变，所有分段向量都得作废，不能只清主向量
+VEC_NULLS = ", ".join(f"{c} = NULL" for c in VEC_SEGS)
+
 
 class VisionError(Exception):
     """视觉解析失败，消息直接进失败日志。
@@ -228,8 +249,8 @@ class TgPresence(Star):
         self._key_cache: dict[str, str] = {}
         self.db_path = self.data_dir / "gallery.db"
         self._db: sqlite3.Connection | None = None
-        # (ids, numpy矩阵)，第一次语义检索时构建，写入新向量后置空重建
-        self._vec_cache: tuple[list[int], object] | None = None
+        # {列名: (ids, numpy矩阵)}，第一次语义检索时构建，写入新向量后清空重建
+        self._vec_cache: dict[str, tuple[list[int], object]] = {}
         # 上游熔断：连续失败到阈值就全局停一会儿，冷却时长随连续熔断次数翻倍
         self._cool_until: float = 0.0
         self._fail_streak: int = 0
@@ -308,8 +329,9 @@ class TgPresence(Star):
             self._db.executescript(GALLERY_SCHEMA)
             # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
             have = {r["name"] for r in self._db.execute("PRAGMA table_info(photos)")}
-            for col, typ in (("tag_state", "TEXT"), ("tag_issues", "TEXT"),
-                             ("file_time", "REAL"), ("vec", "BLOB")):
+            cols = [("tag_state", "TEXT"), ("tag_issues", "TEXT"), ("file_time", "REAL")]
+            cols += [(c, "BLOB") for c in VEC_SEGS]
+            for col, typ in cols:
                 if col not in have:
                     self._db.execute(f"ALTER TABLE photos ADD COLUMN {col} {typ}")
             self._db.commit()
@@ -502,10 +524,14 @@ class TgPresence(Star):
         整词 df 为 0，IDF 给它再高的权重也是零贡献。拆成单字，
         「车」就能命中了。
 
-        单字噪声大，但这里有两道闸：df 为 0 的原词才拆（能整词命中的
-        不动），以及拆出来的字只保留没到处都是的。真漏进来一两个常见字
-        也不致命——IDF 会把它压到最低权重，而且它命中所有图，
-        对排序而言只是个常数项。
+        单字噪声大，三道闸拦着：
+
+        · 只有整词 df 为 0 才拆，能整词命中的不动。
+        · 已命中词的组成字一律不要。否则搜「红色情趣内衣」时，整串落空
+          被拆成红/色/情/趣/内/衣，而「情趣」「内衣」本来就已经命中了——
+          同一个语义被算五遍，分数虚高到满分，别的图全被压死。
+        · 拆出来的字超过六成图都有就丢掉。真漏进来一两个也不致命：
+          IDF 会把它压到最低权重，而且它命中所有图，对排序只是常数项。
         """
         total, dfs = self._df(words, folder)
         dead = [w for w, df in zip(words, dfs) if df == 0 and len(w) > 1]
@@ -513,7 +539,12 @@ class TgPresence(Star):
             return words
         alive = [w for w, df in zip(words, dfs) if df > 0]
         chars = list(
-            dict.fromkeys(c for w in dead for c in w if c.strip() and c not in alive)
+            dict.fromkeys(
+                c
+                for w in dead
+                for c in w
+                if c.strip() and not any(c in a for a in alive)
+            )
         )
         if not chars:
             return alive or words
@@ -673,47 +704,122 @@ class TgPresence(Star):
         n = math.sqrt(sum(v * v for v in vec)) or 1.0
         return struct.pack(f"<{len(vec)}f", *[v / n for v in vec])
 
-    def _load_matrix(self):
-        """把全库向量读进内存。第一次检索时构建，之后复用。
+    def _photo_brief(self, descr: str) -> str:
+        """给桃桃挑图时看的摘要。
 
-        8 万张 × 1024 维 float32 约 320 MB。每次检索都从 SQLite 读一遍
-        显然不行，而这个量级又完全不值得上向量数据库，常驻内存最省事。
+        原来直接截前 70 字，而描述开头恰好是九宫格的「左上：白色墙面，
+        窗户一角」——最没有判别力的那一格。她看十张，十张开头都长一样，
+        等于让她闭着眼睛选。
+
+        抽三样她真正需要的：场景一句、人物整体（穿着姿态镜头）、标签行
+        （信息密度最高的特征清单）。切不出层就退回原来的截断。
         """
-        if self._vec_cache is not None:
-            return self._vec_cache
+        layers = self._desc_layers(descr)
+        if not layers:
+            return " ".join((descr or "").split())[:120]
+
+        bits = []
+        # 第一层里九宫格之后那段才是场景总结，逐格描述对挑图没用
+        env = [
+            ln.strip()
+            for ln in layers.get(1, "").splitlines()
+            if ln.strip() and not GRID_RE.match(ln.strip())
+        ]
+        if env:
+            bits.append(" ".join(env)[:56])
+        if body := " ".join(layers.get(2, "").split()):
+            bits.append(body[:76])
+        if tag := self._tag_line(descr):
+            bits.append(tag[:130])
+        return " ｜ ".join(bits) or " ".join((descr or "").split())[:120]
+
+    @staticmethod
+    def _tag_line(descr: str) -> str:
+        """摘出末尾那行标签。取分隔符最多的一行，和 audit_tags 同一口径。"""
+        line, best = "", 1
+        for raw in (descr or "").splitlines():
+            if (n := raw.count("---")) > best:
+                best, line = n, raw.strip()
+        return line
+
+    @staticmethod
+    def _desc_layers(descr: str) -> dict[int, str]:
+        """按六层标题切开，返回 {层号: 内容}。切不出来返回空。"""
+        if not descr:
+            return {}
+        marks = [m for m in LAYER_RE.finditer(descr) if m.group(1) in LAYER_NUM]
+        if len(marks) < 4:  # 六层里连四层都找不到，格式对不上，别硬切
+            return {}
+        layers: dict[int, str] = {}
+        for i, m in enumerate(marks):
+            end = marks[i + 1].start() if i + 1 < len(marks) else len(descr)
+            # 同一层出现两次就以头一次为准，别让后面的把内容盖掉
+            layers.setdefault(LAYER_NUM[m.group(1)], descr[m.end() : end].strip())
+        return layers
+
+    @staticmethod
+    def _desc_segments(descr: str) -> dict[str, str]:
+        """按六层标题把描述切成几段，各自要转一个向量。
+
+        切不出层标题（提示词换过、模型没照写）就返回空，那种情况只存
+        全文向量，行为跟以前一样。
+        """
+        layers = TgPresence._desc_layers(descr)
+        if not layers:
+            return {}
+        out: dict[str, str] = {}
+        for col, nums in VEC_SEGS.items():
+            if nums is None:
+                continue
+            txt = "\n".join(x for x in (layers.get(n, "") for n in nums) if x).strip()
+            if txt:
+                out[col] = txt
+        return out
+
+    def _load_matrix(self, col: str = "vec"):
+        """把某一段的全库向量读进内存。第一次检索时构建，之后复用。
+
+        一万张 × 四段 × 1024 维 float32 约 160 MB。每次检索都从 SQLite
+        读一遍显然不行，而这个量级又完全不值得上向量数据库，常驻内存最省事。
+        """
+        if col in self._vec_cache:
+            return self._vec_cache[col]
         try:
             import numpy as np
         except ImportError:
             logger.warning("[tg_presence] 没装 numpy，语义检索不可用")
-            self._vec_cache = ([], None)
-            return self._vec_cache
+            self._vec_cache[col] = ([], None)
+            return self._vec_cache[col]
 
         rows = self.db().execute(
-            "SELECT id, vec FROM photos WHERE vec IS NOT NULL ORDER BY id"
+            f"SELECT id, {col} v FROM photos WHERE {col} IS NOT NULL ORDER BY id"
         ).fetchall()
         if not rows:
-            self._vec_cache = ([], None)
-            return self._vec_cache
+            self._vec_cache[col] = ([], None)
+            return self._vec_cache[col]
 
         ids = [int(r["id"]) for r in rows]
-        dim = len(rows[0]["vec"]) // 4
-        mat = np.frombuffer(b"".join(r["vec"] for r in rows), dtype="<f4")
+        dim = len(rows[0]["v"]) // 4
+        mat = np.frombuffer(b"".join(r["v"] for r in rows), dtype="<f4")
         try:
             mat = mat.reshape(len(ids), dim)
         except ValueError:
             logger.error("[tg_presence] 向量维度不一致，可能换过模型；请 /gallery embed redo")
-            self._vec_cache = ([], None)
-            return self._vec_cache
-        logger.info(f"[tg_presence] 载入 {len(ids)} 条向量 {dim} 维，{mat.nbytes/1048576:.0f} MB")
-        self._vec_cache = (ids, mat)
-        return self._vec_cache
+            self._vec_cache[col] = ([], None)
+            return self._vec_cache[col]
+        logger.info(
+            f"[tg_presence] 载入 {col} {len(ids)} 条 {dim} 维，{mat.nbytes/1048576:.0f} MB"
+        )
+        self._vec_cache[col] = (ids, mat)
+        return self._vec_cache[col]
 
     async def _vector_search(self, query: str, limit: int) -> dict[int, float]:
-        """全库语义检索，返回 {图片id: 余弦相似度}。不可用时返回空。"""
+        """全库语义检索，返回 {图片id: 余弦相似度}。不可用时返回空。
+
+        每一段各比一次，同一张图取最高的那段。搜「桌上喷水」时环境段
+        会强命中，而它在全文向量里早被三千字身体细节压没了。
+        """
         if not query.strip() or not self._embed_conf():
-            return {}
-        ids, mat = self._load_matrix()
-        if mat is None or not ids:
             return {}
         try:
             import numpy as np
@@ -722,16 +828,29 @@ class TgPresence(Star):
             if not got:
                 return {}
             q = np.asarray(got[0], dtype="<f4")
-            if q.shape[0] != mat.shape[1]:
-                logger.warning(
-                    f"[tg_presence] 查询向量 {q.shape[0]} 维与库里 {mat.shape[1]} 维对不上"
-                )
-                return {}
             q /= np.linalg.norm(q) or 1.0
-            sims = mat @ q
-            n = min(limit, len(ids))
-            top = np.argpartition(-sims, n - 1)[:n]
-            return {ids[i]: float(sims[i]) for i in top}
+
+            best: dict[int, float] = {}
+            for col in VEC_SEGS:
+                ids, mat = self._load_matrix(col)
+                if mat is None or not ids:
+                    continue
+                if q.shape[0] != mat.shape[1]:
+                    logger.warning(
+                        f"[tg_presence] 查询向量 {q.shape[0]} 维与 {col} 的 "
+                        f"{mat.shape[1]} 维对不上，跳过这一段"
+                    )
+                    continue
+                sims = mat @ q
+                n = min(limit, len(ids))
+                for i in np.argpartition(-sims, n - 1)[:n]:
+                    pid, s = ids[i], float(sims[i])
+                    if s > best.get(pid, -2.0):
+                        best[pid] = s
+            if len(best) <= limit:
+                return best
+            top = sorted(best.items(), key=lambda kv: -kv[1])[:limit]
+            return dict(top)
         except VisionError as e:
             logger.warning(f"[tg_presence] 语义检索失败，退回纯关键词：{e}")
             return {}
@@ -2150,10 +2269,10 @@ class TgPresence(Star):
 
         verdict, issues = self.audit_tags(text)
         db.execute(
-            # vec 必须一起作废：描述换了，旧向量就不再代表这张图了。
+            # 向量必须一起作废：描述换了，旧向量就不再代表这张图了。
             # 不清的话 embed 那边「descr 有、vec 空」的条件选不中它，
             # 新描述会一直配着旧向量，检索错得毫无痕迹
-            "UPDATE photos SET descr = ?, vec = NULL, fails = 0, tag_state = ?, "
+            f"UPDATE photos SET descr = ?, {VEC_NULLS}, fails = 0, tag_state = ?, "
             "tag_issues = ? WHERE id = ?",
             (text, verdict, "; ".join(issues[:8]), row_id),
         )
@@ -2448,14 +2567,42 @@ class TgPresence(Star):
         lines = []
         for r in picked:
             tag = f"[{r['folder']}] " if r["folder"] else ""
-            seen = f" · 发过{r['sent']}次" if r["sent"] else " · 没发过"
-            lines.append(f"g{r['id']} · {tag}{(r['descr'] or '')[:70]}{seen}")
+            seen = f"发过{r['sent']}次" if r["sent"] else "没发过"
+            lines.append(f"g{r['id']} · {tag}{seen}\n  {self._photo_brief(r['descr'])}")
         return (
             f"从 {len(rows)} 张候选里挑出这 {len(picked)} 张"
             + ("（模型逐张比对过）" if by_model else "")
             + "，越靠前越合适：\n"
             + "\n".join(lines)
-            + "\n\n你自己看着挑一张，用 send_photo 加编号发出去。"
+            + "\n\n看不够就用 inspect_photo 加编号调出整篇描述再定。"
+            + "\n挑好一张，用 send_photo 加编号发出去。"
+        )
+
+    @filter.llm_tool(name="inspect_photo")
+    async def inspect_photo(self, event: AstrMessageEvent, photo_id: str = "", **_extra):
+        """调出相册里某张照片的完整描述。browse_gallery 给的是摘要，拿不准哪张更合适、或者想确认某个细节在不在画面里的时候用这个细看。
+
+        Args:
+            photo_id(string): 相册编号，browse_gallery 列出来的那个 g123
+        """
+        raw = (photo_id or "").strip().lstrip("gG")
+        if not raw.isdigit():
+            return "编号得是 browse_gallery 给的那种 g123。"
+        row = self.db().execute(
+            "SELECT id, folder, descr, sent, last_sent FROM photos WHERE id = ?",
+            (int(raw),),
+        ).fetchone()
+        if not row or not row["descr"]:
+            return f"g{raw} 找不到，或者它还没建索引。"
+        when = ""
+        if row["last_sent"]:
+            when = "，上次发是 " + datetime.fromtimestamp(
+                row["last_sent"], self._tz()
+            ).strftime("%m-%d")
+        return (
+            f"g{row['id']}"
+            + (f"（{row['folder']}）" if row["folder"] else "")
+            + f"，发过 {row['sent']} 次{when}：\n{row['descr']}"
         )
 
     @filter.llm_tool(name="send_photo")
@@ -2513,17 +2660,43 @@ class TgPresence(Star):
             logger.error(f"[tg_presence] 发照片失败 {path}: {e}")
             return f"照片没发出去：{e}"
 
+        note = ""
         if row is not None:
             self.db().execute(
                 "UPDATE photos SET sent = sent + 1, last_sent = ? WHERE id = ?",
                 (time.time(), row["id"]),
             )
             self.db().commit()
+            # 让她自己也记住这张。不登记的话她发完就忘：下一句你说
+            # 「刚那张真好看」她接不上，过两轮还可能把同一张再发一遍
+            if pid := self._remember_sent(path, row["descr"] or "", f"g{row['id']}"):
+                note = f" 在你们的对话里它是 #{pid}"
         if enforce_limits:
             self._mark_done("photo")
             self._bump_daily("photo")
         logger.info(f"[tg_presence] 已发送照片 {raw} -> {path.name}")
-        return f"照片发出去了（{raw}）。"
+        return f"照片发出去了（{raw}）。{note}"
+
+    def _remember_sent(self, path: Path, descr: str, key: str) -> str | None:
+        """把她刚发出去的图登记进图片记忆，跟对方发来的图一视同仁。
+
+        图库里的图已经有现成的描述，直接搬过来当画面细节用，不用再花一次
+        视觉 API。key 用 g123 这样的稳定串，同一张重发时编号不会变。
+        """
+        try:
+            index = self.state.setdefault("photo_index", {})
+            if key not in index:
+                index[key] = str(len(index) + 1)
+            pid = index[key]
+            self.state.setdefault("photo_paths", {})[pid] = str(path)
+            self._save_state()
+            if descr and pid not in self.vision:
+                self.vision[pid] = descr
+                self._save_vision()
+            return pid
+        except (OSError, ValueError) as e:
+            logger.warning(f"[tg_presence] 登记已发照片失败：{e}")
+            return None
 
     @filter.command("photo")
     async def cmd_photo(self, event: AstrMessageEvent, photo_id: str = "", *, caption: str = ""):
@@ -3525,11 +3698,15 @@ class TgPresence(Star):
             if stat["sent"]:
                 lines.append(f"累计发出：{stat['sent']} 次")
             if self._embed_conf():
+                segs = ", ".join(f"SUM({c} IS NOT NULL)" for c in VEC_SEGS)
                 v = self.db().execute(
-                    "SELECT SUM(vec IS NOT NULL) a,"
-                    " SUM(descr IS NOT NULL AND vec IS NULL) b FROM photos"
+                    f"SELECT SUM(descr IS NOT NULL AND vec IS NULL) b, {segs} FROM photos"
                 ).fetchone()
-                lines.append(f"语义向量：{v['a'] or 0} 条 · 待转 {v['b'] or 0} 条")
+                got = " / ".join(
+                    f"{c.removeprefix('vec_') if c != 'vec' else '全文'} {v[i + 1] or 0}"
+                    for i, c in enumerate(VEC_SEGS)
+                )
+                lines.append(f"语义向量：{got} · 待转 {v['b'] or 0} 张")
             if not stat["total"]:
                 lines.append("\n先 /gallery scan 扫一遍目录。")
             elif stat["pending"]:
@@ -3622,11 +3799,13 @@ class TgPresence(Star):
                 return
 
             if arg == "redo":
-                n = db.execute("UPDATE photos SET vec = NULL").rowcount
+                sets = ", ".join(f"{c} = NULL" for c in VEC_SEGS)
+                n = db.execute(f"UPDATE photos SET {sets}").rowcount
                 db.commit()
-                self._vec_cache = None
+                self._vec_cache.clear()
                 yield event.plain_result(
-                    f"已清空 {n} 条向量（换了模型或维度就该这样）。再发 /gallery embed 重建。"
+                    f"已清空 {n} 条向量的全部分段（换了模型或维度就该这样）。"
+                    f"再发 /gallery embed 重建。"
                 )
                 return
 
@@ -3646,15 +3825,26 @@ class TgPresence(Star):
                 yield event.plain_result(f"没有待转向量的图。已有 {done} 条向量。")
                 return
 
+            # 一张图要转好几段，按「文本条数」分批而不是按图片张数，
+            # 否则批大小填 32 实际会一次发一百多条上去
+            jobs: list[tuple[int, str, str]] = []
+            for r in rows:
+                jobs.append((r["id"], "vec", self._embed_text(r["descr"])))
+                for col, txt in self._desc_segments(r["descr"]).items():
+                    jobs.append((r["id"], col, self._embed_text(txt)))
+            seg_n = len(jobs) - len(rows)
+
             batch = max(1, min(int(self.conf.get("embed_batch", 32) or 32), 256))
             yield event.plain_result(
-                f"待转 {left_before} 条，这次做 {len(rows)} 条，每批 {batch}。"
+                f"待转 {left_before} 张，这次做 {len(rows)} 张。\n"
+                f"分段后共 {len(jobs)} 条文本（全文 {len(rows)} + 分段 {seg_n}），每批 {batch}。"
+                + ("\n⚠ 一段都没切出来，检查描述里的层标题" if not seg_n else "")
             )
             ok = fail = 0
-            for i in range(0, len(rows), batch):
-                chunk = rows[i : i + batch]
+            for i in range(0, len(jobs), batch):
+                chunk = jobs[i : i + batch]
                 try:
-                    vecs = await self._embed([self._embed_text(r["descr"]) for r in chunk])
+                    vecs = await self._embed([t for _, _, t in chunk])
                 except VisionError as e:
                     fail += len(chunk)
                     logger.warning(f"[tg_presence] 转向量失败：{e}")
@@ -3664,19 +3854,23 @@ class TgPresence(Star):
                 if not vecs or len(vecs) != len(chunk):
                     fail += len(chunk)
                     continue
-                db.executemany(
-                    "UPDATE photos SET vec = ? WHERE id = ?",
-                    [(self._vec_pack(v), r["id"]) for v, r in zip(vecs, chunk)],
-                )
+                # 同一批里可能混着不同的列，按列分组写回
+                by_col: dict[str, list] = {}
+                for (rid, col, _), v in zip(chunk, vecs):
+                    by_col.setdefault(col, []).append((self._vec_pack(v), rid))
+                for col, pairs in by_col.items():
+                    db.executemany(
+                        f"UPDATE photos SET {col} = ? WHERE id = ?", pairs
+                    )
                 db.commit()
                 ok += len(chunk)
-            self._vec_cache = None  # 有新向量，下次检索重建内存矩阵
+            self._vec_cache.clear()  # 有新向量，下次检索重建内存矩阵
             left = db.execute(
                 "SELECT COUNT(*) c FROM photos WHERE descr IS NOT NULL AND vec IS NULL"
             ).fetchone()["c"]
             yield event.plain_result(
-                f"完成 {ok} 条" + (f"，失败 {fail} 条" if fail else "")
-                + f"。还剩 {left} 条"
+                f"完成 {ok} 条文本" + (f"，失败 {fail} 条" if fail else "")
+                + f"。还剩 {left} 张图"
                 + ("，再发一次 /gallery embed 继续。" if left else "，全部转完。")
             )
             return
@@ -3751,12 +3945,12 @@ class TgPresence(Star):
                 return
 
             db.executemany(
-                "UPDATE photos SET descr = NULL, vec = NULL, tag_state = NULL, "
+                f"UPDATE photos SET descr = NULL, {VEC_NULLS}, tag_state = NULL, "
                 "tag_issues = NULL, fails = 0 WHERE id = ?",
                 [(i,) for i, _, _ in bad],
             )
             db.commit()
-            self._vec_cache = None
+            self._vec_cache.clear()
             yield event.plain_result(
                 f"清掉 {len(bad)} 条，已退回待索引。\n"
                 f"先确认视觉配置改好了（Gemini 记得设安全阈值），再 /gallery index auto 重跑。"
@@ -3766,11 +3960,11 @@ class TgPresence(Star):
         if action == "redo":
             db = self.db()
             n = db.execute(
-                "UPDATE photos SET descr = NULL, vec = NULL, tag_state = NULL, "
+                f"UPDATE photos SET descr = NULL, {VEC_NULLS}, tag_state = NULL, "
                 "tag_issues = NULL, fails = 0 WHERE tag_state = '段数不齐'"
             ).rowcount
             db.commit()
-            self._vec_cache = None
+            self._vec_cache.clear()
             yield event.plain_result(
                 f"已把 {n} 张标签有结构问题的图退回待索引，/gallery index 重跑。"
                 if n
@@ -3833,19 +4027,28 @@ class TgPresence(Star):
             # 实际走的路径。只测关键词那条路的话，向量有没有生效根本看不出来
             pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
             rows = await self._recall(rest, "", "", pool)
+            # 显示实际参与匹配的词表：整词落空被拆成单字的话，这里和
+            # 原始切词不一样，不显示出来就会对着「桌上」猜半天
+            raw_words = self._split_query(rest)
+            words = self._rescue_dead(raw_words)
             if not rows:
                 yield event.plain_result(
-                    "没找到。\n切词：" + " / ".join(self._split_query(rest))
+                    "没找到。\n切词：" + " / ".join(raw_words)
+                    + ("\n实际用：" + " / ".join(words) if words != raw_words else "")
                 )
                 return
 
             vw = float(self.conf.get("vector_weight", 0.4) or 0)
             n_kw = sum(1 for r in rows if (r.get("kw_score") or 0) > 0)
             n_vec = sum(1 for r in rows if r.get("sim_score") is not None)
-            head = [
-                "切词：" + " / ".join(self._split_query(rest)),
-                f"候选 {len(rows)} 张（词面命中 {n_kw} · 语义召回 {n_vec}）",
-            ]
+            head = ["切词：" + " / ".join(raw_words)]
+            if words != raw_words:
+                dropped = [w for w in raw_words if w not in words]
+                head.append(
+                    "实际用：" + " / ".join(words)
+                    + (f"（{'、'.join(dropped)} 一张都没匹配上，已拆成单字）" if dropped else "")
+                )
+            head.append(f"候选 {len(rows)} 张（词面命中 {n_kw} · 语义召回 {n_vec}）")
             if vw <= 0:
                 head.append("⚠ 语义权重是 0，向量路没启用")
             elif not n_vec:
@@ -3857,10 +4060,15 @@ class TgPresence(Star):
                 kw, sim = r.get("kw_score") or 0, r.get("sim_score")
                 mark = "词+义" if kw > 0 and sim is not None else ("义" if sim is not None else "词 ")
                 detail = f"词{kw:.2f}" + (f" 义{sim:.2f}" if sim is not None else "")
+                # 到底哪几个词中了——不列出来就分不清「桌上」真命中了，
+                # 还是只是单字「桌」蹭到了「桌面」
+                hit = [w for w in words if w in (r["descr"] or "")]
                 # 描述本身是多行的，不压平的话十条结果会散成几十行糊在一起
-                snippet = " ".join((r["descr"] or "").split())[:50]
+                snippet = " ".join((r["descr"] or "").split())[:44]
                 lines.append(
-                    f"g{r['id']} {r['score']:.3f} [{mark}] {detail}\n   {snippet}"
+                    f"g{r['id']} {r['score']:.3f} [{mark}] {detail}"
+                    + (f" ⟨{' '.join(hit)}⟩" if hit else "")
+                    + f"\n   {snippet}"
                 )
             yield event.plain_result("\n".join(head + lines))
             return
