@@ -215,8 +215,15 @@ CONSOLE_ROUTES = {
     "link": "cmd_link",
     "say": "cmd_say",
     "act": "cmd_act",
+    "photo": "cmd_photo",
+    "moment": "cmd_moment",
+    "avatar": "cmd_avatar",
+    "signature": "cmd_signature",
     "whoami": "cmd_whoami",
 }
+# 这几条得以角色的身份去调 Telegram（发图、发频道、换头像、改签名），
+# 在控制台执行时要借用目标会话那个 bot 的 client
+CONSOLE_AS_TARGET = {"photo", "moment", "avatar", "signature"}
 # 注册到 Telegram 的指令菜单，输入 / 就能看见。顺序即菜单顺序，
 # 按「先绑谁、再让她说什么、最后管相册」排
 CONSOLE_MENU = [
@@ -224,7 +231,11 @@ CONSOLE_MENU = [
     ("link", "绑定目标会话 · /link UMO"),
     ("say", "让她原样说一句 · /say 内容"),
     ("act", "给个方向，她自己组织语言 · /act 方向"),
+    ("photo", "以她的身份发张照片 · /photo g123 [附言]"),
     ("proactive", "主动消息状态 · /proactive now 立即发"),
+    ("moment", "让她发条动态到频道 · /moment [内容]"),
+    ("avatar", "给她换个头像 · /avatar [分类]"),
+    ("signature", "改她的签名 · /signature 内容"),
     ("gallery", "相册 · index auto / search 词 / show / embed"),
     ("vision", "视觉 API 配置诊断"),
     ("presence", "插件状态：动态、冷却、图片存档"),
@@ -243,13 +254,20 @@ class ConsoleEvent:
     双入口，这里补一个最小实现：接住 plain_result、报出发送者身份。
     role 直接给 admin —— 能走到这儿说明已经过了白名单，控制台本来就是
     你一个人的。
+
+    发照片、换头像这类要以角色身份调 Telegram 的指令，构造时把目标会话
+    的 umo 和它那个 bot 的 client 传进来，_client() 和 _chat_id() 就都
+    对得上了——它们看的正是这两样。
     """
 
-    def __init__(self, uid: str, chat_id):
-        self.unified_msg_origin = f"console:FriendMessage:{chat_id}"
+    def __init__(self, uid: str, chat_id, umo: str = "", client=None):
+        self._console_umo = f"console:FriendMessage:{chat_id}"
+        self.unified_msg_origin = umo or self._console_umo
+        self.client = client
         self.role = "admin"
         self.replies: list[str] = []
         self._uid = str(uid)
+        self._as_target = bool(umo)
 
     def plain_result(self, text: str) -> str:
         if text:
@@ -260,7 +278,8 @@ class ConsoleEvent:
         return self._uid
 
     def get_platform_name(self) -> str:
-        return "console"
+        # 借角色身份执行时要报 telegram，否则 _client() 直接返回 None
+        return "telegram" if self._as_target else "console"
 
     def should_call_llm(self, _flag: bool) -> None:
         """控制台不经过 AstrBot 管线，没有"要不要丢给 LLM"这回事。"""
@@ -1314,6 +1333,31 @@ class TgPresence(Star):
         if event.get_platform_name() != "telegram":
             return None
         return getattr(event, "client", None)
+
+    def _platform_client(self, umo: str):
+        """按 UMO 第一段找到那个平台实例的底层 client。
+
+        控制台是插件自己的 bot，手上没有角色那个 bot 的 client——
+        而发照片、发频道动态、换头像、改签名都得以角色的身份去调
+        Telegram。适配器把 ExtBot 挂在自己的 client 属性上，
+        从平台管理器按 meta().id 找到实例就能拿到。
+        """
+        name = self._umo_platform(umo)
+        pm = getattr(self.context, "platform_manager", None)
+        if not name or pm is None:
+            return None
+        try:
+            for inst in pm.get_insts() or []:
+                meta = inst.meta()
+                if getattr(meta, "id", None) != name:
+                    continue
+                if getattr(meta, "name", "") != "telegram":
+                    logger.warning(f"[tg_presence] {name} 不是 telegram 平台，用不了")
+                    return None
+                return getattr(inst, "client", None)
+        except Exception as e:
+            logger.warning(f"[tg_presence] 找平台实例 {name} 失败：{e}")
+        return None
 
     def _chat_id(self, event: AstrMessageEvent):
         """当前会话的 telegram chat_id。适配器用 chat.id 作为 session_id。"""
@@ -4057,7 +4101,26 @@ class TgPresence(Star):
             return
 
         func = getattr(self, handler)
-        ev = ConsoleEvent(uid, chat_id)
+        if name in CONSOLE_AS_TARGET:
+            target = (self.state.get("director_target") or "").strip()
+            if not target:
+                await self._console_say(
+                    chat_id,
+                    f"/{name} 要以角色的身份执行，得先知道是哪个角色。\n"
+                    "/umo 看有哪些会话，/link 绑一个。",
+                )
+                return
+            client = self._platform_client(target)
+            if client is None:
+                await self._console_say(
+                    chat_id,
+                    f"找不到 {self._umo_platform(target)} 这个 bot 的连接。\n"
+                    "它在 AstrBot 平台配置里还开着吗？只有 telegram 平台支持这条指令。",
+                )
+                return
+            ev = ConsoleEvent(uid, chat_id, umo=target, client=client)
+        else:
+            ev = ConsoleEvent(uid, chat_id)
         try:
             args, kwargs = self._bind_args(func, rest)
             async for _ in func(ev, *args, **kwargs):
