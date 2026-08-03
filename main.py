@@ -364,6 +364,7 @@ CMD_HELP: dict[str, tuple[str, list[tuple[str, str]], str]] = {
         ("/gallery embed test", "探一下向量模型对露骨文本还有没有区分度"),
         ("/gallery embed redo", "清空全部向量重建（换了模型或维度时用）"),
         ("/gallery search 黑丝 车里", "测检索效果，看词面和语义各命中多少"),
+        ("/gallery g123", "把这张图调出来看（原图模式，不记发送次数）"),
         ("/gallery show g123", "看某张的完整描述；不带编号则随机抽一张"),
         ("/gallery audit", "看关键词行的质量分布"),
         ("/gallery clean", "揪出拒答、思维链、过短的脏描述"),
@@ -1776,35 +1777,35 @@ class TgPresence(Star):
 
     @staticmethod
     def _help_text(name: str) -> str:
-        """渲染一条指令的详细用法。用法本身用代码块包住，能直接复制。"""
+        """渲染一条指令的详细用法。
+
+        只用单反引号包指令本身，不用三反引号的代码块——这条链路没开
+        Markdown 解析，三反引号会原样显示成三个点号。也不靠空格对齐：
+        反引号渲染与否会让每行宽度变，对齐反而更乱。
+        """
         if name not in CMD_HELP:
-            return f"没有 /{name} 这条指令。`/help` 看全部。"
+            return f"没有 `/{name}` 这条指令。发 `/help` 看全部。"
         brief, rows, tip = CMD_HELP[name]
-        width = max(len(u) for u, _ in rows)
-        body = "\n".join(f"{u:<{width}}  {d}" for u, d in rows)
-        out = f"/{name} — {brief}\n\n```\n{body}\n```"
-        return out + (f"\n{tip}" if tip else "")
+        body = "\n".join(f"`{u}`\n    {d}" for u, d in rows)
+        return f"/{name} — {brief}\n\n{body}" + (f"\n\n{tip}" if tip else "")
 
     @staticmethod
     def _help_all() -> str:
         """所有指令一览，按控制台菜单的顺序排。"""
         order = [n for n, _ in CONSOLE_MENU if n in CMD_HELP]
         order += [n for n in CMD_HELP if n not in order]
-        width = max(len(n) for n in order) + 1
-        body = "\n".join(f"/{n:<{width}} {CMD_HELP[n][0]}" for n in order)
+        body = "\n".join(f"`/{n}` — {CMD_HELP[n][0]}" for n in order)
         return (
-            "全部指令：\n\n```\n" + body + "\n```\n"
-            "单条的详细用法：`/指令 x`，例如 `/gallery x`\n\n"
-            "第一次用，照这个顺序：\n\n"
-            "```\n"
-            "`/whoami`              确认插件认得你\n"
-            "`/umo`                 列出会话\n"
-            "`/link` <上面的UMO>    绑定目标\n"
-            "`/vision test`         确认视觉 API 通\n"
-            "`/gallery scan`        扫图库\n"
-            "`/gallery index auto`  建索引，睡前开跑\n"
-            "`/gallery embed auto`  转向量\n"
-            "```"
+            "全部指令\n\n" + body + "\n\n"
+            "单条的详细用法加个 x，例如 `/gallery x`\n\n"
+            "第一次用照这个顺序：\n"
+            "`/whoami` 确认插件认得你\n"
+            "`/umo` 列出会话\n"
+            "`/link 上面挑的UMO` 绑定目标\n"
+            "`/vision test` 确认视觉 API 通\n"
+            "`/gallery scan` 扫图库\n"
+            "`/gallery index auto` 建索引，睡前开跑\n"
+            "`/gallery embed auto` 转向量"
         )
 
     def _client(self, event: AstrMessageEvent):
@@ -3600,6 +3601,44 @@ class TgPresence(Star):
         """
         return await self._do_send_photo(event, photo_id, caption)
 
+    async def _show_photo(self, event, row, path: Path) -> str:
+        """把某张图发出来给自己看。返回空串表示成功，否则是错误说明。
+
+        跟 _do_send_photo 划清界限：那是角色发给对方的，要记 sent 计数、
+        要写进她的历史；这条纯粹是自己核对，两样都不动，免得污染
+        「发过没发过」的排序和她的记忆。
+        """
+        tag = self._tag_line(row["descr"] or "")
+        cap = "\n".join(x for x in (
+            f"g{row['id']} · {path.name}",
+            f"[{self._folder_label(row['folder']) or '根目录'}]"
+            + (f" · {row['rating']}" if row["rating"] else "")
+            + (f" · 发过 {row['sent']} 次" if row["sent"] else ""),
+            tag[:600] if tag else "",
+        ) if x)[:CAPTION_MAX]
+
+        # 控制台里执行时，用控制台自己那个 bot 发回控制台
+        umo = getattr(event, "_console_umo", "")
+        if umo.startswith("console:"):
+            chat = umo.rsplit(":", 1)[-1]
+            ok = await self._tg_upload(
+                "sendPhoto", "photo", path, chat_id=chat, caption=cap
+            )
+            return "" if ok else "控制台发不出这张图，看日志。"
+
+        client = self._client(event)
+        if client is None:
+            return "这个平台发不了照片。"
+        try:
+            with open(path, "rb") as fp:
+                await client.send_photo(
+                    chat_id=self._chat_id(event), photo=fp, caption=cap
+                )
+        except Exception as e:
+            logger.error(f"[tg_presence] 调图失败 {path}: {e}")
+            return f"没发出去：{e}"
+        return ""
+
     async def _do_send_photo(
         self, event: AstrMessageEvent, photo_id: str, caption: str = ""
     ) -> str:
@@ -4824,6 +4863,46 @@ class TgPresence(Star):
             logger.debug(f"[tg_presence] 取对话对象失败 {umo}: {e}")
             return None
 
+    async def _list_umo(self, kw: str = "", with_skipped: bool = False):
+        """列出所有会话，按 UMO 归并、最近活跃在前。
+
+        /umo 和 /link 都要这份清单——link 不带参数时直接把可绑的会话
+        摆出来，省得再让人跑一趟 /umo 再复制粘贴。
+        """
+        cm = getattr(self.context, "conversation_manager", None)
+        if cm is None or not hasattr(cm, "get_filtered_conversations"):
+            return ([], 0) if with_skipped else []
+        try:
+            convs, _total = await cm.get_filtered_conversations(
+                page=1, page_size=60, search_query=(kw or "").strip(),
+                include_history=False,
+            )
+        except Exception as e:
+            logger.error(f"[tg_presence] 列会话失败：{e}")
+            return ([], 0) if with_skipped else []
+
+        did = self._director_id()
+        # 同一个会话可能有多个对话（AstrBot 支持一个会话开多轮），
+        # 这里只关心 UMO，按会话归并，取最近活跃的那条
+        seen: dict[str, dict] = {}
+        skipped = 0
+        for c in convs or []:
+            umo = getattr(c, "user_id", "") or ""
+            if not umo:
+                continue
+            # 控制台自己的会话不列——绑它没意义，只会挤占列表
+            if self._umo_platform(umo) in ("console", did or "\0"):
+                skipped += 1
+                continue
+            ts = int(getattr(c, "updated_at", 0) or 0)
+            got = seen.setdefault(umo, {"ts": 0, "n": 0, "title": ""})
+            got["n"] += 1
+            if ts >= got["ts"]:
+                got["ts"] = ts
+                got["title"] = (getattr(c, "title", "") or "").strip()
+        rows = sorted(seen.items(), key=lambda kv: -kv[1]["ts"])
+        return (rows, skipped) if with_skipped else rows
+
     @filter.command("umo")
     async def cmd_umo(self, event: AstrMessageEvent, arg: str = ""):
         """列出所有会话的 UMO，用来挑一个 /link 绑上。用法：/umo [关键词]"""
@@ -4861,28 +4940,8 @@ class TgPresence(Star):
             return
 
         cur = (self.state.get("director_target") or "").strip()
-        did = self._director_id()
         tz = self._tz()
-        # 同一个会话可能有多个对话（AstrBot 支持一个会话开多轮），
-        # 这里只关心 UMO，按会话归并，取最近活跃的那条
-        seen: dict[str, dict] = {}
-        skipped = 0
-        for c in convs:
-            umo = getattr(c, "user_id", "") or ""
-            if not umo:
-                continue
-            # 控制台自己的会话不列——绑它没意义，只会挤占列表
-            if self._umo_platform(umo) in ("console", did or "\0"):
-                skipped += 1
-                continue
-            ts = int(getattr(c, "updated_at", 0) or 0)
-            got = seen.setdefault(umo, {"ts": 0, "n": 0, "title": ""})
-            got["n"] += 1
-            if ts >= got["ts"]:
-                got["ts"] = ts
-                got["title"] = (getattr(c, "title", "") or "").strip()
-
-        rows = sorted(seen.items(), key=lambda kv: -kv[1]["ts"])
+        rows, skipped = await self._list_umo(kw, with_skipped=True)
         if not rows:
             yield event.plain_result(
                 "除了控制台自己，没有别的会话。\n"
@@ -4943,13 +5002,22 @@ class TgPresence(Star):
                 lines.append(
                     f"人格：    {'读到 ' + str(len(persona)) + ' 字' if persona else '⚠️ 没读到，`/act` 会不像她'}"
                 )
+            rows = await self._list_umo()
+            if rows:
+                lines.append("")
+                lines.append(f"能绑的会话（{len(rows)} 个，按最近活跃排）：")
+                for umo, info in rows[:8]:
+                    mark = " ← 当前" if umo == cur else ""
+                    title = info["title"] or "（无标题）"
+                    lines.append(f"  {title}{mark}")
+                    lines.append(f"  `/link {umo}`")
+                if len(rows) > 8:
+                    lines.append(f"  …还有 {len(rows) - 8} 个，`/umo` 看全部")
+            else:
+                lines += ["", "没找到可绑的会话。先在角色那边正常聊一句，对话才会建起来。"]
             lines += [
                 "",
-                "`/umo`          列出所有会话，从里面挑一个",
-                # 别用尖括号占位：Telegram 按 HTML 解析，<UMO> 会被当成标签整段吃掉
-                "`/link` 目标UMO  绑上它",
-                "",
-                "多个角色就靠这两条来回切：绑谁，`/say` 和 `/act` 就发给谁。",
+                "多个角色就靠这条来回切：绑谁，`/say` 和 `/act` 就发给谁。",
             ]
             yield event.plain_result("\n".join(lines))
             return
@@ -5038,6 +5106,39 @@ class TgPresence(Star):
             return data.get("result")
         except asyncio.TimeoutError:
             return None
+        except Exception as e:
+            logger.warning(f"[tg_presence] 控制台 {method} 出错：{e}")
+            return None
+
+    async def _tg_upload(self, method: str, field: str, path: Path,
+                         timeout: int = 60, **params):
+        """带文件的 Bot API 调用。_tg_api 走 JSON，传不了本地文件。
+
+        文件对象必须在整个请求期间保持打开，所以 open 包在 with 外层，
+        不能先读进内存再发——几 MB 的原图不值得整份复制一遍。
+        """
+        token = (self.conf.get("console_token") or "").strip()
+        if not token:
+            return None
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        try:
+            with open(path, "rb") as fp:
+                form = aiohttp.FormData()
+                for k, v in params.items():
+                    if v is not None:
+                        form.add_field(k, str(v))
+                form.add_field(field, fp, filename=path.name)
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as sess:
+                    async with sess.post(url, data=form) as r:
+                        data = await r.json()
+            if not data.get("ok"):
+                logger.warning(
+                    f"[tg_presence] 控制台 {method} 失败：{data.get('description')}"
+                )
+                return None
+            return data.get("result")
         except Exception as e:
             logger.warning(f"[tg_presence] 控制台 {method} 出错：{e}")
             return None
@@ -5495,6 +5596,27 @@ class TgPresence(Star):
             elif self._vec_left():
                 lines.append(f"\n还有 {self._vec_left()} 张没转向量，`/gallery embed auto`。")
             yield event.plain_result("\n".join(lines))
+            return
+
+        if re.fullmatch(r"g?\d+", action):
+            pid = int(action.lstrip("gG"))
+            row = self.db().execute(
+                "SELECT * FROM photos WHERE id = ?", (pid,)
+            ).fetchone()
+            if row is None:
+                yield event.plain_result(f"库里没有 g{pid}。")
+                return
+            path = self._photo_file(row)
+            if not path:
+                yield event.plain_result(
+                    f"g{pid} 的文件不在了：{row['path']}\n"
+                    "`/gallery scan prune` 可以清掉这类失效记录。"
+                )
+                return
+            if err := await self._show_photo(event, row, path):
+                yield event.plain_result(err)
+            elif not row["descr"]:
+                yield event.plain_result(f"g{pid} 还没索引，只有图没有描述。")
             return
 
         if action == "scan":
