@@ -221,6 +221,12 @@
             "default": 1800,
             "hint": "超出会截断，但**结尾的标签行一定保留**——那一行口语词最密集（黑丝、细高跟、M腿），丢了等于把语义检索最该抓住的东西扔掉。注意模型的输入上限：gemini-embedding-001 只有 2048 token（约 1300 汉字），gemini-embedding-2 有 8192。描述加标签通常 1200~1500 字，用 001 的话这里要调到 1200 以下。"
           },
+          "embed_auto_batch": {
+            "description": "后台转向量每批张数",
+            "type": "int",
+            "default": 200,
+            "hint": "/gallery embed auto 每轮取几张图。一张图切成四段，所以实际发出的文本条数是这个值的四倍左右，再按下面的「向量批大小」分批。这里只决定多久汇总一次进度、落一次库。"
+          },
           "embed_batch": {
             "description": "向量批量条数",
             "type": "int",

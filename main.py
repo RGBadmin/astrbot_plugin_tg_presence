@@ -309,6 +309,7 @@ TWITTER_EPOCH_MS = 1288834974657  # 2010-11-04，snowflake 的起点
 # 角色那个 bot 的身份去调 Telegram（发图、改头像、改签名），控制台拿不到
 # 它的 client，那四条继续在角色的会话里发
 CONSOLE_ROUTES = {
+    "help": "cmd_help",
     "gallery": "cmd_gallery",
     "vision": "cmd_vision",
     "presence": "cmd_presence",
@@ -342,7 +343,83 @@ CONSOLE_MENU = [
     ("vision", "视觉 API 配置诊断"),
     ("presence", "插件状态：动态、冷却、图片存档"),
     ("whoami", "这个会话里你是谁"),
+    ("help", "所有指令一览 · 单条用法看 /指令 x"),
 ]
+
+# 每条指令的详细用法。任何指令加 x 参数都会显示对应的这一段，
+# /help 汇总所有条目的首行。
+# 结构：(一句话说明, [(用法, 解释), ...], 提示)
+CMD_HELP: dict[str, tuple[str, list[tuple[str, str]], str]] = {
+    "gallery": ("管理相册索引", [
+        ("/gallery", "看总览：登记多少、索引多少、分级分布、向量进度"),
+        ("/gallery scan", "扫目录，把新图登记进库。加了新图先跑这个"),
+        ("/gallery index 50", "索引 50 张，跑完就回结果，适合试水"),
+        ("/gallery index auto", "后台跑到全部完成，每隔一阵报进度"),
+        ("/gallery index stop", "停掉后台索引，进度不丢"),
+        ("/gallery embed", "把描述转成语义向量，一次转 1000 张"),
+        ("/gallery embed auto", "后台转到全部完成"),
+        ("/gallery embed stop", "停掉后台转换"),
+        ("/gallery embed test", "探一下向量模型对露骨文本还有没有区分度"),
+        ("/gallery embed redo", "清空全部向量重建（换了模型或维度时用）"),
+        ("/gallery search 黑丝 车里", "测检索效果，看词面和语义各命中多少"),
+        ("/gallery show g123", "看某张的完整描述；不带编号则随机抽一张"),
+        ("/gallery audit", "看关键词行的质量分布"),
+        ("/gallery clean", "揪出拒答、思维链、过短的脏描述"),
+        ("/gallery redo", "把关键词不合格的退回重跑"),
+        ("/gallery retry", "失败计数清零，让跳过的图重新排队"),
+        ("/gallery polish", "清洗存量描述：删硬拼的长标签、泛称改成角色名"),
+    ], "第一次用的顺序：`/gallery scan` → `/gallery index auto` → `/gallery embed auto`"),
+    "vision": ("视觉 API 诊断与补做解析", [
+        ("/vision", "看配置齐不齐、还有多少张没解析"),
+        ("/vision test", "拿一张真图试跑，看接口通不通、描述像不像样"),
+        ("/vision 20", "给上下文里 20 张还没描述的图补做解析"),
+        ("/vision retry", "把失败计数清零重来"),
+    ], "图库的解析走 `/gallery index auto`，这条只管上下文里的图"),
+    "presence": ("插件状态总览", [
+        ("/presence", "已发动态数、各项冷却剩余、图片存档量"),
+    ], ""),
+    "whoami": ("看这个会话里你是谁", [
+        ("/whoami", "回显你的 ID、会话 UMO、插件认不认你是管理员"),
+    ], "指令没反应时先跑这个，多半是管理员 ID 没对上"),
+    "umo": ("列出所有会话的 UMO", [
+        ("/umo", "列出全部活跃会话"),
+        ("/umo 桃桃", "只列名字里带「桃桃」的"),
+    ], "拿到 UMO 之后用 `/link` 绑定"),
+    "link": ("绑定投递目标", [
+        ("/link show", "看当前绑的是哪个会话"),
+        ("/link telegram:...", "绑到这个会话，之后 /say /act 都发到这儿"),
+    ], "一个控制台来回切换，就能管多个角色"),
+    "say": ("让她原样说一句", [
+        ("/say 我到家了", "一字不改地发出去"),
+    ], "要她自己组织语言用 `/act`"),
+    "act": ("给个方向，她自己组织语言", [
+        ("/act 跟他说你今天加班到很晚", "按这个方向说"),
+        ("/act", "不给方向，她自己想说什么就说什么"),
+    ], "发出去的内容会进她的上下文，她记得自己说过"),
+    "photo": ("以她的身份发张照片", [
+        ("/photo g123", "发指定的那张"),
+        ("/photo g123 今天穿这个", "带一句附言"),
+        ("/photo", "让她自己挑一张、自己配话"),
+    ], "编号用 `/gallery search` 或 `/gallery show` 找"),
+    "moment": ("让她发条动态到频道", [
+        ("/moment 今天天气真好", "发这条内容"),
+        ("/moment", "让她自己想发什么"),
+    ], ""),
+    "avatar": ("给她换个头像", [
+        ("/avatar", "让她自己挑"),
+        ("/avatar 自拍", "从这个分类里挑"),
+    ], "换头像有冷却，看 `/presence`"),
+    "signature": ("改她的个性签名", [
+        ("/signature 想你了", "改成这句"),
+        ("/signature", "让她自己想一句"),
+    ], ""),
+    "proactive": ("主动消息", [
+        ("/proactive", "看倒计时还剩多久、已经攒了几次没回"),
+        ("/proactive now", "不等了，立刻发一条"),
+    ], "她会在你说话后重新摇一个随机倒计时"),
+}
+HELP_FLAGS = {"x", "?", "help", "帮助", "用法"}
+
 # 九宫格的逐格描述。挑图时它们没有判别力——十张图开头都是「左上：白色墙面」
 GRID_RE = re.compile(r"^(左上|中上|右上|左中|正中|右中|左下|中下|右下)\s*[：:]")
 # 描述一变，所有分段向量都得作废，不能只清主向量
@@ -424,6 +501,8 @@ class VisionError(Exception):
 class TgPresence(Star):
     # 类级默认值，给 __init__ 之外的路径兜底（热重载、只造壳不初始化）。
     # 它们只是计数和留痕，读到 0 比抛 AttributeError 强得多
+    _index_task = None
+    _embed_task = None
     _api_calls = 0
     _api_blocked = 0
     _last_fail = ""
@@ -458,6 +537,7 @@ class TgPresence(Star):
         self._api_blocked: int = 0
         # /gallery index auto 的后台任务，一次只允许有一个
         self._index_task: asyncio.Task | None = None
+        self._embed_task: asyncio.Task | None = None
         self._index_note: str = ""
         # 主动消息的倒计时循环。懒启动——__init__ 时还不一定有事件循环
         self._proactive_task: asyncio.Task | None = None
@@ -542,10 +622,12 @@ class TgPresence(Star):
 
     async def terminate(self):
         """插件卸载或热重载时收尾，别把数据库句柄漏掉。"""
-        for task in (self._index_task, self._proactive_task, self._console_task):
+        for task in (self._index_task, self._embed_task,
+                     self._proactive_task, self._console_task):
             if task and not task.done():
                 task.cancel()  # 后台任务跟着插件一起走
-        self._index_task = self._proactive_task = self._console_task = None
+        self._index_task = self._embed_task = None
+        self._proactive_task = self._console_task = None
         if self._db is not None:
             try:
                 self._db.commit()
@@ -1325,7 +1407,7 @@ class TgPresence(Star):
         try:
             mat = mat.reshape(len(ids), dim)
         except ValueError:
-            logger.error("[tg_presence] 向量维度不一致，可能换过模型；请 /gallery embed redo")
+            logger.error("[tg_presence] 向量维度不一致，可能换过模型；请 `/gallery embed redo`")
             self._vec_cache[col] = ([], None)
             return self._vec_cache[col]
         logger.info(
@@ -1654,6 +1736,48 @@ class TgPresence(Star):
         should_call_llm 的语义是反的 —— 传 True 才是禁止。
         """
         event.should_call_llm(True)
+
+    @staticmethod
+    def _wants_help(*args: str) -> bool:
+        """任何一个参数是 x / ? / help 就当成「看用法」。
+
+        放在每条指令的开头，比给每条单独写一遍帮助分支省事，
+        也保证了所有指令的用法入口长得一样。
+        """
+        return any((a or "").strip().lower() in HELP_FLAGS for a in args)
+
+    @staticmethod
+    def _help_text(name: str) -> str:
+        """渲染一条指令的详细用法。用法本身用代码块包住，能直接复制。"""
+        if name not in CMD_HELP:
+            return f"没有 /{name} 这条指令。`/help` 看全部。"
+        brief, rows, tip = CMD_HELP[name]
+        width = max(len(u) for u, _ in rows)
+        body = "\n".join(f"{u:<{width}}  {d}" for u, d in rows)
+        out = f"/{name} — {brief}\n\n```\n{body}\n```"
+        return out + (f"\n{tip}" if tip else "")
+
+    @staticmethod
+    def _help_all() -> str:
+        """所有指令一览，按控制台菜单的顺序排。"""
+        order = [n for n, _ in CONSOLE_MENU if n in CMD_HELP]
+        order += [n for n in CMD_HELP if n not in order]
+        width = max(len(n) for n in order) + 1
+        body = "\n".join(f"/{n:<{width}} {CMD_HELP[n][0]}" for n in order)
+        return (
+            "全部指令：\n\n```\n" + body + "\n```\n"
+            "单条的详细用法：`/指令 x`，例如 `/gallery x`\n\n"
+            "第一次用，照这个顺序：\n\n"
+            "```\n"
+            "`/whoami`              确认插件认得你\n"
+            "`/umo`                 列出会话\n"
+            "`/link` <上面的UMO>    绑定目标\n"
+            "`/vision test`         确认视觉 API 通\n"
+            "`/gallery scan`        扫图库\n"
+            "`/gallery index auto`  建索引，睡前开跑\n"
+            "`/gallery embed auto`  转向量\n"
+            "```"
+        )
 
     def _client(self, event: AstrMessageEvent):
         """拿底层 telegram ExtBot。telegram 适配器把它挂在 event.client 上。"""
@@ -2820,6 +2944,139 @@ class TgPresence(Star):
             logger.info(f"[tg_presence] 本批 {len(rows)} 张，{note}")
         return sum(1 for x in results if x is True), len(rows), note
 
+    async def _embed_once(self, todo: int) -> dict:
+        """转一批向量。返回这批的统计，不打印、不发消息。
+
+        一次性指令和后台循环共用这一段——两边各写一遍的话，改了限流
+        策略只改一处、另一处悄悄跑着老逻辑，这种 bug 最难发现。
+        """
+        db = self.db()
+        rows = db.execute(
+            "SELECT id, descr FROM photos "
+            "WHERE descr IS NOT NULL AND vec IS NULL ORDER BY id LIMIT ?",
+            (todo,),
+        ).fetchall()
+        if not rows:
+            return {"pics": 0, "ok": 0, "fail": 0, "jobs": 0, "segs": 0, "err": ""}
+
+        # 一张图要转好几段，按「文本条数」分批而不是按图片张数，
+        # 否则批大小填 32 实际会一次发一百多条上去
+        jobs: list[tuple[int, str, str]] = []
+        for r in rows:
+            jobs.append((r["id"], "vec", self._embed_text(r["descr"])))
+            for col, txt in self._desc_segments(r["descr"]).items():
+                jobs.append((r["id"], col, self._embed_text(txt)))
+
+        batch = max(1, min(int(self.conf.get("embed_batch", 32) or 32), 256))
+        ok = fail = dry = 0
+        err = ""
+        for i in range(0, len(jobs), batch):
+            chunk = jobs[i : i + batch]
+            try:
+                vecs = await self._embed_retry([t for _, _, t in chunk])
+            except VisionError as e:
+                fail += len(chunk)
+                err = err or str(e)
+                logger.warning(f"[tg_presence] 转向量失败：{e}")
+                if e.fatal:
+                    break
+                dry += 1
+                if dry >= 3:  # 连着三批都挂，别再空转
+                    break
+                continue
+            dry = 0
+            if not vecs or len(vecs) != len(chunk):
+                fail += len(chunk)
+                err = err or "接口返回的条数和送进去的对不上"
+                continue
+            # 同一批里可能混着不同的列，按列分组写回
+            by_col: dict[str, list] = {}
+            for (rid, col, _), v in zip(chunk, vecs):
+                by_col.setdefault(col, []).append((self._vec_pack(v), rid))
+            for col, pairs in by_col.items():
+                db.executemany(f"UPDATE photos SET {col} = ? WHERE id = ?", pairs)
+            db.commit()
+            ok += len(chunk)
+        self._vec_cache.clear()  # 有新向量，下次检索重建内存矩阵
+        return {"pics": len(rows), "ok": ok, "fail": fail,
+                "jobs": len(jobs), "segs": len(jobs) - len(rows), "err": err}
+
+    def _vec_left(self) -> int:
+        return self.db().execute(
+            "SELECT COUNT(*) c FROM photos WHERE descr IS NOT NULL AND vec IS NULL"
+        ).fetchone()["c"]
+
+    async def _embed_loop(self, umo: str) -> None:
+        """后台把向量全部转完。跟索引那条循环一个套路。
+
+        向量接口比视觉接口更容易撞限流——分段之后请求数翻四倍，而这类
+        接口常按文本条数算配额。所以一批全挂不立刻放弃，拉长间隔守着。
+        """
+        from astrbot.core.message.message_event_result import MessageChain
+
+        batch = max(1, min(int(self.conf.get("embed_auto_batch", 200) or 200), 2000))
+        gap = max(60, int(self.conf.get("index_report_gap", 600) or 600))
+        max_dry = max(1, int(self.conf.get("index_max_dry", 12) or 12))
+        started = last_report = time.time()
+        done = dry = 0
+
+        async def say(text: str) -> None:
+            try:
+                await self.context.send_message(umo, MessageChain().message(text))
+            except Exception as e:
+                logger.warning(f"[tg_presence] 转向量进度回报失败：{e}")
+
+        try:
+            while True:
+                r = await self._embed_once(batch)
+                if r["pics"] == 0:
+                    total = self.db().execute(
+                        "SELECT COUNT(*) c FROM photos WHERE vec IS NOT NULL"
+                    ).fetchone()["c"]
+                    await say(
+                        f"✅ 向量全部转完，用时 {self._dur(time.time() - started)}。\n"
+                        f"本次新增 {done} 张，全库共 {total} 条向量。\n"
+                        "可以 `/gallery search` 试试语义检索了。"
+                    )
+                    return
+
+                done += r["ok"] and r["pics"] or 0
+                if r["ok"]:
+                    dry = 0
+                else:
+                    dry += 1
+                    if dry >= max_dry:
+                        await say(
+                            f"⏸ 连着 {dry} 批一条都没成，先收工。\n"
+                            f"本次完成约 {done} 张，还剩 {self._vec_left()} 张。\n"
+                            + (f"最后的错误：{r['err'][:120]}\n" if r["err"] else "")
+                            + "恢复后 `/gallery embed auto` 接着跑，进度不丢。"
+                        )
+                        return
+                    wait = min(60 * 2 ** min(dry, 4), 900)
+                    if dry == 1 or dry % 3 == 0:
+                        await say(
+                            f"⚠️ 向量接口连续失败（第 {dry} 轮），"
+                            f"{wait // 60} 分钟后再试。\n"
+                            + (f"原因：{r['err'][:120]}\n" if r["err"] else "")
+                            + "撞限流的话把「向量批大小」调小到 8~16。"
+                        )
+                    await asyncio.sleep(wait)
+                    continue
+
+                if time.time() - last_report >= gap:
+                    left = self._vec_left()
+                    await say(
+                        f"转向量中：本次约 {done} 张，还剩 {left} 张，"
+                        f"已跑 {self._dur(time.time() - started)}。"
+                    )
+                    last_report = time.time()
+        except asyncio.CancelledError:
+            logger.info(f"[tg_presence] 后台转向量已取消，本次约 {done} 张")
+            raise
+        finally:
+            self._embed_task = None
+
     async def _index_loop(self, umo: str) -> None:
         """后台把待索引的图全部跑完，一条指令跑到底。
 
@@ -2847,7 +3104,7 @@ class TgPresence(Star):
                 try:
                     ok, n, _ = await self._index_batch(batch)
                 except VisionError as e:
-                    await say(f"❌ 配置有问题，索引停了：{e}\n改完发 /gallery index auto 重开。")
+                    await say(f"❌ 配置有问题，索引停了：{e}\n改完发 `/gallery index auto` 重开。")
                     return
 
                 # 整趟累计的花费，报给用户的都用这个，不是单批的
@@ -2862,11 +3119,11 @@ class TgPresence(Star):
                         f"本次新增 {done} 张，全库已索引 {st['indexed']}/{st['total']}。"
                         + (f"\n{cost}" if cost else "")
                         + (
-                            f"\n有 {st['stuck']} 张失败跳过，/gallery retry 可以重来。"
+                            f"\n有 {st['stuck']} 张失败跳过，`/gallery retry` 可以重来。"
                             if st["stuck"]
                             else ""
                         )
-                        + "\n接着跑 /gallery embed 转向量。"
+                        + "\n接着跑 `/gallery embed` 转向量。"
                     )
                     return
 
@@ -2886,7 +3143,7 @@ class TgPresence(Star):
                                 if self._last_fail
                                 else ""
                             )
-                            + "\n恢复后 /gallery index auto 接着跑，进度不丢。"
+                            + "\n恢复后 `/gallery index auto` 接着跑，进度不丢。"
                         )
                         return
                     # 越挂越久就等越久，上限 15 分钟。守着比放弃划算——
@@ -3399,14 +3656,17 @@ class TgPresence(Star):
     async def cmd_photo(self, event: AstrMessageEvent, photo_id: str = "", *, caption: str = ""):
         """手动发一张照片。用法：/photo g123 [附言]"""
         self._seal_command(event)
+        if self._wants_help(photo_id, caption):
+            yield event.plain_result(self._help_text("photo"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
         if not photo_id:
             yield event.plain_result("让她自己挑…")
             picked, said = await self._improvise_photo()
             if not picked:
-                yield event.plain_result(said or "她没挑出来。直接指定：/photo g123 [附言]")
+                yield event.plain_result(said or "她没挑出来。直接指定：`/photo g123` [附言]")
                 return
             photo_id, caption = picked, (caption or said)
             yield event.plain_result(f"她挑了 {picked}" + (f"，配文：{said}" if said else ""))
@@ -3824,8 +4084,11 @@ class TgPresence(Star):
     async def cmd_moment(self, event: AstrMessageEvent, text: str = ""):
         """手动发一条动态。用法：/moment 正文"""
         self._seal_command(event)
+        if self._wants_help(text):
+            yield event.plain_result(self._help_text("moment"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
         if not text:
             yield event.plain_result("让她自己想…")
@@ -3833,7 +4096,7 @@ class TgPresence(Star):
                 self._prompt_of("improvise_moment", DEFAULT_IMP_MOMENT)
             )
             if not text:
-                yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/moment 正文")
+                yield event.plain_result(f"没想出来：{err}\n直接给内容也行：`/moment` 正文")
                 return
             yield event.plain_result(f"她想发：\n{text}")
         yield event.plain_result(await self._do_post(event, text, "", enforce_limits=False))
@@ -3904,8 +4167,11 @@ class TgPresence(Star):
     async def cmd_avatar(self, event: AstrMessageEvent, category: str = ""):
         """手动换头像。用法：/avatar [分类]"""
         self._seal_command(event)
+        if self._wants_help(category):
+            yield event.plain_result(self._help_text("avatar"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
         if not category:
             cats = self._list_categories(self.conf.get("avatar_dir") or "")
@@ -4001,8 +4267,11 @@ class TgPresence(Star):
     async def cmd_signature(self, event: AstrMessageEvent, text: str = ""):
         """手动改签名。用法：/signature 新签名"""
         self._seal_command(event)
+        if self._wants_help(text):
+            yield event.plain_result(self._help_text("signature"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
         if not text:
             yield event.plain_result("让她自己想…")
@@ -4012,7 +4281,7 @@ class TgPresence(Star):
                 )
             )
             if not text:
-                yield event.plain_result(f"没想出来：{err}\n直接给内容也行：/signature 新签名")
+                yield event.plain_result(f"没想出来：{err}\n直接给内容也行：`/signature` 新签名")
                 return
             yield event.plain_result(f"她想改成：\n{text}")
         yield event.plain_result(
@@ -4061,7 +4330,7 @@ class TgPresence(Star):
         """查看插件状态：已发动态数、各项冷却剩余。"""
         self._seal_command(event)
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
 
         moments = self.state.get("moments", [])
@@ -4119,14 +4388,14 @@ class TgPresence(Star):
         if not target:
             return (
                 "还没绑定目标会话。\n"
-                "在这儿发：/link 角色机器人名称:FriendMessage:会话ID"
+                "在这儿发：`/link` 角色机器人名称:FriendMessage:会话ID"
             )
         if self._umo_platform(target) in ("console", self._director_id() or "\0"):
             # 目标绑到控制台自己的话，消息会发回控制台、历史也写进控制台的会话，
             # 角色那边什么都没有，但看着像成功了
             return (
                 f"投递目标绑到控制台自己了：\n{target}\n\n"
-                "重新绑：/link 角色机器人名称:FriendMessage:会话ID"
+                "重新绑：`/link` 角色机器人名称:FriendMessage:会话ID"
             )
         return None
 
@@ -4282,7 +4551,7 @@ class TgPresence(Star):
         人就只能去翻日志。
         """
         if not (self.state.get("director_target") or "").strip():
-            return "", "还没绑定目标会话，取不到她的人格和历史。先 /umo 看看有哪些，再 /link 绑一个"
+            return "", "还没绑定目标会话，取不到她的人格和历史。先 `/umo` 看看有哪些，再 `/link` 绑一个"
         try:
             now = datetime.now(self._tz()).strftime("%m-%d %H:%M")
             # instruct 传空串：要求已经写在 prompt 里了，别再叠一句"发条消息给他"
@@ -4302,7 +4571,7 @@ class TgPresence(Star):
         候选，而检索本身就需要她先说出想要什么。
         """
         if not self.gallery_stat()["indexed"]:
-            return "", "相册还没建索引，挑不了。先 /gallery index auto。"
+            return "", "相册还没建索引，挑不了。先 `/gallery index auto`。"
         raw, err = await self._improvise(
             self._prompt_of("improvise_photo", DEFAULT_IMP_PHOTO)
         )
@@ -4432,6 +4701,13 @@ class TgPresence(Star):
             text = OWN_STAMP_RE.sub("", text).strip()
         return text
 
+    @filter.command("help", alias={"帮助"})
+    async def cmd_help(self, event: AstrMessageEvent, name: str = ""):
+        """列出插件的全部指令。用法：/help，或 /help gallery 看单条。"""
+        self._seal_command(event)
+        key = (name or "").strip().lstrip("/").lower()
+        yield event.plain_result(self._help_text(key) if key else self._help_all())
+
     @filter.command("whoami")
     async def cmd_whoami(self, event: AstrMessageEvent):
         """诊断：这个会话里你是谁、插件读到的管理员名单认不认你。不需要管理员权限。"""
@@ -4524,8 +4800,11 @@ class TgPresence(Star):
     async def cmd_umo(self, event: AstrMessageEvent, arg: str = ""):
         """列出所有会话的 UMO，用来挑一个 /link 绑上。用法：/umo [关键词]"""
         self._seal_command(event)
+        if self._wants_help(arg):
+            yield event.plain_result(self._help_text("umo"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
 
         cm = getattr(self.context, "conversation_manager", None)
@@ -4533,7 +4812,7 @@ class TgPresence(Star):
             yield event.plain_result(
                 "这个 AstrBot 版本列不出会话清单。\n"
                 "手动拼：机器人名称:FriendMessage:会话ID\n"
-                "机器人名称看 WebUI「平台配置」第一项，会话ID 在那个会话里发 /whoami 看。"
+                "机器人名称看 WebUI「平台配置」第一项，会话ID 在那个会话里发 `/whoami` 看。"
             )
             return
 
@@ -4549,7 +4828,7 @@ class TgPresence(Star):
         if not convs:
             yield event.plain_result(
                 f"没有{'匹配「' + kw + '」的' if kw else ''}会话。"
-                + ("\n换个词，或者直接 /umo 看全部。" if kw else "\n先在角色那边正常聊一句，对话才会建起来。")
+                + ("\n换个词，或者直接 `/umo` 看全部。" if kw else "\n先在角色那边正常聊一句，对话才会建起来。")
             )
             return
 
@@ -4599,16 +4878,19 @@ class TgPresence(Star):
                 detail += f" · {info['title'][:18]}"
             lines.append(detail)
         if len(rows) > 25:
-            lines.append(f"\n…还有 {len(rows) - 25} 个，用 /umo 关键词 缩小范围")
-        lines.append("\n绑定：/link 上面任意一个 UMO")
+            lines.append(f"\n…还有 {len(rows) - 25} 个，用 `/umo` 关键词 缩小范围")
+        lines.append("\n绑定：`/link` 上面任意一个 UMO")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("link")
     async def cmd_link(self, event: AstrMessageEvent, target: str = ""):
         """在控制台里绑定投递目标。用法：/link 目标UMO，或 /link show 查看当前绑定。"""
         self._seal_command(event)
+        if self._wants_help(target):
+            yield event.plain_result(self._help_text("link"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
 
         here = self._platform_of(event)
@@ -4631,15 +4913,15 @@ class TgPresence(Star):
                 # 人格里的硬设定一条都不生效——这事不报出来根本发现不了
                 persona = await self._persona_of(cur, await self._peek_conv_obj(cur))
                 lines.append(
-                    f"人格：    {'读到 ' + str(len(persona)) + ' 字' if persona else '⚠️ 没读到，/act 会不像她'}"
+                    f"人格：    {'读到 ' + str(len(persona)) + ' 字' if persona else '⚠️ 没读到，`/act` 会不像她'}"
                 )
             lines += [
                 "",
-                "/umo          列出所有会话，从里面挑一个",
+                "`/umo`          列出所有会话，从里面挑一个",
                 # 别用尖括号占位：Telegram 按 HTML 解析，<UMO> 会被当成标签整段吃掉
-                "/link 目标UMO  绑上它",
+                "`/link` 目标UMO  绑上它",
                 "",
-                "多个角色就靠这两条来回切：绑谁，/say 和 /act 就发给谁。",
+                "多个角色就靠这两条来回切：绑谁，`/say` 和 `/act` 就发给谁。",
             ]
             yield event.plain_result("\n".join(lines))
             return
@@ -4679,7 +4961,7 @@ class TgPresence(Star):
             yield event.plain_result(
                 f"这是控制台自己（{self._umo_platform(arg)}），绑它没意义——"
                 "消息会发回控制台，角色那边什么都收不到。\n"
-                "第一段要填角色那个 bot 的机器人名称，/umo 能列出来。"
+                "第一段要填角色那个 bot 的机器人名称，`/umo` 能列出来。"
             )
             return
 
@@ -4694,13 +4976,13 @@ class TgPresence(Star):
             msg.append(
                 "⚠️ 但查不到这个会话的对话记录。\n"
                 "要么 UMO 填错了，要么那个会话还没聊过——"
-                "没有对话的话，/say 发得出去但写不进历史。"
+                "没有对话的话，`/say` 发得出去但写不进历史。"
             )
         msg += [
             "",
             "接下来：",
-            "  /say 你要她说的原话",
-            "  /act 给她的方向，她自己组织语言",
+            "  `/say` 你要她说的原话",
+            "  `/act` 给她的方向，她自己组织语言",
         ]
         yield event.plain_result("\n".join(msg))
 
@@ -4742,7 +5024,7 @@ class TgPresence(Star):
         """按 handler 的签名把参数切出来，规则跟 AstrBot 那套对齐。
 
         位置参数一个词一个，keyword-only（写在 * 之后的那个）吃掉剩下的
-        全部文本——所以 /gallery index auto 会切成 action='index'、rest='auto'，
+        全部文本——所以 `/gallery index auto` 会切成 action='index'、rest='auto'，
         而 /act 后面整句话都进 brief。
         """
         args: list = []
@@ -4767,7 +5049,7 @@ class TgPresence(Star):
     async def _console_run(self, chat_id, uid: str, text: str) -> None:
         """把控制台收到的一行指令交给对应的 handler，回复原样转发回去。"""
         name, _, rest = text[1:].partition(" ")
-        name = name.split("@", 1)[0].strip().lower()  # /gallery@mybot 也认
+        name = name.split("@", 1)[0].strip().lower()  # `/gallery`@mybot 也认
         handler = CONSOLE_ROUTES.get(name)
         if handler is None:
             await self._console_say(
@@ -4783,7 +5065,7 @@ class TgPresence(Star):
                 await self._console_say(
                     chat_id,
                     f"/{name} 要以角色的身份执行，得先知道是哪个角色。\n"
-                    "/umo 看有哪些会话，/link 绑一个。",
+                    "`/umo` 看有哪些会话，`/link` 绑一个。",
                 )
                 return
             client = self._platform_client(target)
@@ -4981,7 +5263,7 @@ class TgPresence(Star):
                 if cap > 0 and int(st.get("unanswered", 0) or 0) >= cap:
                     continue  # 停下来等他，他一回复就清零
                 if not (self.state.get("director_target") or "").strip():
-                    logger.warning("[tg_presence] 主动消息到点了，但还没 /link 绑定目标会话")
+                    logger.warning("[tg_presence] 主动消息到点了，但还没 `/link` 绑定目标会话")
                     st["due"] = time.time() + 3600
                     self._save_state()
                     continue
@@ -5015,8 +5297,11 @@ class TgPresence(Star):
     async def cmd_proactive(self, event: AstrMessageEvent, arg: str = ""):
         """看主动消息的倒计时状态。用法：/proactive [now]"""
         self._seal_command(event)
+        if self._wants_help(arg):
+            yield event.plain_result(self._help_text("proactive"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
 
         st = self.state.get("proactive") or {}
@@ -5052,7 +5337,7 @@ class TgPresence(Star):
         if self._in_quiet():
             lines.append(f"⏸ 正在静默时段（{self.conf.get('proactive_quiet')}），到点也不发")
         if not (self.state.get("director_target") or "").strip():
-            lines.append("⚠️ 还没绑定目标会话，发不出去。先在控制台 /link")
+            lines.append("⚠️ 还没绑定目标会话，发不出去。先在控制台 `/link`")
         lines.append(f"间隔范围：{self.conf.get('proactive_min_hours', 4)}"
                      f"~{self.conf.get('proactive_max_hours', 14)} 小时随机")
         lines.append("\n/proactive now 立刻让她发一条（不等倒计时）")
@@ -5062,8 +5347,11 @@ class TgPresence(Star):
     async def cmd_say(self, event: AstrMessageEvent, *, text: str = ""):
         """在控制台里用：让角色原样说一句话。用法：/say 内容"""
         self._seal_command(event)
+        if self._wants_help(text):
+            yield event.plain_result(self._help_text("say"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
         if err := self._director_guard(event):
             yield event.plain_result(err)
@@ -5074,15 +5362,18 @@ class TgPresence(Star):
     async def cmd_act(self, event: AstrMessageEvent, *, brief: str = ""):
         """在控制台里用：给个方向，让角色自己组织语言发出去。用法：/act 跟他说你今天加班到很晚"""
         self._seal_command(event)
+        if self._wants_help(brief):
+            yield event.plain_result(self._help_text("act"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
         if err := self._director_guard(event):
             yield event.plain_result(err)
             return
         brief = (brief or "").strip()
         if not brief:
-            yield event.plain_result("给个方向，比如：/act 跟他说你今天加班到很晚，有点累")
+            yield event.plain_result("给个方向，比如：`/act` 跟他说你今天加班到很晚，有点累")
             return
 
         yield event.plain_result("让她想想…")
@@ -5096,7 +5387,7 @@ class TgPresence(Star):
             yield event.plain_result(
                 "她没说出话来——模型返回了空内容。\n"
                 "可能是拒答，也可能是上下文里有它处理不了的东西。"
-                "换个提示试试，或者 /link show 看人格读到没有。"
+                "换个提示试试，或者 `/link show` 看人格读到没有。"
             )
             return
         yield event.plain_result(await self._director_deliver(text))
@@ -5107,8 +5398,11 @@ class TgPresence(Star):
     ):
         """管理相册索引。用法：/gallery [scan|index N|search 词|embed N|audit|redo|retry]"""
         self._seal_command(event)
+        if self._wants_help(action, rest):
+            yield event.plain_result(self._help_text("gallery"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
 
         action = (action or "").strip().lower()
@@ -5147,7 +5441,7 @@ class TgPresence(Star):
                         "两边都翻得到"
                     )
             if stat["stuck"]:
-                lines.append(f"失败跳过：{stat['stuck']} 张（/gallery retry 重来）")
+                lines.append(f"失败跳过：{stat['stuck']} 张（`/gallery retry` 重来）")
             if stat["sent"]:
                 lines.append(f"累计发出：{stat['sent']} 次")
             if self._embed_conf():
@@ -5160,10 +5454,18 @@ class TgPresence(Star):
                     for i, c in enumerate(VEC_SEGS)
                 )
                 lines.append(f"语义向量：{got} · 待转 {v['b'] or 0} 张")
+            for task, what, cmd in (
+                (self._index_task, "索引", "`/gallery index stop`"),
+                (self._embed_task, "转向量", "`/gallery embed stop`"),
+            ):
+                if task and not task.done():
+                    lines.append(f"⏳ 后台{what}正在跑，`{cmd}` 可以停")
             if not stat["total"]:
-                lines.append("\n先 /gallery scan 扫一遍目录。")
+                lines.append("\n先 `/gallery scan` 扫一遍目录。")
             elif stat["pending"]:
-                lines.append("\n用 /gallery index 50 开始建索引，可以分多次跑。")
+                lines.append("\n用 `/gallery index auto` 建索引，睡前开跑早上就好了。")
+            elif self._vec_left():
+                lines.append(f"\n还有 {self._vec_left()} 张没转向量，`/gallery embed auto`。")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -5175,14 +5477,14 @@ class TgPresence(Star):
             added, total = await asyncio.to_thread(self.gallery_scan)
             yield event.plain_result(
                 f"扫完了。新增 {added} 张，库里共 {total} 张。\n"
-                + ("接着 /gallery index 50 建索引。" if added else "没有新文件。")
+                + ("接着 `/gallery index 50` 建索引。" if added else "没有新文件。")
             )
             return
 
         if action == "retry":
             self.db().execute("UPDATE photos SET fails = 0 WHERE descr IS NULL")
             self.db().commit()
-            yield event.plain_result("失败计数已清零，/gallery index 可以重跑那些图了。")
+            yield event.plain_result("失败计数已清零，`/gallery index` 可以重跑那些图了。")
             return
 
         if action == "polish":
@@ -5213,7 +5515,7 @@ class TgPresence(Star):
                 f"标签行删掉硬拼长段：{n_tag} 张\n"
                 + (f"泛称改成「{name}」：{n_name} 张\n" if name
                    else "主体角色名没配，泛称没动。\n")
-                + ("动过的图向量已作废，/gallery embed 重转一遍。"
+                + ("动过的图向量已作废，`/gallery embed` 重转一遍。"
                    if n_tag or n_name else "没有需要动的。")
             )
             return
@@ -5291,91 +5593,74 @@ class TgPresence(Star):
                 self._vec_cache.clear()
                 yield event.plain_result(
                     f"已清空 {n} 条向量的全部分段（换了模型或维度就该这样）。"
-                    f"再发 /gallery embed 重建。"
+                    f"再发 `/gallery embed` 重建。"
                 )
                 return
 
-            todo = max(1, min(int(arg), 20000)) if arg.isdigit() else 1000
-            rows = db.execute(
-                "SELECT id, descr FROM photos "
-                "WHERE descr IS NOT NULL AND vec IS NULL ORDER BY id LIMIT ?",
-                (todo,),
-            ).fetchall()
-            left_before = db.execute(
-                "SELECT COUNT(*) c FROM photos WHERE descr IS NOT NULL AND vec IS NULL"
-            ).fetchone()["c"]
-            if not rows:
+            running = bool(self._embed_task and not self._embed_task.done())
+            if arg == "stop":
+                if not running:
+                    yield event.plain_result("没有在跑的后台转换。")
+                    return
+                self._embed_task.cancel()
+                self._embed_task = None
+                yield event.plain_result(
+                    "已停。转好的都在库里，`/gallery embed auto` 可以接着跑。"
+                )
+                return
+            if running:
+                yield event.plain_result(
+                    "后台正在转向量，`/gallery` 看进度，`/gallery embed stop` 停掉。"
+                )
+                return
+
+            left_before = self._vec_left()
+            if not left_before:
                 done = db.execute(
                     "SELECT COUNT(*) c FROM photos WHERE vec IS NOT NULL"
                 ).fetchone()["c"]
                 yield event.plain_result(f"没有待转向量的图。已有 {done} 条向量。")
                 return
 
-            # 一张图要转好几段，按「文本条数」分批而不是按图片张数，
-            # 否则批大小填 32 实际会一次发一百多条上去
-            jobs: list[tuple[int, str, str]] = []
-            for r in rows:
-                jobs.append((r["id"], "vec", self._embed_text(r["descr"])))
-                for col, txt in self._desc_segments(r["descr"]).items():
-                    jobs.append((r["id"], col, self._embed_text(txt)))
-            seg_n = len(jobs) - len(rows)
+            if arg == "auto":
+                self._embed_task = asyncio.create_task(
+                    self._embed_loop(event.unified_msg_origin)
+                )
+                yield event.plain_result(
+                    f"后台开跑，待转 {left_before} 张。\n"
+                    "跑完会告诉你，中途每隔一阵报一次进度。\n"
+                    "撞限流会自动拉长间隔守着，不会把进度丢掉。\n"
+                    "`/gallery embed stop` 随时停。"
+                )
+                return
 
+            todo = max(1, min(int(arg), 20000)) if arg.isdigit() else 1000
             batch = max(1, min(int(self.conf.get("embed_batch", 32) or 32), 256))
             yield event.plain_result(
-                f"待转 {left_before} 张，这次做 {len(rows)} 张。\n"
-                f"分段后共 {len(jobs)} 条文本（全文 {len(rows)} + 分段 {seg_n}），每批 {batch}。"
-                + ("\n⚠ 一段都没切出来，检查描述里的层标题" if not seg_n else "")
+                f"待转 {left_before} 张，这次做 {min(todo, left_before)} 张，每批 {batch}。"
             )
-            ok = fail = dry = 0
-            err = ""
-            for i in range(0, len(jobs), batch):
-                chunk = jobs[i : i + batch]
-                try:
-                    vecs = await self._embed_retry([t for _, _, t in chunk])
-                except VisionError as e:
-                    fail += len(chunk)
-                    err = err or str(e)
-                    logger.warning(f"[tg_presence] 转向量失败：{e}")
-                    if e.fatal:
-                        break
-                    dry += 1
-                    if dry >= 3:  # 连着三批都挂，别再空转
-                        break
-                    continue
-                dry = 0
-                if not vecs or len(vecs) != len(chunk):
-                    fail += len(chunk)
-                    err = err or "接口返回的条数和送进去的对不上"
-                    continue
-                # 同一批里可能混着不同的列，按列分组写回
-                by_col: dict[str, list] = {}
-                for (rid, col, _), v in zip(chunk, vecs):
-                    by_col.setdefault(col, []).append((self._vec_pack(v), rid))
-                for col, pairs in by_col.items():
-                    db.executemany(
-                        f"UPDATE photos SET {col} = ? WHERE id = ?", pairs
-                    )
-                db.commit()
-                ok += len(chunk)
-            self._vec_cache.clear()  # 有新向量，下次检索重建内存矩阵
-            left = db.execute(
-                "SELECT COUNT(*) c FROM photos WHERE descr IS NOT NULL AND vec IS NULL"
-            ).fetchone()["c"]
+            r = await self._embed_once(todo)
+            left = self._vec_left()
             msg = [
-                f"完成 {ok} 条文本" + (f"，失败 {fail} 条" if fail else "")
-                + f"。还剩 {left} 张图"
-                + ("，再发一次 /gallery embed 继续。" if left else "，全部转完。")
+                f"完成 {r['ok']} 条文本"
+                + (f"，失败 {r['fail']} 条" if r["fail"] else "")
+                + f"（{r['pics']} 张图切成 {r['jobs']} 条：全文 {r['pics']} + 分段 {r['segs']}）。"
+                + f"\n还剩 {left} 张图"
+                + ("，量大的话用 `/gallery embed auto` 一条指令跑到底。"
+                   if left else "，全部转完。")
             ]
-            if err:
-                msg.append(f"\n最后的错误：{err[:160]}")
-                if "429" in err:
+            if not r["segs"]:
+                msg.append("⚠ 一段都没切出来，检查描述里的层标题")
+            if r["err"]:
+                msg.append(f"\n最后的错误：{r['err'][:160]}")
+                if "429" in r["err"]:
                     msg.append(
                         "撞限流了。一张图要转四段，请求数是原来的四倍，"
                         "而这类接口常按文本条数算配额。\n"
                         "等一两分钟再发一次就行，进度不会丢；"
                         "老撞就把「向量批大小」调小到 8~16。"
                     )
-                elif "401" in err or "403" in err or "404" in err:
+                elif any(c in r["err"] for c in ("401", "403", "404")):
                     msg.append("这是配置问题，重试没用。检查向量接口的地址、密钥、模型名。")
             yield event.plain_result("\n".join(msg))
             return
@@ -5411,7 +5696,7 @@ class TgPresence(Star):
             ).fetchone()["c"]
             if miss or none_n:
                 lines.append(
-                    f"\n{miss + none_n} 张关键词不合格，/gallery redo 排队重跑。"
+                    f"\n{miss + none_n} 张关键词不合格，`/gallery redo` 排队重跑。"
                 )
             lines.append(
                 f"\n注：关键词行是检索命中率的主要来源，少于 "
@@ -5453,7 +5738,7 @@ class TgPresence(Star):
                 ]
                 lines.append("\n举例：")
                 lines += [f"  g{i} {Path(p).name} — {why}" for i, p, why in bad[:5]]
-                lines.append("\n这些会污染向量检索。确认清掉重跑：/gallery clean go")
+                lines.append("\n这些会污染向量检索。确认清掉重跑：`/gallery clean go`")
                 yield event.plain_result("\n".join(lines))
                 return
 
@@ -5466,7 +5751,7 @@ class TgPresence(Star):
             self._vec_cache.clear()
             yield event.plain_result(
                 f"清掉 {len(bad)} 条，已退回待索引。\n"
-                f"先确认视觉配置改好了（Gemini 记得设安全阈值），再 /gallery index auto 重跑。"
+                f"先确认视觉配置改好了（Gemini 记得设安全阈值），再 `/gallery index auto` 重跑。"
             )
             return
 
@@ -5480,7 +5765,7 @@ class TgPresence(Star):
             db.commit()
             self._vec_cache.clear()
             yield event.plain_result(
-                f"已把 {n} 张标签有结构问题的图退回待索引，/gallery index 重跑。"
+                f"已把 {n} 张标签有结构问题的图退回待索引，`/gallery index` 重跑。"
                 if n
                 else "没有需要重跑的图。"
             )
@@ -5535,7 +5820,7 @@ class TgPresence(Star):
 
         if action == "search":
             if not rest.strip():
-                yield event.plain_result("要搜什么？例如 /gallery search 红色情趣内衣")
+                yield event.plain_result("要搜什么？例如 `/gallery search` 红色情趣内衣")
                 return
             # 词里带 sfw / soft / hard / nsfw 的当成筛选条件摘出来，
             # 剩下的才是检索词
@@ -5578,7 +5863,7 @@ class TgPresence(Star):
             if vw <= 0:
                 head.append("⚠ 语义权重是 0，向量路没启用")
             elif not n_vec:
-                head.append("⚠ 语义一张都没召回，/gallery embed 转过向量没有？")
+                head.append("⚠ 语义一张都没召回，`/gallery embed` 转过向量没有？")
             head.append("─" * 18)
 
             lines = []
@@ -5602,7 +5887,7 @@ class TgPresence(Star):
 
         if action == "index":
             if not self._vision_ready():
-                yield event.plain_result("视觉 API 没配全，/vision 看缺哪项。")
+                yield event.plain_result("视觉 API 没配全，`/vision` 看缺哪项。")
                 return
             arg = rest.strip().lower()
             running = bool(self._index_task and not self._index_task.done())
@@ -5614,13 +5899,13 @@ class TgPresence(Star):
                 self._index_task.cancel()
                 self._index_task = None
                 yield event.plain_result(
-                    "已停。进度都在库里，/gallery index auto 可以接着跑。"
+                    "已停。进度都在库里，`/gallery index auto` 可以接着跑。"
                 )
                 return
 
             if running:
                 yield event.plain_result(
-                    "后台索引正在跑，/gallery 看进度，/gallery index stop 停掉。"
+                    "后台索引正在跑，`/gallery` 看进度，`/gallery index stop` 停掉。"
                 )
                 return
 
@@ -5629,7 +5914,7 @@ class TgPresence(Star):
                     yield event.plain_result(
                         f"没有待索引的图。已索引 {stat['indexed']} 张。"
                         + (
-                            f"\n有 {stat['stuck']} 张失败跳过，/gallery retry 重来。"
+                            f"\n有 {stat['stuck']} 张失败跳过，`/gallery retry` 重来。"
                             if stat["stuck"]
                             else ""
                         )
@@ -5643,7 +5928,7 @@ class TgPresence(Star):
                     f"并发 {self.conf.get('vision_concurrency', 2)}。\n"
                     f"跑完会告诉你，中途每隔一阵报一次进度。\n"
                     f"上游要是挂了会自动等它恢复，不会把图标成坏图。\n"
-                    f"/gallery index stop 随时停，进度不丢。"
+                    f"`/gallery index stop` 随时停，进度不丢。"
                 )
                 return
 
@@ -5651,7 +5936,7 @@ class TgPresence(Star):
             if not stat["pending"]:
                 yield event.plain_result(
                     f"没有待索引的图。已索引 {stat['indexed']} 张。"
-                    + (f"\n有 {stat['stuck']} 张失败跳过，/gallery retry 重来。" if stat["stuck"] else "")
+                    + (f"\n有 {stat['stuck']} 张失败跳过，`/gallery retry` 重来。" if stat["stuck"] else "")
                 )
                 return
 
@@ -5670,7 +5955,7 @@ class TgPresence(Star):
                 f"还剩 {after['pending']} 张。"
                 + (f"\n{cost}" if cost else "")
                 + (
-                    "\n量大的话用 /gallery index auto，一条指令跑到底。"
+                    "\n量大的话用 `/gallery index auto`，一条指令跑到底。"
                     if after["pending"]
                     else "\n全部索引完毕。"
                 )
@@ -5678,7 +5963,7 @@ class TgPresence(Star):
             return
 
         yield event.plain_result(
-            "用法：/gallery [scan|index N|index auto|index stop|search 词|show [gN]|"
+            "用法：`/gallery` [scan|index N|index auto|index stop|search 词|show [gN]|"
             "embed N|audit|clean|redo|retry|polish]\n"
             "  index auto 后台跑到全部完成，show 看某张的完整描述（不带参数随机抽），\n"
             "  embed 把描述转成语义向量，clean 揪出拒答和思维链，\n"
@@ -5690,8 +5975,11 @@ class TgPresence(Star):
     async def cmd_vision(self, event: AstrMessageEvent, arg: str = ""):
         """给还没有细节记录的存量图片补做视觉解析。用法：/vision [张数|retry|test]"""
         self._seal_command(event)
+        if self._wants_help(arg):
+            yield event.plain_result(self._help_text("vision"))
+            return
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
-            yield event.plain_result("只有管理员能用这个指令。发 /whoami 看是哪儿没对上。")
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
 
         cfg = self._vision_conf()
@@ -5764,7 +6052,7 @@ class TgPresence(Star):
             stuck = sum(1 for pid in paths if fails.get(pid, 0) >= VISION_MAX_FAILS)
             msg = f"没有待解析的图片。已有细节记录 {len(self.vision)} 条。"
             if stuck:
-                msg += f"\n另有 {stuck} 张失败满 {VISION_MAX_FAILS} 次被跳过，/vision retry 可重来。"
+                msg += f"\n另有 {stuck} 张失败满 {VISION_MAX_FAILS} 次被跳过，`/vision retry` 可重来。"
             yield event.plain_result(msg)
             return
 
@@ -5781,5 +6069,5 @@ class TgPresence(Star):
         left = len(pending) - ok
         yield event.plain_result(
             f"完成 {ok}/{len(todo)} 张。"
-            + (f"\n还剩 {left} 张，再发一次 /vision 继续。" if left > 0 else "")
+            + (f"\n还剩 {left} 张，再发一次 `/vision` 继续。" if left > 0 else "")
         )
