@@ -183,7 +183,8 @@ CREATE TABLE IF NOT EXISTS photos (
     vec_body  BLOB,                    -- 身体段（第二层 + 第三层）
     vec_act   BLOB,                    -- 动作段（第四层 + 第六层 + 关键词行）
     tag_state  TEXT,                   -- ok / 无标签 / 段数不齐 / 有问题
-    tag_issues TEXT                    -- 上面那个的具体说明，给 /gallery audit 看
+    tag_issues TEXT,                   -- 上面那个的具体说明，给 /gallery audit 看
+    rating  TEXT                       -- SFW / NSFW，从描述末行标记解析出来
 );
 CREATE INDEX IF NOT EXISTS idx_folder  ON photos(folder);
 CREATE INDEX IF NOT EXISTS idx_pending ON photos(fails) WHERE descr IS NULL;
@@ -552,7 +553,8 @@ class TgPresence(Star):
             self._db.executescript(GALLERY_SCHEMA)
             # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
             have = {r["name"] for r in self._db.execute("PRAGMA table_info(photos)")}
-            cols = [("tag_state", "TEXT"), ("tag_issues", "TEXT"), ("file_time", "REAL")]
+            cols = [("tag_state", "TEXT"), ("tag_issues", "TEXT"), ("file_time", "REAL"),
+                    ("rating", "TEXT")]
             cols += [(c, "BLOB") for c in VEC_SEGS]
             for col, typ in cols:
                 if col not in have:
@@ -864,8 +866,18 @@ class TgPresence(Star):
         weights = [math.log((total + 1) / (df + 1)) + 1 for df in dfs]
         return weights, sum(weights) or 1.0
 
+    @staticmethod
+    def _norm_rating(raw: str) -> str:
+        """把用户/模型给的分级词归一成 SFW / NSFW，认不出返回空（= 不限）。"""
+        s = (raw or "").strip().upper()
+        if s in ("SFW", "安全", "日常", "正常", "CLEAN"):
+            return "SFW"
+        if s in ("NSFW", "R18", "涩", "色", "露骨", "成人"):
+            return "NSFW"
+        return ""
+
     def gallery_search(
-        self, keywords: str = "", folder: str = "", limit: int = 8
+        self, keywords: str = "", folder: str = "", limit: int = 8, rating: str = ""
     ) -> list[sqlite3.Row]:
         """按关键词和分类找图，按 IDF 加权的命中分排序。
 
@@ -893,6 +905,9 @@ class TgPresence(Star):
         if folder.strip():
             sql += " AND folder LIKE ?"
             args.append(f"%{folder.strip()}%")
+        if want := self._norm_rating(rating):
+            sql += " AND rating = ?"
+            args.append(want)
         # 只按命中数排，同分用 id 兜底——不能有 RANDOM()：
         # 同一段词每次搜出来的候选必须是同一批，否则"上次那张"永远漂移。
         # 发送历史和时间的偏好交给后面的权重重排，那里是可控的确定性调整
@@ -1064,6 +1079,23 @@ class TgPresence(Star):
         return " ｜ ".join(bits) or " ".join((descr or "").split())[:120]
 
     @staticmethod
+    def _rating_of(descr: str) -> str:
+        """从描述末行标记里取分级。返回 SFW / NSFW，取不到返回空。
+
+        末行格式是「分级---水印---遮挡」。从后往前找第一个首段是
+        SFW 或 NSFW 的行——正文里偶尔也会出现 --- ，认首段的内容
+        比认行号可靠。
+        """
+        for raw in reversed((descr or "").splitlines()):
+            s = raw.strip()
+            if "---" not in s:
+                continue
+            head = s.split("---", 1)[0].strip().upper()
+            if head in ("SFW", "NSFW"):
+                return head
+        return ""
+
+    @staticmethod
     def _tag_line(descr: str) -> str:
         """摘出末尾那行标签。取分隔符最多的一行，和 audit_tags 同一口径。"""
         line, best = "", 1
@@ -1189,7 +1221,7 @@ class TgPresence(Star):
             return {}
 
     async def _recall(
-        self, keywords: str, want: str, folder: str, pool: int
+        self, keywords: str, want: str, folder: str, pool: int, rating: str = ""
     ) -> list[sqlite3.Row]:
         """关键词召回 ∪ 语义召回，合并出候选池并算出统一的匹配度。
 
@@ -1201,7 +1233,8 @@ class TgPresence(Star):
         加权。这一步是在「匹配度」这个维度内部合成，不影响时间/发送条件
         压在它上面的分层结构。
         """
-        kw_rows = self.gallery_search(keywords or want, folder, limit=pool)
+        kw_rows = self.gallery_search(keywords or want, folder, limit=pool, rating=rating)
+        want_rating = self._norm_rating(rating)
 
         vw = float(self.conf.get("vector_weight", 0.4) or 0)
         query = " ".join(x for x in (want.strip(), keywords.strip()) if x)
@@ -1217,6 +1250,10 @@ class TgPresence(Star):
             ).fetchall()
             for r in extra:
                 if folder.strip() and folder.strip() not in (r["folder"] or ""):
+                    continue
+                # 语义那路是全库比对的，分级同样要在这儿卡一道，
+                # 否则说"想看你穿搭"照样能被语义捞出一张露的来
+                if want_rating and (r["rating"] or "") != want_rating:
                     continue
                 by_id[int(r["id"])] = dict(r)
 
@@ -2630,8 +2667,8 @@ class TgPresence(Star):
             # 不清的话 embed 那边「descr 有、vec 空」的条件选不中它，
             # 新描述会一直配着旧向量，检索错得毫无痕迹
             f"UPDATE photos SET descr = ?, {VEC_NULLS}, fails = 0, tag_state = ?, "
-            "tag_issues = ? WHERE id = ?",
-            (text, verdict, "; ".join(issues[:8]), row_id),
+            "tag_issues = ?, rating = ? WHERE id = ?",
+            (text, verdict, "; ".join(issues[:8]), self._rating_of(text) or None, row_id),
         )
         db.commit()
         if verdict not in ("ok", "无标签"):
@@ -2909,7 +2946,8 @@ class TgPresence(Star):
     @filter.llm_tool(name="browse_gallery")
     async def browse_gallery(
         self, event: AstrMessageEvent, keywords: str = "", want: str = "",
-        folder: str = "", prefer_sent: str = "", around: str = "", **_extra
+        folder: str = "", prefer_sent: str = "", around: str = "",
+        rating: str = "", **_extra
     ):
         """在你自己的相册里翻，找一张想发给他的照片。想给他看点什么、或者他描述了某个画面让你找的时候用。返回一批候选，你自己挑一张，再用 send_photo 发出去。
 
@@ -2919,13 +2957,19 @@ class TgPresence(Star):
             folder(string): 可选，限定某个相册分类
             prefer_sent(string): 他要的是最近发过的那张就填 recent，要没发过的新图就填 fresh，听不出来就留空（默认 fresh，免得老发同一张）
             around(string): 他提到某个月份就填，格式 YYYY-MM 或 MM，例如「三月那会儿的」填 03。那个月的图会整体排到前面。没提就留空
+            rating(string): 尺度。聊日常、穿搭、自拍、今天去哪儿了这种，填 sfw，免得翻出露的来；他要看你身体、或者你就是想撩他，填 nsfw。留空则两种都会出现。注意这是你的选择而不是限制——想用一张露的去逗他，那就主动填 nsfw
         """
         pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
-        rows = await self._recall(keywords, want, folder, pool)
+        rows = await self._recall(keywords, want, folder, pool, rating)
         if not rows:
             stat = self.gallery_stat()
             if not stat["indexed"]:
                 return "相册还没建好索引，现在挑不了。"
+            if self._norm_rating(rating):
+                return (
+                    f"没找到合适的（只在 {self._norm_rating(rating)} 里翻的）。"
+                    "换几个词，或者把 rating 留空再试一次。"
+                )
             return "没找到合适的。换几个词再翻翻，或者把想找的画面整句说出来。"
 
         # 召回之后按固定逻辑重排。纯计算，同一段词每次结果都一样
@@ -4797,6 +4841,15 @@ class TgPresence(Star):
                 f"已登记：{stat['total']} 张 · {stat['folders']} 个分类",
                 f"已索引：{stat['indexed']} 张 · 待索引：{stat['pending']} 张",
             ]
+            rt = self.db().execute(
+                "SELECT SUM(rating = 'SFW') s, SUM(rating = 'NSFW') n, "
+                "SUM(descr IS NOT NULL AND rating IS NULL) u FROM photos"
+            ).fetchone()
+            if (rt["s"] or 0) + (rt["n"] or 0) + (rt["u"] or 0):
+                lines.append(
+                    f"分级：    SFW {rt['s'] or 0} · NSFW {rt['n'] or 0}"
+                    + (f" · 未标 {rt['u']}（老描述没这一行）" if rt["u"] else "")
+                )
             if stat["stuck"]:
                 lines.append(f"失败跳过：{stat['stuck']} 张（/gallery retry 重来）")
             if stat["sent"]:
@@ -5155,10 +5208,19 @@ class TgPresence(Star):
             if not rest.strip():
                 yield event.plain_result("要搜什么？例如 /gallery search 红色情趣内衣")
                 return
+            # 词里带 sfw / nsfw 的当成筛选条件摘出来，剩下的才是检索词
+            terms, pick = [], ""
+            for w in rest.split():
+                if got := self._norm_rating(w):
+                    pick = got
+                else:
+                    terms.append(w)
+            rest = " ".join(terms)
+
             # 走 _recall 而不是 gallery_search——那才是桃桃调 browse_gallery 时
             # 实际走的路径。只测关键词那条路的话，向量有没有生效根本看不出来
             pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
-            rows = await self._recall(rest, "", "", pool)
+            rows = await self._recall(rest, "", "", pool, pick)
             # 显示实际参与匹配的词表：整词落空被拆成单字的话，这里和
             # 原始切词不一样，不显示出来就会对着「桌上」猜半天
             raw_words = self._split_query(rest)
@@ -5174,6 +5236,8 @@ class TgPresence(Star):
             n_kw = sum(1 for r in rows if (r.get("kw_score") or 0) > 0)
             n_vec = sum(1 for r in rows if r.get("sim_score") is not None)
             head = ["切词：" + " / ".join(raw_words)]
+            if pick:
+                head.append(f"只在 {pick} 里翻")
             if words != raw_words:
                 dropped = [w for w in raw_words if w not in words]
                 head.append(
@@ -5199,6 +5263,7 @@ class TgPresence(Star):
                 snippet = " ".join((r["descr"] or "").split())[:44]
                 lines.append(
                     f"g{r['id']} {r['score']:.3f} [{mark}] {detail}"
+                    + (f" {r['rating']}" if r.get("rating") else "")
                     + (f" ⟨{' '.join(hit)}⟩" if hit else "")
                     + f"\n   {snippet}"
                 )
