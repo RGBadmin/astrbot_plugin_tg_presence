@@ -90,6 +90,16 @@ RATING_TIERS = {
 RATING_RE = re.compile(r"硬NSFW|软NSFW|(?<![软硬N])SFW")
 RATING_SEPS = "+＋/、,，&和"  # 模型写复合值时可能用的连接符
 RATING_TIER_ORDER = ("SFW", "软NSFW", "硬NSFW")  # 由轻到重，只用于显示
+
+# 标签行里超过这个汉字数的段，实测几乎全是模型硬拼的字堆。
+# 正常标签 87% 在四字以内、97% 在六字以内，十字往上就是垃圾了
+JUNK_SEG_MIN = 10
+# 模型偶尔不用角色名，改写这些泛称——搜角色名时这些图就漏了
+SUBJECT_ALIASES = (
+    "一名女性主体", "单人女性主体", "画面女性主体", "女性主体",
+    "一名女性", "该女性", "这名女性", "此女性", "画面主体",
+    "一位女性", "女子", "该女子",
+)
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
 CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
 SIGNATURE_MAX = 120  # setMyShortDescription 的上限
@@ -1184,6 +1194,61 @@ class TgPresence(Star):
                 return "硬NSFW"
             return "SFW+软NSFW" if len(tiers) > 1 else next(iter(tiers))
         return ""
+
+    def _polish(self, descr: str) -> str:
+        """入库前把描述过一遍：标签行去掉硬拼的长段，主体名归一。
+
+        两件事模型都做不稳，但都是确定性的字符串操作，代码这边一次做对
+        比在提示词里跟它较劲可靠得多——而且改了对存量数据也能补做。
+        """
+        if not descr:
+            return descr
+        out = self._fix_subject(descr)
+        if line := self._tag_line(out):
+            if (fixed := self._clean_tags(line)) != line:
+                out = out.replace(line, fixed, 1)
+        return out
+
+    def _fix_subject(self, descr: str) -> str:
+        """把「一名女性」这类泛称换成角色名。
+
+        实测 4% 的输出会写成"单人女性""该女性"，检索时搜"桃桃"就漏了。
+        画面里有别人时会误伤，所以给了开关。
+        """
+        name = (self.conf.get("subject_name") or "").strip()
+        if not name:
+            return descr
+        for alias in SUBJECT_ALIASES:
+            descr = descr.replace(alias, name)
+        # 「桃桃（桃桃）」这种替换后的重复收一下
+        return re.sub(rf"{re.escape(name)}\s*[（(]\s*{re.escape(name)}\s*[）)]", name, descr)
+
+    @staticmethod
+    def _clean_tags(line: str) -> str:
+        """标签行里把模型硬拼出来的长段删掉。
+
+        实测标签段 87% 在四个字以内，六个字覆盖 97%；十个字往上几乎
+        全是「显手强扯撑举扩张腔缝全绽直露态」这种硬拼的字堆，没人会
+        拿去搜。
+
+        三类长段要豁免，它们再长也是正经内容：
+        · 带逗号的是多值项——云雾,光晕,马赛克
+        · 带字母数字的是型号品牌——DG-LAB电击盒
+        · 带连字符的是候选清单里的结构化写法——状态-半脱-拉到大腿根、
+          乳房-被衣物覆盖-轮廓可见。硬拼出来的字堆从不带连字符
+        """
+        segs = [s for s in line.split("---")]
+        keep = [
+            s for s in segs
+            if len(s.strip()) < JUNK_SEG_MIN
+            or "," in s or "，" in s
+            or "-" in s or "－" in s
+            or re.search(r"[A-Za-z0-9]", s)
+        ]
+        # 前三项是分级/水印/遮挡，无论如何都不能动
+        if len(keep) < 3:
+            return line
+        return "---".join(keep)
 
     @staticmethod
     def _tag_line(descr: str) -> str:
@@ -2843,6 +2908,7 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 图库 g{row_id} 索引失败：{e}")
             return False
 
+        text = self._polish(text)
         verdict, issues = self.audit_tags(text)
         db.execute(
             # 向量必须一起作废：描述换了，旧向量就不再代表这张图了。
@@ -5087,6 +5153,39 @@ class TgPresence(Star):
             yield event.plain_result("失败计数已清零，/gallery index 可以重跑那些图了。")
             return
 
+        if action == "polish":
+            # 清洗规则是纯字符串操作，存量数据也能补做，不用重跑索引
+            db = self.db()
+            rows = db.execute(
+                "SELECT id, descr FROM photos WHERE descr IS NOT NULL"
+            ).fetchall()
+            n_tag = n_name = 0
+            for r in rows:
+                fixed = self._polish(r["descr"])
+                if fixed == r["descr"]:
+                    continue
+                if self._fix_subject(r["descr"]) != r["descr"]:
+                    n_name += 1
+                if self._tag_line(r["descr"]) != self._tag_line(fixed):
+                    n_tag += 1
+                # 描述变了向量就得作废，否则新描述配着旧向量，错得没痕迹
+                db.execute(
+                    f"UPDATE photos SET descr = ?, {VEC_NULLS} WHERE id = ?",
+                    (fixed, r["id"]),
+                )
+            db.commit()
+            self._vec_cache.clear()
+            name = (self.conf.get("subject_name") or "").strip()
+            yield event.plain_result(
+                f"清洗完毕，扫过 {len(rows)} 张。\n"
+                f"标签行删掉硬拼长段：{n_tag} 张\n"
+                + (f"泛称改成「{name}」：{n_name} 张\n" if name
+                   else "主体角色名没配，泛称没动。\n")
+                + ("动过的图向量已作废，/gallery embed 重转一遍。"
+                   if n_tag or n_name else "没有需要动的。")
+            )
+            return
+
         if action == "embed":
             db = self.db()
             if not self._embed_conf():
@@ -5548,10 +5647,11 @@ class TgPresence(Star):
 
         yield event.plain_result(
             "用法：/gallery [scan|index N|index auto|index stop|search 词|show [gN]|"
-            "embed N|audit|clean|redo|retry]\n"
+            "embed N|audit|clean|redo|retry|polish]\n"
             "  index auto 后台跑到全部完成，show 看某张的完整描述（不带参数随机抽），\n"
             "  embed 把描述转成语义向量，clean 揪出拒答和思维链，\n"
-            "  audit 看标签质量，redo 重跑结构坏的"
+            "  audit 看标签质量，redo 重跑结构坏的，\n"
+            "  polish 清洗存量描述（删标签行的硬拼长段、泛称改成角色名）"
         )
 
     @filter.command("vision")
