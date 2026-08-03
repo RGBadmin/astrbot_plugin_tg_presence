@@ -197,9 +197,9 @@ CREATE TABLE IF NOT EXISTS photos (
     file_time REAL,                    -- 这张图自己的时间：推特文件名解出的发推
                                        -- 时刻，解不出才用文件 mtime
     vec       BLOB,                    -- 全文向量，float32 且已归一化
-    vec_env   BLOB,                    -- 环境段（第一层 + 第五层）
-    vec_body  BLOB,                    -- 身体段（第二层 + 第三层）
-    vec_act   BLOB,                    -- 动作段（第四层 + 第六层 + 关键词行）
+    vec_env   BLOB,                    -- 环境段（焦点全视图 + 环境背景 + 物品道具）
+    vec_body  BLOB,                    -- 身体段（人物整体 + 身体细节）
+    vec_act   BLOB,                    -- 动作段（互动动作 + 体液痕迹 + 关键词行）
     tag_state  TEXT,                   -- ok / 无标签 / 段数不齐 / 有问题
     tag_issues TEXT,                   -- 上面那个的具体说明，给 /gallery audit 看
     rating  TEXT                       -- SFW / 软NSFW / SFW+软NSFW / 硬NSFW，
@@ -264,15 +264,24 @@ DEFAULT_IMP_PHOTO = (
 # 值是这一段取哪几层；None 表示整篇。第六层往后会连标签行一起带上，
 # 那正好——标签是特征清单，跟动作状态放一起不违和。
 VEC_SEGS: dict[str, tuple[int, ...] | None] = {
-    "vec": None,           # 全文，也是向后兼容的那一路
-    "vec_env": (1, 5),     # 环境与背景 + 物品道具
-    "vec_body": (2, 3),    # 人物整体 + 身体细节
-    "vec_act": (4, 6),     # 互动动作 + 体液痕迹 + 标签行
+    "vec": None,              # 全文，也是向后兼容的那一路
+    "vec_env": (1, 2, 6),     # 焦点与全视图 + 环境与背景 + 物品道具
+    "vec_body": (3, 4),       # 人物整体 + 身体细节
+    "vec_act": (5, 7),        # 互动动作 + 体液痕迹 + 标签行
+}
+# 七层提示词之前的老描述没有开头那层「画面焦点与全视图」，后面每层
+# 都往前挪一位。库里两种版本会长期共存，切分时按层数选映射
+VEC_SEGS_6: dict[str, tuple[int, ...] | None] = {
+    "vec": None,
+    "vec_env": (1, 5),
+    "vec_body": (2, 3),
+    "vec_act": (4, 6),
 }
 # 必须锚在行首。正文里「背景中的杂物见第一层」这种交叉引用很常见，
 # 不锚定的话它会被当成层标题，把真正的第一层内容整段吃掉
-LAYER_RE = re.compile(r"^[\s*·・-]*第\s*([一二三四五六])\s*层[^\n]*", re.M)
-LAYER_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
+LAYER_RE = re.compile(r"^[\s*·・-]*第\s*([一二三四五六七])\s*层[^\n]*", re.M)
+LAYER_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7}
+LAYER_COUNT = len(LAYER_NUM)
 
 # 推特下载的媒体文件名就是推文 ID，同一条推文的多张图带 -1 -2 -3 后缀。
 # 这个 ID 是 snowflake：高 42 位是毫秒时间戳，能还原出发推时刻。
@@ -381,19 +390,31 @@ class VisionError(Exception):
       满 VISION_MAX_FAILS 次后不再自动重试。
     """
 
-    def __init__(self, msg: str, *, retryable: bool = False, fatal: bool = False):
+    def __init__(
+        self, msg: str, *, retryable: bool = False, fatal: bool = False,
+        blocked: bool = False,
+    ):
         super().__init__(msg)
         self.retryable = retryable
         self.fatal = fatal
+        # 内容策略拦掉的。这类失败上游返回的是 HTTP 200，计费照算，
+        # 所以要单独计数——不然「调用了两百次只出了一百张图」根本查不出原因
+        self.blocked = blocked
 
 
 @register(
     "astrbot_plugin_tg_presence",
     "chine",
     "让角色自己发动态到频道、换头像、改签名、对消息点表情，并把图片记成可检索的两层文字",
-    "0.21.0",
+    "0.23.0",
 )
 class TgPresence(Star):
+    # 类级默认值，给 __init__ 之外的路径兜底（热重载、只造壳不初始化）。
+    # 它们只是计数和留痕，读到 0 比抛 AttributeError 强得多
+    _api_calls = 0
+    _api_blocked = 0
+    _last_fail = ""
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = self._flatten_conf(config)
@@ -417,6 +438,11 @@ class TgPresence(Star):
         self._cool_until: float = 0.0
         self._fail_streak: int = 0
         self._trip_level: int = 0
+        self._last_fail: str = ""
+        # 实际发出去多少次视觉请求、其中多少次被内容策略拦掉。
+        # 上游把拦截也记成 HTTP 200 成功，账单上看不出区别，只能自己数
+        self._api_calls: int = 0
+        self._api_blocked: int = 0
         # /gallery index auto 的后台任务，一次只允许有一个
         self._index_task: asyncio.Task | None = None
         self._index_note: str = ""
@@ -1105,8 +1131,13 @@ class TgPresence(Star):
         if not layers:
             return " ".join((descr or "").split())[:120]
 
+        # 七层版比六层版多了开头的「画面焦点与全视图」，后面每层都往后
+        # 挪了一位。不认版本直接按层号取的话，六层版会把「身体细节」
+        # 当成「人物整体」摘出来——不报错，只是摘要一直不对劲
+        seven = 7 in layers
         bits = []
-        # 第一层里九宫格之后那段才是场景总结，逐格描述对挑图没用
+        # 场景一句：七层取焦点全视图（那句「画面焦点是X」最有判别力），
+        # 六层取环境背景。九宫格那种逐格描述对挑图没用，滤掉
         env = [
             ln.strip()
             for ln in layers.get(1, "").splitlines()
@@ -1114,13 +1145,13 @@ class TgPresence(Star):
         ]
         if env:
             bits.append(" ".join(env)[:56])
-        if body := " ".join(layers.get(2, "").split()):
+        if body := " ".join(layers.get(3 if seven else 2, "").split()):
             bits.append(body[:76])
-        # 末尾若有关键词行就用它，没有就退回第四层——描述里最能说清
-        # 「这张在干什么」的一段。两种提示词版本都能给出有用的摘要
+        # 末尾若有关键词行就用它，没有就退回互动动作那层——描述里最能
+        # 说清「这张在干什么」的一段
         if tag := self._tag_line(descr):
             bits.append(tag[:130])
-        elif act := " ".join(layers.get(4, "").split()):
+        elif act := " ".join(layers.get(5 if seven else 4, "").split()):
             bits.append(act[:96])
         return " ｜ ".join(bits) or " ".join((descr or "").split())[:120]
 
@@ -1162,11 +1193,11 @@ class TgPresence(Star):
 
     @staticmethod
     def _desc_layers(descr: str) -> dict[int, str]:
-        """按六层标题切开，返回 {层号: 内容}。切不出来返回空。"""
+        """按层标题切开，返回 {层号: 内容}。切不出来返回空。"""
         if not descr:
             return {}
         marks = [m for m in LAYER_RE.finditer(descr) if m.group(1) in LAYER_NUM]
-        if len(marks) < 4:  # 六层里连四层都找不到，格式对不上，别硬切
+        if len(marks) < 4:  # 连四层都找不到，格式对不上，别硬切
             return {}
         layers: dict[int, str] = {}
         for i, m in enumerate(marks):
@@ -1177,7 +1208,7 @@ class TgPresence(Star):
 
     @staticmethod
     def _desc_segments(descr: str) -> dict[str, str]:
-        """按六层标题把描述切成几段，各自要转一个向量。
+        """按层标题把描述切成几段，各自要转一个向量。
 
         切不出层标题（提示词换过、模型没照写）就返回空，那种情况只存
         全文向量，行为跟以前一样。
@@ -1185,8 +1216,12 @@ class TgPresence(Star):
         layers = TgPresence._desc_layers(descr)
         if not layers:
             return {}
+        # 老的六层描述照旧按老映射切。库里两种版本会长期共存（换提示词
+        # 之前索引的那批还在），按新层号硬切的话老描述会把「人物整体」
+        # 混进环境段——不报错、不留痕，只是检索一直差着一点
+        segs = VEC_SEGS if 7 in layers else VEC_SEGS_6
         out: dict[str, str] = {}
-        for col, nums in VEC_SEGS.items():
+        for col, nums in segs.items():
             if nums is None:
                 continue
             txt = "\n".join(x for x in (layers.get(n, "") for n in nums) if x).strip()
@@ -2360,9 +2395,14 @@ class TgPresence(Star):
                         if not text:
                             # 200 却没正文，基本都是内容被拦。原因藏在正文里
                             why = self._refusal_reason(fmt, data)
+                            # blockReason 是送进去就被判死，同一张图重发多少次
+                            # 结果都一样；finishReason 是写到一半被掐，换次
+                            # 采样常常就过了——这两种的重试价值天差地别
+                            hard = "blockReason=" in why
                             raise VisionError(
                                 "HTTP 200 但没有正文" + (f"：{why}" if why else ""),
-                                retryable=True,
+                                retryable=not hard,
+                                blocked=True,
                             )
                         return text
 
@@ -2414,7 +2454,11 @@ class TgPresence(Star):
             raise VisionError("图片读不出来")  # 这张图自己的问题，该记账
 
         tries = max(1, int(self.conf.get("vision_retries", 4) or 4))
+        # 内容拦截单独限次数：它带随机性，重试确实能救回来一部分，但每次
+        # 都是 HTTP 200、照常计费，用通用次数硬顶等于按拦截率成倍烧钱
+        blocked_tries = max(1, min(int(self.conf.get("vision_block_retries", 2) or 2), tries))
         cap = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
+        who = Path(path).name
         last: VisionError | None = None
 
         for attempt in range(1, tries + 1):
@@ -2423,6 +2467,7 @@ class TgPresence(Star):
                     if skip_check and skip_check():
                         return None
                     await self._wait_cooldown()
+                    self._api_calls += 1
                     text = await self._vision_post(cfg, *image)
                 if not text:
                     # 流式路径拿不到响应体，给不出具体原因；非流式的在
@@ -2444,11 +2489,27 @@ class TgPresence(Star):
                 self._note_upstream_ok()
                 return text[:cap]
             except VisionError as e:
+                if e.blocked:
+                    self._api_blocked += 1
                 if e.fatal or not e.retryable:
+                    # 不重试的也要留一行——不然「上游返回 200、这张图却没了」
+                    # 在日志里完全是空白
+                    logger.warning(
+                        f"[tg_presence] 视觉 {who} 第 {attempt}/{tries} 次"
+                        f"{'（内容被拦，重发无用，不再试）' if e.blocked else ''}：{e}"
+                    )
                     raise
                 last = e
-                self._note_upstream_fail()
-                if attempt >= tries:
+                self._note_upstream_fail(str(e))
+                # 内容拦截提前收手：再试也是同样的钱换同样的概率
+                limit = blocked_tries if e.blocked else tries
+                done = attempt >= limit
+                logger.warning(
+                    f"[tg_presence] 视觉 {who} 第 {attempt}/{limit} 次失败"
+                    f"{'（内容被拦）' if e.blocked else ''}"
+                    f"{'，放弃' if done else '，等一会儿重试'}：{e}"
+                )
+                if done:
                     break
                 await asyncio.sleep(self._retry_wait("vision_retry_wait", 10))
 
@@ -2472,9 +2533,11 @@ class TgPresence(Star):
     def _note_upstream_ok(self) -> None:
         self._fail_streak = 0
 
-    def _note_upstream_fail(self) -> None:
+    def _note_upstream_fail(self, why: str = "") -> None:
         """连续失败到一定程度就全局歇一轮，别对着挂掉的上游猛捶。"""
         self._fail_streak += 1
+        if why:
+            self._last_fail = why
         if self._fail_streak < TRIP_STREAK or time.time() < self._cool_until:
             return
         cool = self._retry_wait("vision_retry_wait", 10) * 3
@@ -2482,6 +2545,9 @@ class TgPresence(Star):
         self._fail_streak = 0
         logger.warning(
             f"[tg_presence] 上游连续失败 {TRIP_STREAK} 次，全局暂停 {cool:.0f} 秒"
+            # 光说"失败 8 次"看不出该去修什么：是限流、是配置错、
+            # 还是内容全被拦——把最后一次的原因带上，一眼就能分辨
+            + (f"。最后一次：{self._last_fail}" if self._last_fail else "")
         )
 
     async def _vision_describe(self, pid: str, path: str) -> bool:
@@ -2585,8 +2651,26 @@ class TgPresence(Star):
             return f"{h} 小时 {m} 分"
         return f"{m} 分 {s} 秒" if m else f"{s} 秒"
 
-    async def _index_batch(self, batch: int) -> tuple[int, int]:
-        """跑一批待索引的图，返回 (成功数, 这批取到几张)。
+    def _cost_note(self, calls: int, blocked: int, shots: int) -> str:
+        """一句话说清这批花了多少次调用。没有异常就不啰嗦。
+
+        shots 是这批实际有几张图。calls 明显多于 shots 时才值得报——
+        「98 张图打了 220 次请求」这件事不主动说，用户只能去翻账单。
+        """
+        if not calls or calls <= shots:
+            return ""
+        note = f"API 调用 {calls} 次"
+        if blocked:
+            note += (
+                f"，其中 {blocked} 次被内容策略拦掉"
+                # 这是整件事最反直觉的地方：拦截返回的是 HTTP 200，
+                # 上游记成功、照常扣费，账单上跟正常出图一模一样
+                "（这些上游算成功，照常计费）"
+            )
+        return note
+
+    async def _index_batch(self, batch: int) -> tuple[int, int, str]:
+        """跑一批待索引的图，返回 (成功数, 这批取到几张, 花费说明)。
 
         取到 0 张就是全库索引完了。fatal 异常往外抛，让调用方中止整批。
         """
@@ -2597,8 +2681,9 @@ class TgPresence(Star):
             (VISION_MAX_FAILS, batch),
         ).fetchall()
         if not rows:
-            return 0, 0
+            return 0, 0, ""
 
+        calls0, blocked0 = self._api_calls, self._api_blocked
         jobs = []
         for r in rows:
             if p := self._photo_file(r):
@@ -2615,7 +2700,12 @@ class TgPresence(Star):
         for x in results:
             if isinstance(x, VisionError) and x.fatal:
                 raise x
-        return sum(1 for x in results if x is True), len(rows)
+        note = self._cost_note(
+            self._api_calls - calls0, self._api_blocked - blocked0, len(rows)
+        )
+        if note:
+            logger.info(f"[tg_presence] 本批 {len(rows)} 张，{note}")
+        return sum(1 for x in results if x is True), len(rows), note
 
     async def _index_loop(self, umo: str) -> None:
         """后台把待索引的图全部跑完，一条指令跑到底。
@@ -2631,6 +2721,7 @@ class TgPresence(Star):
         max_dry = max(1, int(self.conf.get("index_max_dry", 12) or 12))
         started = last_report = time.time()
         done = dry = 0
+        calls0, blocked0 = self._api_calls, self._api_blocked
 
         async def say(text: str) -> None:
             try:
@@ -2641,16 +2732,22 @@ class TgPresence(Star):
         try:
             while True:
                 try:
-                    ok, n = await self._index_batch(batch)
+                    ok, n, _ = await self._index_batch(batch)
                 except VisionError as e:
                     await say(f"❌ 配置有问题，索引停了：{e}\n改完发 /gallery index auto 重开。")
                     return
+
+                # 整趟累计的花费，报给用户的都用这个，不是单批的
+                cost = self._cost_note(
+                    self._api_calls - calls0, self._api_blocked - blocked0, done
+                )
 
                 if n == 0:
                     st = self.gallery_stat()
                     await say(
                         f"✅ 索引跑完了，用时 {self._dur(time.time() - started)}。\n"
                         f"本次新增 {done} 张，全库已索引 {st['indexed']}/{st['total']}。"
+                        + (f"\n{cost}" if cost else "")
                         + (
                             f"\n有 {st['stuck']} 张失败跳过，/gallery retry 可以重来。"
                             if st["stuck"]
@@ -2669,8 +2766,14 @@ class TgPresence(Star):
                         st = self.gallery_stat()
                         await say(
                             f"⏸ 连着 {dry} 批一张都没成，上游看来是长时间挂了，先收工。\n"
-                            f"本次完成 {done} 张，还剩 {st['pending']} 张。\n"
-                            f"日志看下原因，恢复后 /gallery index auto 接着跑，进度不丢。"
+                            f"本次完成 {done} 张，还剩 {st['pending']} 张。"
+                            + (f"\n{cost}" if cost else "")
+                            + (
+                                f"\n最后一次失败：{self._last_fail[:120]}"
+                                if self._last_fail
+                                else ""
+                            )
+                            + "\n恢复后 /gallery index auto 接着跑，进度不丢。"
                         )
                         return
                     # 越挂越久就等越久，上限 15 分钟。守着比放弃划算——
@@ -2679,7 +2782,13 @@ class TgPresence(Star):
                     if dry == 1 or dry % 3 == 0:
                         await say(
                             f"⚠️ 上游连续失败（第 {dry} 轮），{wait // 60} 分钟后再试。\n"
-                            f"本次已完成 {done} 张。/gallery index stop 可以停。"
+                            f"本次已完成 {done} 张。"
+                            + (
+                                f"\n原因：{self._last_fail[:120]}"
+                                if self._last_fail
+                                else ""
+                            )
+                            + "\n/gallery index stop 可以停。"
                         )
                     await asyncio.sleep(wait)
                     continue
@@ -2689,6 +2798,7 @@ class TgPresence(Star):
                     await say(
                         f"索引中：本次 {done} 张，全库 {st['indexed']}/{st['total']}，"
                         f"还剩 {st['pending']} 张，已跑 {self._dur(time.time() - started)}。"
+                        + (f"\n{cost}" if cost else "")
                     )
                     last_report = time.time()
         except asyncio.CancelledError:
@@ -5403,7 +5513,7 @@ class TgPresence(Star):
                 f"并发 {self.conf.get('vision_concurrency', 2)}，跑完再报。"
             )
             try:
-                ok, n = await self._index_batch(batch)
+                ok, n, cost = await self._index_batch(batch)
             except VisionError as e:
                 yield event.plain_result(f"配置有问题，已中止：{e}")
                 return
@@ -5411,6 +5521,7 @@ class TgPresence(Star):
             yield event.plain_result(
                 f"完成 {ok}/{n} 张。已索引 {after['indexed']} / {after['total']}，"
                 f"还剩 {after['pending']} 张。"
+                + (f"\n{cost}" if cost else "")
                 + (
                     "\n量大的话用 /gallery index auto，一条指令跑到底。"
                     if after["pending"]
