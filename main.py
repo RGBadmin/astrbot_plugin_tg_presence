@@ -508,6 +508,7 @@ class TgPresence(Star):
     _embed_task = None
     _api_calls = 0
     _api_blocked = 0
+    _api_saved = 0
     _last_fail = ""
 
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -538,6 +539,7 @@ class TgPresence(Star):
         # 上游把拦截也记成 HTTP 200 成功，账单上看不出区别，只能自己数
         self._api_calls: int = 0
         self._api_blocked: int = 0
+        self._api_saved: int = 0
         # /gallery index auto 的后台任务，一次只允许有一个
         self._index_task: asyncio.Task | None = None
         self._embed_task: asyncio.Task | None = None
@@ -2639,13 +2641,16 @@ class TgPresence(Star):
                         if not text:
                             # 200 却没正文，基本都是内容被拦。原因藏在正文里
                             why = self._refusal_reason(fmt, data)
-                            # blockReason 是送进去就被判死，同一张图重发多少次
-                            # 结果都一样；finishReason 是写到一半被掐，换次
-                            # 采样常常就过了——这两种的重试价值天差地别
-                            hard = "blockReason=" in why
+                            # blockReason（送进去就被判死）和 finishReason
+                            # （写到一半被掐）都按可重试处理，一起走
+                            # vision_block_retries。
+                            # 早先版本把 blockReason 判成「重发必然一样」直接
+                            # 放弃，那是从字段语义推的，没有实测支撑——安全
+                            # 分类器本身带随机性，多试一次是有可能过的。
+                            # 想省这笔钱就把那个配置项调到 1。
                             raise VisionError(
                                 "HTTP 200 但没有正文" + (f"：{why}" if why else ""),
-                                retryable=not hard,
+                                retryable=True,
                                 blocked=True,
                             )
                         # 拿到正文也不等于写完了。上游会直接告诉我们是不是
@@ -2719,6 +2724,7 @@ class TgPresence(Star):
         cap = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
         who = Path(path).name
         last: VisionError | None = None
+        blocked_at = 0  # 这张图被内容策略拦了几次
 
         for attempt in range(1, tries + 1):
             try:
@@ -2746,21 +2752,31 @@ class TgPresence(Star):
                     # 重试是有意义的：拒答带随机性，同一张图换一次采样常常就过了
                     raise VisionError(f"返回的不是描述（{why}）：{text[:80]}", retryable=True)
                 self._note_upstream_ok()
+                if blocked_at:
+                    # 被拦过还能成，说明重试确实有用。这是判断
+                    # vision_block_retries 该填几的唯一实证
+                    self._api_saved += 1
+                    logger.info(
+                        f"[tg_presence] 视觉 {who} 第 {attempt} 次过了"
+                        f"（前 {blocked_at} 次被内容策略拦掉）"
+                    )
                 return text[:cap]
             except VisionError as e:
                 if e.blocked:
                     self._api_blocked += 1
+                    blocked_at += 1
                 if e.fatal or not e.retryable:
                     # 不重试的也要留一行——不然「上游返回 200、这张图却没了」
                     # 在日志里完全是空白
                     logger.warning(
                         f"[tg_presence] 视觉 {who} 第 {attempt}/{tries} 次"
-                        f"{'（内容被拦，重发无用，不再试）' if e.blocked else ''}：{e}"
+                        f"{'（内容被拦）' if e.blocked else ''}：{e}"
                     )
                     raise
                 last = e
                 self._note_upstream_fail(str(e))
-                # 内容拦截提前收手：再试也是同样的钱换同样的概率
+                # 内容拦截单独限次数——它带随机性，重试能救回一部分，
+                # 但每试一次都是一次钱，不该跟网络故障用同一个次数
                 limit = blocked_tries if e.blocked else tries
                 done = attempt >= limit
                 logger.warning(
@@ -2917,11 +2933,15 @@ class TgPresence(Star):
             return f"{h} 小时 {m} 分"
         return f"{m} 分 {s} 秒" if m else f"{s} 秒"
 
-    def _cost_note(self, calls: int, blocked: int, shots: int) -> str:
+    def _cost_note(self, calls: int, blocked: int, shots: int,
+                   saved: int = 0) -> str:
         """一句话说清这批花了多少次调用。没有异常就不啰嗦。
 
         shots 是这批实际有几张图。calls 明显多于 shots 时才值得报——
         「98 张图打了 220 次请求」这件事不主动说，用户只能去翻账单。
+
+        saved 是被拦之后靠重试救回来的张数，它决定了
+        vision_block_retries 该调大还是调小——是这条配置唯一的实证依据。
         """
         if not calls or calls <= shots:
             return ""
@@ -2932,6 +2952,10 @@ class TgPresence(Star):
                 # 这是整件事最反直觉的地方：拦截返回的是 HTTP 200，
                 # 上游记成功、照常扣费，账单上跟正常出图一模一样
                 "（这些上游算成功，照常计费）"
+            )
+            note += (
+                f"；重试救回 {saved} 张" if saved
+                else "；重试一张都没救回来，这一项可以调到 1"
             )
         return note
 
@@ -2949,7 +2973,8 @@ class TgPresence(Star):
         if not rows:
             return 0, 0, ""
 
-        calls0, blocked0 = self._api_calls, self._api_blocked
+        calls0, blocked0, saved0 = (
+            self._api_calls, self._api_blocked, self._api_saved)
         jobs = []
         for r in rows:
             if p := self._photo_file(r):
@@ -2967,7 +2992,8 @@ class TgPresence(Star):
             if isinstance(x, VisionError) and x.fatal:
                 raise x
         note = self._cost_note(
-            self._api_calls - calls0, self._api_blocked - blocked0, len(rows)
+            self._api_calls - calls0, self._api_blocked - blocked0, len(rows),
+            self._api_saved - saved0,
         )
         if note:
             logger.info(f"[tg_presence] 本批 {len(rows)} 张，{note}")
@@ -3120,7 +3146,8 @@ class TgPresence(Star):
         max_dry = max(1, int(self.conf.get("index_max_dry", 12) or 12))
         started = last_report = time.time()
         done = dry = 0
-        calls0, blocked0 = self._api_calls, self._api_blocked
+        calls0, blocked0, saved0 = (
+            self._api_calls, self._api_blocked, self._api_saved)
 
         async def say(text: str) -> None:
             try:
@@ -3138,7 +3165,8 @@ class TgPresence(Star):
 
                 # 整趟累计的花费，报给用户的都用这个，不是单批的
                 cost = self._cost_note(
-                    self._api_calls - calls0, self._api_blocked - blocked0, done
+                    self._api_calls - calls0, self._api_blocked - blocked0, done,
+                    self._api_saved - saved0,
                 )
 
                 if n == 0:
@@ -4768,9 +4796,13 @@ class TgPresence(Star):
             text = OWN_STAMP_RE.sub("", text).strip()
         return text
 
-    @filter.command("help", alias={"帮助"})
+    # 不能叫 help —— AstrBot 内置了同名指令，重名的会被忽略（日志里那句
+    # 「命令名 'help' 重复注册」就是它），注册了也永远走不到这儿。
+    # 控制台那边是插件自己路由的，不受这个限制，仍然认 /help
+    @filter.command("tghelp", alias={"插件帮助"})
     async def cmd_help(self, event: AstrMessageEvent, name: str = ""):
-        """列出插件的全部指令。用法：/help，或 /help gallery 看单条。"""
+        """列出插件的全部指令。用法：/tghelp，或 /tghelp gallery 看单条。
+        控制台里直接用 /help。"""
         self._seal_command(event)
         key = (name or "").strip().lstrip("/").lower()
         yield event.plain_result(self._help_text(key) if key else self._help_all())
