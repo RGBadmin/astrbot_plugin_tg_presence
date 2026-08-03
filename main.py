@@ -2188,6 +2188,28 @@ class TgPresence(Star):
         return ""
 
     @staticmethod
+    def _truncated(fmt: str, data: dict) -> bool:
+        """上游有没有说这次输出是被额度掐断的。
+
+        三家的字段名不同，值也不同：
+          gemini     candidates[0].finishReason = MAX_TOKENS
+          anthropic  stop_reason = max_tokens
+          openai     choices[0].finish_reason = length
+        截断的描述看上去和正常的一模一样，只是尾巴没了——而尾巴恰好是
+        标签行和分级标记，丢了不报错、检索悄悄变差。
+        """
+        try:
+            if fmt == "gemini":
+                return (data["candidates"][0].get("finishReason") or "") == "MAX_TOKENS"
+            if fmt == "anthropic":
+                return (data.get("stop_reason") or "") == "max_tokens"
+            return (data["choices"][0].get("finish_reason") or "") == "length"
+        except (KeyError, IndexError, TypeError, AttributeError):
+            # 网关吐回来的结构千奇百怪，认不出就当没截断——
+            # 这一条是保险，不该反过来把正常请求弄挂
+            return False
+
+    @staticmethod
     def _refusal_reason(fmt: str, data: dict) -> str:
         """空回的时候把「为什么空」挖出来。
 
@@ -2472,6 +2494,16 @@ class TgPresence(Star):
                                 "HTTP 200 但没有正文" + (f"：{why}" if why else ""),
                                 retryable=not hard,
                                 blocked=True,
+                            )
+                        # 拿到正文也不等于写完了。上游会直接告诉我们是不是
+                        # 被额度掐断的，比让模型自己写结束标记可靠——那是
+                        # 二手信息，还得指望它配合
+                        if self._truncated(fmt, data):
+                            raise VisionError(
+                                f"输出被最大长度掐断（收到 {len(text)} 字）。"
+                                "调大「最大输出长度」；Gemini 的思考 token 跟正文"
+                                "共用这个额度，也看一眼「思考预算」",
+                                retryable=True,
                             )
                         return text
 
