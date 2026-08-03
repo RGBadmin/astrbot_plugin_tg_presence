@@ -70,6 +70,8 @@ GRAM_MIN_LEN = 4
 
 AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+# 博主目录里会躺一个这个后缀的文件，用来标出"这一级的目录名就是博主名"
+ARCHIVE_EXT = ".archive"
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
 CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
 SIGNATURE_MAX = 120  # setMyShortDescription 的上限
@@ -605,6 +607,25 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 图片登记失败 {path}: {e}")
             return None
 
+    @staticmethod
+    def _folder_of(rel: Path, marked: set[str]) -> str:
+        """定这张图归哪个分类。
+
+        博主目录里放着一个 .archive 文件，那一级的目录名就是博主名。
+        从图片往上找，遇到的第一个带标记的目录就是它的归属——
+        博主目录下再分子目录（按年份、按合集）也归得对。
+
+        没有标记的地方退回「文件名之外的整段路径」：aiimages/ 这种
+        一层结构直接得到 aiimages，而 twitter/某人/ 会得到
+        twitter/某人，两级都还能被模糊匹配搜到，不至于丢信息。
+        """
+        cur = rel.parent
+        while cur != Path("."):
+            if cur.as_posix() in marked:
+                return cur.name
+            cur = cur.parent
+        return rel.parent.as_posix() if rel.parent != Path(".") else ""
+
     def _time_from_name(self, path: Path) -> float | None:
         """从推特媒体文件名解出发推时间。解不出返回 None。
 
@@ -651,18 +672,32 @@ class TgPresence(Star):
 
         # UPSERT 而不是 INSERT OR IGNORE：已登记的行也要刷新 file_time，
         # 否则给老库补这一列时永远填不上
+        # folder 也要跟着刷新：目录改过名、或者分类规则变了（比如从只取顶层
+        # 改成存完整路径），重扫一次就能就地修正，不用清库重来
         SQL = (
             "INSERT INTO photos(path, folder, source, added, file_time) "
             "VALUES (?,?,?,?,?) "
-            "ON CONFLICT(path) DO UPDATE SET file_time = excluded.file_time"
+            "ON CONFLICT(path) DO UPDATE SET "
+            "file_time = excluded.file_time, folder = excluded.folder"
         )
+        # 先过一遍找出博主目录：那里面躺着一个 .archive 文件。
+        # 靠层级猜是不行的——图库可能是 twitter/博主名/ 两层，
+        # 也可能是 aiimages/ 一层，博主目录下还可能再分子目录
+        files = list(root.rglob("*"))
+        marked = {
+            p.parent.relative_to(root).as_posix()
+            for p in files
+            if p.suffix.lower() == ARCHIVE_EXT and p.is_file()
+        }
+        if marked:
+            logger.info(f"[tg_presence] 扫到 {len(marked)} 个带 .archive 标记的目录")
+
         rows = []
-        for p in root.rglob("*"):
+        for p in files:
             if not p.is_file() or p.suffix.lower() not in PHOTO_EXTS:
                 continue
             rel = p.relative_to(root)
-            # 顶层子目录当作分类（一个博主一个文件夹）；直接放根目录的归空分类
-            folder = rel.parts[0] if len(rel.parts) > 1 else ""
+            folder = self._folder_of(rel, marked)
             # 文件名能解出发推时间就用它，那是这张图真正的时间；
             # 解不出再退回 mtime
             when = self._time_from_name(p)
