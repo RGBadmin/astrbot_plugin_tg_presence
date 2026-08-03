@@ -72,6 +72,9 @@ AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 # 博主目录里会躺一个这个后缀的文件，用来标出"这一级的目录名就是博主名"
 ARCHIVE_EXT = ".archive"
+# 视觉模型在描述末行给出的三档尺度。SFW = 能穿出门的日常照；
+# 软NSFW = 冲着身体去但没露点；硬NSFW = 露点或性行为
+RATINGS = ("SFW", "软NSFW", "硬NSFW")
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
 CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
 SIGNATURE_MAX = 120  # setMyShortDescription 的上限
@@ -184,7 +187,7 @@ CREATE TABLE IF NOT EXISTS photos (
     vec_act   BLOB,                    -- 动作段（第四层 + 第六层 + 关键词行）
     tag_state  TEXT,                   -- ok / 无标签 / 段数不齐 / 有问题
     tag_issues TEXT,                   -- 上面那个的具体说明，给 /gallery audit 看
-    rating  TEXT                       -- SFW / NSFW，从描述末行标记解析出来
+    rating  TEXT                       -- SFW / 软NSFW / 硬NSFW，从描述末行标记解析出来
 );
 CREATE INDEX IF NOT EXISTS idx_folder  ON photos(folder);
 CREATE INDEX IF NOT EXISTS idx_pending ON photos(fails) WHERE descr IS NULL;
@@ -867,14 +870,22 @@ class TgPresence(Star):
         return weights, sum(weights) or 1.0
 
     @staticmethod
-    def _norm_rating(raw: str) -> str:
-        """把用户/模型给的分级词归一成 SFW / NSFW，认不出返回空（= 不限）。"""
-        s = (raw or "").strip().upper()
-        if s in ("SFW", "安全", "日常", "正常", "CLEAN"):
-            return "SFW"
-        if s in ("NSFW", "R18", "涩", "色", "露骨", "成人"):
-            return "NSFW"
-        return ""
+    def _rating_filter(raw: str) -> list[str]:
+        """把筛选词翻成允许的分级列表。空列表 = 不限。
+
+        nsfw 这个词故意涵盖软硬两档：说"想看点涩的"时两种都该翻得到，
+        真要精确到某一档就写 soft / hard。
+        """
+        s = (raw or "").strip().upper().replace(" ", "")
+        if s in ("SFW", "安全", "日常", "正常", "CLEAN", "SAFE"):
+            return ["SFW"]
+        if s in ("软NSFW", "软", "SOFT", "SOFTNSFW", "微涩", "半脱"):
+            return ["软NSFW"]
+        if s in ("硬NSFW", "硬", "HARD", "HARDNSFW", "R18", "露点", "露骨"):
+            return ["硬NSFW"]
+        if s in ("NSFW", "涩", "色", "成人", "不安全"):
+            return ["软NSFW", "硬NSFW"]
+        return []
 
     def gallery_search(
         self, keywords: str = "", folder: str = "", limit: int = 8, rating: str = ""
@@ -905,9 +916,9 @@ class TgPresence(Star):
         if folder.strip():
             sql += " AND folder LIKE ?"
             args.append(f"%{folder.strip()}%")
-        if want := self._norm_rating(rating):
-            sql += " AND rating = ?"
-            args.append(want)
+        if want := self._rating_filter(rating):
+            sql += f" AND rating IN ({','.join('?' * len(want))})"
+            args += want
         # 只按命中数排，同分用 id 兜底——不能有 RANDOM()：
         # 同一段词每次搜出来的候选必须是同一批，否则"上次那张"永远漂移。
         # 发送历史和时间的偏好交给后面的权重重排，那里是可控的确定性调整
@@ -1080,18 +1091,17 @@ class TgPresence(Star):
 
     @staticmethod
     def _rating_of(descr: str) -> str:
-        """从描述末行标记里取分级。返回 SFW / NSFW，取不到返回空。
+        """从描述末行标记里取分级。返回三档之一，取不到返回空。
 
-        末行格式是「分级---水印---遮挡」。从后往前找第一个首段是
-        SFW 或 NSFW 的行——正文里偶尔也会出现 --- ，认首段的内容
-        比认行号可靠。
+        末行格式是「分级---水印---遮挡」。从后往前找第一个首段认得出
+        分级的行——正文里偶尔也会出现 --- ，认首段的内容比认行号可靠。
         """
         for raw in reversed((descr or "").splitlines()):
             s = raw.strip()
             if "---" not in s:
                 continue
-            head = s.split("---", 1)[0].strip().upper()
-            if head in ("SFW", "NSFW"):
+            head = s.split("---", 1)[0].strip().upper().replace(" ", "")
+            if head in RATINGS:
                 return head
         return ""
 
@@ -1234,7 +1244,7 @@ class TgPresence(Star):
         压在它上面的分层结构。
         """
         kw_rows = self.gallery_search(keywords or want, folder, limit=pool, rating=rating)
-        want_rating = self._norm_rating(rating)
+        want_rating = self._rating_filter(rating)
 
         vw = float(self.conf.get("vector_weight", 0.4) or 0)
         query = " ".join(x for x in (want.strip(), keywords.strip()) if x)
@@ -1253,7 +1263,7 @@ class TgPresence(Star):
                     continue
                 # 语义那路是全库比对的，分级同样要在这儿卡一道，
                 # 否则说"想看你穿搭"照样能被语义捞出一张露的来
-                if want_rating and (r["rating"] or "") != want_rating:
+                if want_rating and (r["rating"] or "") not in want_rating:
                     continue
                 by_id[int(r["id"])] = dict(r)
 
@@ -2957,7 +2967,7 @@ class TgPresence(Star):
             folder(string): 可选，限定某个相册分类
             prefer_sent(string): 他要的是最近发过的那张就填 recent，要没发过的新图就填 fresh，听不出来就留空（默认 fresh，免得老发同一张）
             around(string): 他提到某个月份就填，格式 YYYY-MM 或 MM，例如「三月那会儿的」填 03。那个月的图会整体排到前面。没提就留空
-            rating(string): 尺度。聊日常、穿搭、自拍、今天去哪儿了这种，填 sfw，免得翻出露的来；他要看你身体、或者你就是想撩他，填 nsfw。留空则两种都会出现。注意这是你的选择而不是限制——想用一张露的去逗他，那就主动填 nsfw
+            rating(string): 尺度，三档。sfw = 穿着能出门的衣服的日常照，聊今天干嘛了、穿搭、自拍时用；soft = 内衣泳装情趣内衣、身体特写、勾人的姿势，但没露点，想撩他一下就填这个；hard = 露点或者更进一步的。想要软硬都行可以填 nsfw，留空则三档都会出现。注意这是你的选择而不是限制——想用一张露的去逗他，那就主动填
         """
         pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
         rows = await self._recall(keywords, want, folder, pool, rating)
@@ -2965,9 +2975,9 @@ class TgPresence(Star):
             stat = self.gallery_stat()
             if not stat["indexed"]:
                 return "相册还没建好索引，现在挑不了。"
-            if self._norm_rating(rating):
+            if want_r := self._rating_filter(rating):
                 return (
-                    f"没找到合适的（只在 {self._norm_rating(rating)} 里翻的）。"
+                    f"没找到合适的（只在 {' / '.join(want_r)} 里翻的）。"
                     "换几个词，或者把 rating 留空再试一次。"
                 )
             return "没找到合适的。换几个词再翻翻，或者把想找的画面整句说出来。"
@@ -4841,14 +4851,21 @@ class TgPresence(Star):
                 f"已登记：{stat['total']} 张 · {stat['folders']} 个分类",
                 f"已索引：{stat['indexed']} 张 · 待索引：{stat['pending']} 张",
             ]
+            marks = ",".join("?" * len(RATINGS))
             rt = self.db().execute(
-                "SELECT SUM(rating = 'SFW') s, SUM(rating = 'NSFW') n, "
-                "SUM(descr IS NOT NULL AND rating IS NULL) u FROM photos"
+                "SELECT SUM(rating = 'SFW') s, SUM(rating = '软NSFW') m, "
+                "SUM(rating = '硬NSFW') n, "
+                # 认不出的一律算「未标」——老库里二分级时期的 'NSFW'
+                # 也落在这里，看见它就该整表重跑一遍索引
+                f"SUM(descr IS NOT NULL AND COALESCE(rating,'') NOT IN ({marks})) u "
+                "FROM photos", RATINGS
             ).fetchone()
-            if (rt["s"] or 0) + (rt["n"] or 0) + (rt["u"] or 0):
+            if sum(rt[k] or 0 for k in ("s", "m", "n", "u")):
                 lines.append(
-                    f"分级：    SFW {rt['s'] or 0} · NSFW {rt['n'] or 0}"
-                    + (f" · 未标 {rt['u']}（老描述没这一行）" if rt["u"] else "")
+                    f"分级：    SFW {rt['s'] or 0} · 软NSFW {rt['m'] or 0}"
+                    f" · 硬NSFW {rt['n'] or 0}"
+                    + (f" · 未标 {rt['u']}（老描述没这一行，重跑索引才有）"
+                       if rt["u"] else "")
                 )
             if stat["stuck"]:
                 lines.append(f"失败跳过：{stat['stuck']} 张（/gallery retry 重来）")
@@ -5208,11 +5225,12 @@ class TgPresence(Star):
             if not rest.strip():
                 yield event.plain_result("要搜什么？例如 /gallery search 红色情趣内衣")
                 return
-            # 词里带 sfw / nsfw 的当成筛选条件摘出来，剩下的才是检索词
-            terms, pick = [], ""
+            # 词里带 sfw / soft / hard / nsfw 的当成筛选条件摘出来，
+            # 剩下的才是检索词
+            terms, pick, pick_label = [], "", ""
             for w in rest.split():
-                if got := self._norm_rating(w):
-                    pick = got
+                if got := self._rating_filter(w):
+                    pick, pick_label = w, " / ".join(got)
                 else:
                     terms.append(w)
             rest = " ".join(terms)
@@ -5236,8 +5254,8 @@ class TgPresence(Star):
             n_kw = sum(1 for r in rows if (r.get("kw_score") or 0) > 0)
             n_vec = sum(1 for r in rows if r.get("sim_score") is not None)
             head = ["切词：" + " / ".join(raw_words)]
-            if pick:
-                head.append(f"只在 {pick} 里翻")
+            if pick_label:
+                head.append(f"只在 {pick_label} 里翻")
             if words != raw_words:
                 dropped = [w for w in raw_words if w not in words]
                 head.append(
