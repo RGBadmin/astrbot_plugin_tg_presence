@@ -248,6 +248,14 @@ VEC_SEGS: dict[str, tuple[int, ...] | None] = {
 LAYER_RE = re.compile(r"^[\s*·・-]*第\s*([一二三四五六])\s*层[^\n]*", re.M)
 LAYER_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 
+# 推特下载的媒体文件名就是推文 ID，同一条推文的多张图带 -1 -2 -3 后缀。
+# 这个 ID 是 snowflake：高 42 位是毫秒时间戳，能还原出发推时刻。
+# 比文件 mtime 可靠得多——mtime 是下载时间，网页上传一次全变成同一天
+# 至少 17 位：snowflake 从 2010-11 启用时就已经是 17 位了，
+# 位数放宽到 15 的话，随便一串 15 位数字都会被解析成 2010 年的推文
+TWEET_ID_RE = re.compile(r"^(\d{17,20})(?:[-_ ]\d{1,2})?$")
+TWITTER_EPOCH_MS = 1288834974657  # 2010-11-04，snowflake 的起点
+
 # 插件自带控制台支持的指令 -> handler 名。
 # 只收不需要平台 client 的那些：/photo /moment /avatar /signature 得借
 # 角色那个 bot 的身份去调 Telegram（发图、改头像、改签名），控制台拿不到
@@ -593,6 +601,28 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 图片登记失败 {path}: {e}")
             return None
 
+    def _time_from_name(self, path: Path) -> float | None:
+        """从推特媒体文件名解出发推时间。解不出返回 None。
+
+        推特下载的文件名就是推文 ID，同一条推文的多张图带 -1 -2 -3。
+        这个 ID 是 snowflake：右移 22 位再加上 2010-11-04 那个起点，
+        就是发推的毫秒时间戳。
+
+        为什么不用文件的 mtime——网页上传不传时间戳，几千张图传完
+        全变成上传那一刻，时间维度直接失效。而文件名里的这个时间是
+        图片内容自带的，跟怎么传、传几次都没关系。
+
+        范围校验挡住误判：一串正好十几位的数字未必是推文 ID，
+        但它解出来的时间落在 2010 年之前或者未来，那就一定不是。
+        """
+        if not self.conf.get("scan_time_from_name", True):
+            return None
+        m = TWEET_ID_RE.match(path.stem.strip())
+        if not m:
+            return None
+        ts = ((int(m.group(1)) >> 22) + TWITTER_EPOCH_MS) / 1000
+        return ts if TWITTER_EPOCH_MS / 1000 < ts < time.time() + 86400 else None
+
     def gallery_scan(self) -> tuple[int, int]:
         """扫描图库目录，把新文件登记进库。返回 (新增, 总数)。
 
@@ -629,11 +659,15 @@ class TgPresence(Star):
             rel = p.relative_to(root)
             # 顶层子目录当作分类（一个博主一个文件夹）；直接放根目录的归空分类
             folder = rel.parts[0] if len(rel.parts) > 1 else ""
-            try:
-                mtime = p.stat().st_mtime
-            except OSError:
-                mtime = None
-            rows.append((rel.as_posix(), folder, "gallery", time.time(), mtime))
+            # 文件名能解出发推时间就用它，那是这张图真正的时间；
+            # 解不出再退回 mtime
+            when = self._time_from_name(p)
+            if when is None:
+                try:
+                    when = p.stat().st_mtime
+                except OSError:
+                    when = None
+            rows.append((rel.as_posix(), folder, "gallery", time.time(), when))
             if len(rows) >= 500:
                 db.executemany(SQL, rows)
                 db.commit()
