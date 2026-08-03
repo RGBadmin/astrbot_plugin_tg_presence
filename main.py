@@ -69,7 +69,7 @@ TAG_VOCAB = _build_vocab()
 GRAM_MIN_LEN = 4
 
 AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
-PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
 CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
 SIGNATURE_MAX = 120  # setMyShortDescription 的上限
@@ -165,19 +165,23 @@ NOTES_PER_TURN = 5
 
 GALLERY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,  -- 就是 gN 里的那个 N
     path    TEXT    NOT NULL UNIQUE,   -- 相对图库根目录；来源非图库时存绝对路径
-    folder  TEXT    NOT NULL DEFAULT '',
-    source  TEXT    NOT NULL DEFAULT 'gallery',  -- gallery / moment
+    folder  TEXT    NOT NULL DEFAULT '',        -- 顶层子目录名，一个博主一个
+    source  TEXT    NOT NULL DEFAULT 'gallery', -- gallery / moment，标明打哪来的
     descr   TEXT,                      -- 视觉 API 的描述；NULL = 还没索引
-    fails   INTEGER NOT NULL DEFAULT 0,
-    sent    INTEGER NOT NULL DEFAULT 0,
-    last_sent REAL,
-    added   REAL    NOT NULL,      -- 扫进库的时间
-    file_time REAL,                -- 文件自身的修改时间，才是这张图真正的时间
-    vec     BLOB,                  -- 描述的语义向量，float32 且已归一化
-    tag_state  TEXT,               -- ok / 无标签 / 段数不齐 / 有问题
-    tag_issues TEXT
+    fails   INTEGER NOT NULL DEFAULT 0,-- 索引失败次数，满 3 次不再自动重试
+    sent    INTEGER NOT NULL DEFAULT 0,-- 发出去过几次，重排时用来避开老发的那几张
+    last_sent REAL,                    -- 上次发出的时刻，「最近发过的那张」靠它
+    added   REAL    NOT NULL,          -- 扫进库的时间，file_time 缺失时顶上
+    file_time REAL,                    -- 这张图自己的时间：推特文件名解出的发推
+                                       -- 时刻，解不出才用文件 mtime
+    vec       BLOB,                    -- 全文向量，float32 且已归一化
+    vec_env   BLOB,                    -- 环境段（第一层 + 第五层）
+    vec_body  BLOB,                    -- 身体段（第二层 + 第三层）
+    vec_act   BLOB,                    -- 动作段（第四层 + 第六层 + 关键词行）
+    tag_state  TEXT,                   -- ok / 无标签 / 段数不齐 / 有问题
+    tag_issues TEXT                    -- 上面那个的具体说明，给 /gallery audit 看
 );
 CREATE INDEX IF NOT EXISTS idx_folder  ON photos(folder);
 CREATE INDEX IF NOT EXISTS idx_pending ON photos(fails) WHERE descr IS NULL;
