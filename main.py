@@ -134,7 +134,10 @@ DEFAULT_VISION_PROMPT = (
 # 视觉解析连续失败这么多次就不再自动重试，避免坏图无限撞 API。
 # 只有「这张图自己的问题」才累加——上游故障不算，见 _gallery_describe
 VISION_MAX_FAILS = 3
-VISION_TIMEOUT = 120  # 秒。图片请求比纯文本慢，给宽裕些
+# 秒。图片请求比纯文本慢，给宽裕些。视觉那条链路可以在配置里改
+# （描述越长生成越久，非流式又必须等它全部写完才返回），转向量那条
+# 一直很快，沿用这个值就够
+VISION_TIMEOUT = 180
 VISION_FORMATS = ("openai", "anthropic", "gemini")
 
 # 上游临时故障，等一会儿重试有意义：限流、网关抽风、后端没起来。
@@ -2376,7 +2379,8 @@ class TgPresence(Star):
         url = self._vision_url(cfg)
         headers = self._vision_headers(cfg)
         fmt = cfg["fmt"]
-        timeout = aiohttp.ClientTimeout(total=VISION_TIMEOUT)
+        secs = self._vision_timeout()
+        timeout = aiohttp.ClientTimeout(total=secs)
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as sess:
@@ -2422,9 +2426,14 @@ class TgPresence(Star):
                             continue
                     return "".join(bits).strip()
         except asyncio.TimeoutError:
-            raise VisionError(f"超时（{VISION_TIMEOUT} 秒）", retryable=True) from None
+            raise VisionError(
+                f"超时（{secs:.0f} 秒）。非流式要等模型全部写完才返回，"
+                "描述越长越久——反代那边的读超时也要够宽",
+                retryable=True,
+            ) from None
         except (aiohttp.ClientError, json.JSONDecodeError, ValueError) as e:
-            # 连接被掐、网关吐了半截 JSON——都是传输层的临时问题，值得再来一次
+            # 连接被掐、网关吐了半截 JSON——都是传输层的临时问题，值得再来一次。
+            # 这类最坑：上游多半已经生成完并计了费，我们却一个字都没拿到
             raise VisionError(f"{type(e).__name__}: {e}", retryable=True) from e
 
     def _note_fail(self, pid: str, why: str) -> None:
@@ -2514,6 +2523,13 @@ class TgPresence(Star):
                 await asyncio.sleep(self._retry_wait("vision_retry_wait", 10))
 
         raise last  # 循环只在重试耗尽时跳出，last 必定有值
+
+    def _vision_timeout(self) -> float:
+        """单次视觉请求最多等多久。下限 30 秒，别配成个把请求全掐死的值。"""
+        return max(
+            30.0,
+            float(self.conf.get("vision_timeout", VISION_TIMEOUT) or VISION_TIMEOUT),
+        )
 
     def _retry_wait(self, key: str, default: int) -> float:
         """重试前等多久。固定值，不做指数退避。
