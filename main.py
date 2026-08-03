@@ -353,6 +353,8 @@ CMD_HELP: dict[str, tuple[str, list[tuple[str, str]], str]] = {
     "gallery": ("管理相册索引", [
         ("/gallery", "看总览：登记多少、索引多少、分级分布、向量进度"),
         ("/gallery scan", "扫目录，把新图登记进库。加了新图先跑这个"),
+        ("/gallery scan prune", "顺带删掉磁盘上已经不存在的那些记录"),
+        ("/gallery scan reset", "清空整个库重扫（描述和向量一起没，要二次确认）"),
         ("/gallery index 50", "索引 50 张，跑完就回结果，适合试水"),
         ("/gallery index auto", "后台跑到全部完成，每隔一阵报进度"),
         ("/gallery index stop", "停掉后台索引，进度不丢"),
@@ -818,6 +820,32 @@ class TgPresence(Star):
         db.row_factory = sqlite3.Row
         try:
             return self._scan_into(db, root)
+        finally:
+            db.close()
+
+    def gallery_prune(self) -> tuple[int, int]:
+        """删掉文件已经不在磁盘上的记录。返回 (删了几条, 剩几条)。
+
+        scan 是纯增量的，图片删掉之后记录会一直留着——检索照样把它翻
+        出来，发的时候才发现文件没了，白扣一次失败计数。几万次 stat
+        要好几秒，跟 scan 一样丢进工作线程，所以自己开一条连接。
+        """
+        root = self._gallery_root()
+        if not root:
+            return 0, 0
+        db = sqlite3.connect(self.db_path)
+        db.row_factory = sqlite3.Row
+        try:
+            gone = [
+                r["id"] for r in db.execute("SELECT id, path FROM photos")
+                if not (root / r["path"]).is_file()
+            ]
+            if gone:
+                db.executemany("DELETE FROM photos WHERE id = ?",
+                               [(i,) for i in gone])
+                db.commit()
+            left = db.execute("SELECT COUNT(*) c FROM photos").fetchone()["c"]
+            return len(gone), left
         finally:
             db.close()
 
@@ -5473,12 +5501,50 @@ class TgPresence(Star):
             if not self._gallery_root():
                 yield event.plain_result("没配相册目录，或路径不存在。填「相册目录」那一项。")
                 return
+            mode = rest.strip().lower().split()
+            what, sure = (mode + ["", ""])[:2]
+
+            if what == "reset":
+                # 描述是花钱跑出来的，清库等于把这笔钱扔了，必须问一次
+                st = self.gallery_stat()
+                if sure not in ("go", "确认"):
+                    yield event.plain_result(
+                        f"⚠️ 这会清空整个库重来：{st['total']} 张登记、"
+                        f"{st['indexed']} 张已索引的描述、全部向量，一起没。\n"
+                        "描述是花钱跑出来的，删了只能重跑。\n\n"
+                        "只是想清掉磁盘上已经不存在的图，用 `/gallery scan prune`。\n"
+                        "确定要清空重来：`/gallery scan reset go`"
+                    )
+                    return
+                db = self.db()
+                db.execute("DELETE FROM photos")
+                db.commit()
+                self._vec_cache.clear()
+                yield event.plain_result(f"已清空 {st['total']} 条记录，重新扫描中…")
+                added, total = await asyncio.to_thread(self.gallery_scan)
+                yield event.plain_result(
+                    f"重建完成，登记 {total} 张。\n用 `/gallery index auto` 建索引。"
+                )
+                return
+
             yield event.plain_result("开始扫描，上万张图可能要几十秒…")
             added, total = await asyncio.to_thread(self.gallery_scan)
-            yield event.plain_result(
-                f"扫完了。新增 {added} 张，库里共 {total} 张。\n"
-                + ("接着 `/gallery index 50` 建索引。" if added else "没有新文件。")
-            )
+            lines = [f"扫完了。新增 {added} 张，库里共 {total} 张。"]
+
+            if what == "prune":
+                gone, left = await asyncio.to_thread(self.gallery_prune)
+                lines.append(
+                    f"清理孤儿记录：删掉 {gone} 条文件已不存在的，剩 {left} 张。"
+                    if gone else "没有孤儿记录，库里每条都能对上磁盘上的文件。"
+                )
+                total = left
+            else:
+                # 不主动扫，那要几万次 stat；只在数量对不上时提一句
+                lines.append("磁盘上删过图的话，`/gallery scan prune` 清掉失效记录。")
+
+            if added:
+                lines.append("接着 `/gallery index auto` 建索引。")
+            yield event.plain_result("\n".join(lines))
             return
 
         if action == "retry":
