@@ -608,6 +608,18 @@ class TgPresence(Star):
             return None
 
     @staticmethod
+    def _folder_label(folder: str) -> str:
+        """分类的简称，给列表显示用。
+
+        推特的目录名是「用户ID@显示名」，比如
+        1346790821wd@王老師的M腿。ID 那截对人没有意义，十几张候选
+        列在一起时全是它在占地方。检索仍按完整名走——她说「王老師」
+        或者贴完整 ID 都能命中。
+        """
+        name = (folder or "").rsplit("/", 1)[-1]
+        return name.rsplit("@", 1)[-1] if "@" in name else name
+
+    @staticmethod
     def _folder_of(rel: Path, marked: set[str]) -> str:
         """定这张图归哪个分类。
 
@@ -2928,7 +2940,7 @@ class TgPresence(Star):
 
         lines = []
         for r in picked:
-            tag = f"[{r['folder']}] " if r["folder"] else ""
+            tag = f"[{self._folder_label(r['folder'])}] " if r["folder"] else ""
             seen = f"发过{r['sent']}次" if r["sent"] else "没发过"
             lines.append(f"g{r['id']} · {tag}{seen}\n  {self._photo_brief(r['descr'])}")
         return (
@@ -2963,7 +2975,7 @@ class TgPresence(Star):
             ).strftime("%m-%d")
         return (
             f"g{row['id']}"
-            + (f"（{row['folder']}）" if row["folder"] else "")
+            + (f"（{self._folder_label(row['folder'])}）" if row["folder"] else "")
             + f"，发过 {row['sent']} 次{when}：\n{row['descr']}"
         )
 
