@@ -485,7 +485,7 @@ class VisionError(Exception):
 
     def __init__(
         self, msg: str, *, retryable: bool = False, fatal: bool = False,
-        blocked: bool = False,
+        blocked: bool = False, hard: bool = False,
     ):
         super().__init__(msg)
         self.retryable = retryable
@@ -493,6 +493,10 @@ class VisionError(Exception):
         # 内容策略拦掉的。这类失败上游返回的是 HTTP 200，计费照算，
         # 所以要单独计数——不然「调用了两百次只出了一百张图」根本查不出原因
         self.blocked = blocked
+        # 输入侧被判死（blockReason）。实测 6637 次里重试救回 0 次，
+        # 而生成中被掐（finishReason）1623 次能救回 680 次。
+        # 两者的重试价值差着一个数量级，次数必须分开配
+        self.hard = hard
 
 
 @register(
@@ -508,6 +512,7 @@ class TgPresence(Star):
     _embed_task = None
     _api_calls = 0
     _api_blocked = 0
+    _api_hard = 0
     _api_saved = 0
     _last_fail = ""
 
@@ -539,6 +544,7 @@ class TgPresence(Star):
         # 上游把拦截也记成 HTTP 200 成功，账单上看不出区别，只能自己数
         self._api_calls: int = 0
         self._api_blocked: int = 0
+        self._api_hard: int = 0
         self._api_saved: int = 0
         # /gallery index auto 的后台任务，一次只允许有一个
         self._index_task: asyncio.Task | None = None
@@ -2641,17 +2647,14 @@ class TgPresence(Star):
                         if not text:
                             # 200 却没正文，基本都是内容被拦。原因藏在正文里
                             why = self._refusal_reason(fmt, data)
-                            # blockReason（送进去就被判死）和 finishReason
-                            # （写到一半被掐）都按可重试处理，一起走
-                            # vision_block_retries。
-                            # 早先版本把 blockReason 判成「重发必然一样」直接
-                            # 放弃，那是从字段语义推的，没有实测支撑——安全
-                            # 分类器本身带随机性，多试一次是有可能过的。
-                            # 想省这笔钱就把那个配置项调到 1。
+                            # 两种拦截的重试价值实测差一个数量级：
+                            # finishReason 救回率 42%，blockReason 是 0%。
+                            # 所以要分开标记，各走各的次数
                             raise VisionError(
                                 "HTTP 200 但没有正文" + (f"：{why}" if why else ""),
                                 retryable=True,
                                 blocked=True,
+                                hard="blockReason=" in why,
                             )
                         # 拿到正文也不等于写完了。上游会直接告诉我们是不是
                         # 被额度掐断的，比让模型自己写结束标记可靠——那是
@@ -2721,6 +2724,10 @@ class TgPresence(Star):
         # 内容拦截单独限次数：它带随机性，重试确实能救回来一部分，但每次
         # 都是 HTTP 200、照常计费，用通用次数硬顶等于按拦截率成倍烧钱
         blocked_tries = max(1, min(int(self.conf.get("vision_block_retries", 2) or 2), tries))
+        # 输入侧判死的那种再单独压一档。实测它重试的回收率是 0，
+        # 默认 1 就是拦了直接跳过，不再浪费第二次调用
+        hard_tries = max(1, min(int(self.conf.get("vision_hardblock_retries", 1) or 1),
+                                blocked_tries))
         cap = max(100, int(self.conf.get("vision_max_chars", 600) or 600))
         who = Path(path).name
         last: VisionError | None = None
@@ -2765,6 +2772,8 @@ class TgPresence(Star):
                 if e.blocked:
                     self._api_blocked += 1
                     blocked_at += 1
+                    if e.hard:
+                        self._api_hard += 1
                 if e.fatal or not e.retryable:
                     # 不重试的也要留一行——不然「上游返回 200、这张图却没了」
                     # 在日志里完全是空白
@@ -2775,13 +2784,15 @@ class TgPresence(Star):
                     raise
                 last = e
                 self._note_upstream_fail(str(e))
-                # 内容拦截单独限次数——它带随机性，重试能救回一部分，
-                # 但每试一次都是一次钱，不该跟网络故障用同一个次数
-                limit = blocked_tries if e.blocked else tries
+                # 三档：输入侧判死 < 生成中被掐 < 网络故障
+                limit = tries
+                if e.blocked:
+                    limit = hard_tries if e.hard else blocked_tries
                 done = attempt >= limit
+                kind = ("（输入侧判死，重发无用）" if e.hard
+                        else "（内容被拦）" if e.blocked else "")
                 logger.warning(
-                    f"[tg_presence] 视觉 {who} 第 {attempt}/{limit} 次失败"
-                    f"{'（内容被拦）' if e.blocked else ''}"
+                    f"[tg_presence] 视觉 {who} 第 {attempt}/{limit} 次失败{kind}"
                     f"{'，放弃' if done else '，等一会儿重试'}：{e}"
                 )
                 if done:
@@ -2934,7 +2945,7 @@ class TgPresence(Star):
         return f"{m} 分 {s} 秒" if m else f"{s} 秒"
 
     def _cost_note(self, calls: int, blocked: int, shots: int,
-                   saved: int = 0) -> str:
+                   saved: int = 0, hard: int = 0) -> str:
         """一句话说清这批花了多少次调用。没有异常就不啰嗦。
 
         shots 是这批实际有几张图。calls 明显多于 shots 时才值得报——
@@ -2953,9 +2964,12 @@ class TgPresence(Star):
                 # 上游记成功、照常扣费，账单上跟正常出图一模一样
                 "（这些上游算成功，照常计费）"
             )
+            if hard:
+                # 拆开说才有意义：这两类的重试价值差一个数量级
+                note += f"，其中 {hard} 次是送进去就被判死的（不重试）"
             note += (
                 f"；重试救回 {saved} 张" if saved
-                else "；重试一张都没救回来，这一项可以调到 1"
+                else "；重试一张都没救回来，可以把重试次数调到 1"
             )
         return note
 
@@ -2973,8 +2987,8 @@ class TgPresence(Star):
         if not rows:
             return 0, 0, ""
 
-        calls0, blocked0, saved0 = (
-            self._api_calls, self._api_blocked, self._api_saved)
+        calls0, blocked0, saved0, hard0 = (
+            self._api_calls, self._api_blocked, self._api_saved, self._api_hard)
         jobs = []
         for r in rows:
             if p := self._photo_file(r):
@@ -2993,7 +3007,7 @@ class TgPresence(Star):
                 raise x
         note = self._cost_note(
             self._api_calls - calls0, self._api_blocked - blocked0, len(rows),
-            self._api_saved - saved0,
+            self._api_saved - saved0, self._api_hard - hard0,
         )
         if note:
             logger.info(f"[tg_presence] 本批 {len(rows)} 张，{note}")
@@ -3146,8 +3160,8 @@ class TgPresence(Star):
         max_dry = max(1, int(self.conf.get("index_max_dry", 12) or 12))
         started = last_report = time.time()
         done = dry = 0
-        calls0, blocked0, saved0 = (
-            self._api_calls, self._api_blocked, self._api_saved)
+        calls0, blocked0, saved0, hard0 = (
+            self._api_calls, self._api_blocked, self._api_saved, self._api_hard)
 
         async def say(text: str) -> None:
             try:
@@ -3166,7 +3180,7 @@ class TgPresence(Star):
                 # 整趟累计的花费，报给用户的都用这个，不是单批的
                 cost = self._cost_note(
                     self._api_calls - calls0, self._api_blocked - blocked0, done,
-                    self._api_saved - saved0,
+                    self._api_saved - saved0, self._api_hard - hard0,
                 )
 
                 if n == 0:
