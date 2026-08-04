@@ -390,6 +390,8 @@ CONSOLE_ROUTES = {
     "link": "cmd_link",
     "say": "cmd_say",
     "act": "cmd_act",
+    "noreply": "cmd_noreply",
+    "reply": "cmd_reply",
     "photo": "cmd_photo",
     "moment": "cmd_moment",
     "avatar": "cmd_avatar",
@@ -406,7 +408,9 @@ CONSOLE_MENU = [
     ("link", "绑定目标会话 · /link UMO"),
     ("say", "让她原样说一句 · /say 内容"),
     ("act", "给个方向，她自己组织语言 · /act 方向"),
-    ("photo", "以她的身份发张照片 · /photo g123 [附言]"),
+    ("noreply", "让她先别回话 · /noreply [分钟]"),
+    ("reply", "解除静默，她重新开口"),
+    ("photo", "发张照片 · /photo 方向，或 /photo g123 [附言]"),
     ("proactive", "主动消息状态 · /proactive now 立即发"),
     ("moment", "让她发条动态到频道 · /moment [内容]"),
     ("avatar", "给她换个头像 · /avatar [分类]"),
@@ -478,6 +482,14 @@ CMD_HELP: dict[str, tuple[str, list[tuple[str, str]], str]] = {
         ("/photo", "让她自己挑一张、自己配话"),
     ], "编号用 `/gallery search` 或 `/gallery show` 找。"
        "要图就用这条——`/act` 只会让她说话，不发图"),
+    "noreply": ("让她先别回话", [
+        ("/noreply", "一直静默，直到 /reply"),
+        ("/noreply 30", "静默 30 分钟后自动恢复"),
+    ], "这期间你说的仍然记进她的记忆，解除后她全知道。"
+       "图片除外——静默期发的图不会被登记"),
+    "reply": ("解除静默，她重新开口", [
+        ("/reply", "现在就恢复"),
+    ], "静默期间攒下的话她都看得到"),
     "moment": ("让她发条动态到频道", [
         ("/moment 今天天气真好", "发这条内容"),
         ("/moment", "让她自己想发什么"),
@@ -4814,6 +4826,15 @@ class TgPresence(Star):
                 f"画面细节 {len(self.vision)} 条"
                 + ("" if self._vision_ready() else "（未配视觉 API）")
             )
+
+        # 静默是最容易忘的状态：她不吭声，看着就像插件坏了
+        for who, until in sorted((self.state.get("silent") or {}).items()):
+            if self._silent_until(who) is None:
+                continue
+            left = (f"，{self._dur(until - time.time())}后恢复"
+                    if until else "，要发 `/reply` 才恢复")
+            lines.append(f"🔇 静默中：{who}{left}")
+
         yield event.plain_result("\n".join(lines))
 
     # --------------------------------------------------------------- 导演模式
@@ -4828,6 +4849,67 @@ class TgPresence(Star):
 
     def _platform_of(self, event: AstrMessageEvent) -> str:
         return self._umo_platform(event.unified_msg_origin)
+
+    # ------------------------------------------------------------ 静默期
+
+    def _silent_until(self, umo: str) -> float | None:
+        """这个会话在不在静默期。返回到期时刻（0 = 不设期限），否则 None。"""
+        if not umo:
+            return None
+        rec = (self.state.get("silent") or {}).get(umo)
+        if rec is None:
+            return None
+        until = float(rec or 0)
+        if until and time.time() >= until:
+            # 到点了自己解除，省得下次还要再判一遍
+            self.state.setdefault("silent", {}).pop(umo, None)
+            self._save_state()
+            logger.info(f"[tg_presence] 静默到期，{umo} 恢复回话")
+            return None
+        return until
+
+    def _set_silent(self, umo: str, minutes: float | None) -> None:
+        """minutes=None 解除；0 表示不设期限。"""
+        box = self.state.setdefault("silent", {})
+        if minutes is None:
+            box.pop(umo, None)
+        else:
+            box[umo] = time.time() + minutes * 60 if minutes else 0
+        self._save_state()
+
+    def _silence_target(self, event: AstrMessageEvent) -> str:
+        """这条 /noreply 该管哪个会话。
+
+        控制台里发就管 /link 绑的那个——控制台自己没有"她"要回话，
+        在那儿静默毫无意义。角色会话里发就管当下这个。
+        """
+        if self._platform_of(event) == "console" or getattr(event, "_console_umo", ""):
+            return (self.state.get("director_target") or "").strip()
+        return event.unified_msg_origin
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def hold_when_silent(self, event: AstrMessageEvent):
+        """静默期里，他说的话只进历史，不惊动她。
+
+        should_call_llm 的语义是反的，传 True 才是禁止。禁掉之后 AstrBot
+        也不再往 conversation 里写这条了（它是在调 LLM 那一步顺手写的），
+        所以得自己补一笔——否则解除静默之后，她对这中间说过的话一无所知，
+        而"说给她听、只是别回"正是这条指令的全部意义。
+        """
+        umo = event.unified_msg_origin
+        if self._silent_until(umo) is None:
+            return
+        text = (event.message_str or "").strip()
+        # 指令一律放行。吞掉的话 /reply 也进不来，静默就再没法解除了
+        if text.startswith("/"):
+            return
+        # 图片在这条路上留不下来：登记和解析都挂在 on_llm_request 上，
+        # 而这一轮压根不调 LLM。留个占位，至少历史是连贯的
+        if not text and event.get_messages():
+            text = "[图片]"
+        if text:
+            await self._append_user(umo, text)
+        event.should_call_llm(True)
 
     def _director_guard(self, event: AstrMessageEvent) -> str | None:
         """校验这条指令来自控制台、且目标绑对了。返回 None 放行。"""
@@ -4876,8 +4958,18 @@ class TgPresence(Star):
         except Exception as e:
             logger.warning(f"[tg_presence] 记录动作失败：{e}")
 
-    async def _append_assistant(self, umo: str, text: str) -> bool:
-        """把一条角色消息写进目标会话的对话历史。
+    async def _append_user(self, umo: str, text: str) -> bool:
+        """把对方的一条消息写进历史。
+
+        静默期专用：那时候不调 LLM，而 AstrBot 是在调 LLM 那一步顺手把
+        消息写进 conversation 的——不自己写这一条就等于没说过。
+        """
+        return await self._append_assistant(umo, text, role="user")
+
+    async def _append_assistant(
+        self, umo: str, text: str, role: str = "assistant"
+    ) -> bool:
+        """把一条消息写进目标会话的对话历史。
 
         导演发出的话必须落进历史，否则她下一轮根本不知道自己说过这句，
         会接不上茬甚至自相矛盾。
@@ -4901,10 +4993,12 @@ class TgPresence(Star):
             if not isinstance(history, list):
                 history = []
             body = text
-            if self.conf.get("stamp_own_messages", True):
+            # 时间戳只给她自己的消息打——对方的消息 AstrBot 本来就带时间，
+            # 再打一道就成了两个时间挤在一起
+            if role == "assistant" and self.conf.get("stamp_own_messages", True):
                 body = f"{datetime.now(self._tz()).strftime(STAMP_FMT)} {text}"
             before = len(history)
-            history.append({"role": "assistant", "content": body})
+            history.append({"role": role, "content": body})
             await cm.update_conversation(umo, cid, history=history)
             logger.info(
                 f"[tg_presence] 已写入对话历史 cid={cid} {before} -> {len(history)} 条"
@@ -5939,6 +6033,69 @@ class TgPresence(Star):
             yield event.plain_result(err)
             return
         yield event.plain_result(await self._director_deliver(text))
+
+    @filter.command("noreply")
+    async def cmd_noreply(self, event: AstrMessageEvent, arg: str = ""):
+        """让她先别回话，你说的仍然记进她的记忆。用法：/noreply [分钟]"""
+        self._seal_command(event)
+        if self._wants_help(arg):
+            yield event.plain_result(self._help_text("noreply"))
+            return
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
+            return
+        umo = self._silence_target(event)
+        if not umo:
+            yield event.plain_result(
+                "不知道要管哪个会话。先在控制台 `/link <UMO>` 绑一个，"
+                "或者直接在跟她的对话里发这条。"
+            )
+            return
+
+        raw = (arg or "").strip()
+        try:
+            mins = float(raw) if raw else 0
+        except ValueError:
+            yield event.plain_result("分钟数得是个数字，比如 `/noreply 30`。不填就是一直静默。")
+            return
+        if mins < 0:
+            yield event.plain_result("分钟数不能是负的。")
+            return
+
+        self._set_silent(umo, mins)
+        when = (
+            f"{self._dur(mins * 60)}后自动恢复（"
+            + datetime.fromtimestamp(
+                time.time() + mins * 60, self._tz()
+            ).strftime("%H:%M")
+            + "）"
+            if mins else "一直静默到你发 `/reply`"
+        )
+        yield event.plain_result(
+            f"她先不回话了，{when}。\n"
+            "这期间你说的仍然会记进她的记忆，解除之后她全知道。\n"
+            "⚠️ 图片是个例外：这期间发的图不会被登记，历史里只留个 [图片]。"
+        )
+
+    @filter.command("reply")
+    async def cmd_reply(self, event: AstrMessageEvent, arg: str = ""):
+        """解除静默，她重新开口。用法：/reply"""
+        self._seal_command(event)
+        if self._wants_help(arg):
+            yield event.plain_result(self._help_text("reply"))
+            return
+        if self.conf.get("admin_only_commands", True) and event.role != "admin":
+            yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
+            return
+        umo = self._silence_target(event)
+        if self._silent_until(umo) is None:
+            yield event.plain_result("她本来就在回话，没什么要解除的。")
+            return
+        self._set_silent(umo, None)
+        yield event.plain_result(
+            "她重新开口了。静默期间你说的话都在她记忆里，"
+            "接下来那句她是带着这些说的。"
+        )
 
     @filter.command("act")
     async def cmd_act(self, event: AstrMessageEvent, *, brief: str = ""):
