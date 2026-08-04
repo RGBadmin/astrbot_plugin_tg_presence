@@ -6,10 +6,12 @@ import inspect
 import json
 import math
 import mimetypes
+import os
 import random
 import re
 import shutil
 import sqlite3
+import stat
 import struct
 import time
 from datetime import datetime
@@ -558,6 +560,7 @@ class TgPresence(Star):
         self._key_cache: dict[str, str] = {}
         self.db_path = self.data_dir / "gallery.db"
         self._db: sqlite3.Connection | None = None
+        self._check_data_dir()
         # {列名: (ids, numpy矩阵)}，第一次语义检索时构建，写入新向量后清空重建
         self._vec_cache: dict[str, tuple[list[int], object]] = {}
         # 上游熔断：连续失败到阈值就全局停一会儿，冷却时长随连续熔断次数翻倍
@@ -687,11 +690,87 @@ class TgPresence(Star):
         state.setdefault("daily", {})
         return state
 
+    # ---------------------------------------------------------- 数据目录权限
+
+    @staticmethod
+    def _me() -> str:
+        uid = getattr(os, "geteuid", lambda: None)()
+        gid = getattr(os, "getegid", lambda: None)()
+        return f"uid={uid} gid={gid}" if uid is not None else "（这个平台没有 uid）"
+
+    @staticmethod
+    def _own_of(p: Path) -> str:
+        try:
+            st_ = p.stat()
+            return (f"属主 uid={st_.st_uid} gid={st_.st_gid} "
+                    f"权限 {stat.S_IMODE(st_.st_mode):04o}")
+        except OSError as e:
+            return f"（读不到属性：{e}）"
+
+    @staticmethod
+    def _ensure_writable(path: Path) -> None:
+        """确保自己建的文件属主写得动。
+
+        新文件的权限受进程 umask 摆布，从别处拷来的还会带着源文件的权限位。
+        属主不是自己时 chmod 注定失败，那种情况这里无能为力，留给启动自检报。
+        """
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode)
+            if not mode & stat.S_IWUSR:
+                path.chmod(mode | stat.S_IWUSR)
+        except OSError:
+            pass
+
+    def _check_data_dir(self) -> None:
+        """启动时验一次数据目录能不能写，不能就把该查的都摆出来。
+
+        写不进去的时候 SQLite 只甩一句 attempt to write a readonly
+        database：不说是哪个文件、不说进程是谁、也不说文件属主是谁。
+        对着那句话查不出任何东西，所以这里一次把三样都打出来。
+        """
+        d = self.data_dir
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(f"[tg_presence] 建不了数据目录 {d}：{e}")
+            return
+
+        probe = d / ".writetest"
+        try:
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError as e:
+            logger.error(
+                f"[tg_presence] 数据目录写不进去，插件基本没法用：{d}\n"
+                f"    {e}\n"
+                f"    目录 {self._own_of(d)}\n"
+                f"    进程 {self._me()}\n"
+                "    属主跟进程对不上就 chown 一下，或者换个能写的用户跑 AstrBot。"
+            )
+            return
+
+        bad = [p for p in (self.state_path, self.vision_path, self.db_path)
+               if p.exists() and not os.access(p, os.W_OK)]
+        if not bad:
+            return
+        detail = "\n".join(f"    {p.name}  {self._own_of(p)}" for p in bad)
+        logger.error(
+            "[tg_presence] 这几个文件写不动，动态记录和相册索引都会存不下来：\n"
+            f"{detail}\n"
+            f"    进程 {self._me()}\n"
+            "    目录本身是能写的，所以多半是这些文件被别的用户建过——"
+            "宿主机上直接动过，或者早先以 root 跑过容器。\n"
+            "    chown 成进程那个 uid 即可。删掉重建也行，但 state.json 丢的是"
+            "动态记录和冷却，gallery.db 丢的是花钱跑出来的描述。"
+        )
+
     def _save_state(self) -> None:
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        # replace 是把 tmp 的 inode 顶上去，所以权限跟的是 tmp 而不是原文件
+        self._ensure_writable(tmp)
         tmp.replace(self.state_path)
 
     def _load_vision(self) -> dict:
@@ -714,6 +793,7 @@ class TgPresence(Star):
         tmp.write_text(
             json.dumps(self.vision, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        self._ensure_writable(tmp)
         tmp.replace(self.vision_path)
 
     # ------------------------------------------------------------ 图库索引库
@@ -724,19 +804,52 @@ class TgPresence(Star):
         SQLite 是标准库，增量写、按需查，不引入任何依赖。
         """
         if self._db is None:
-            self._db = sqlite3.connect(self.db_path)
-            self._db.row_factory = sqlite3.Row
-            self._db.executescript(GALLERY_SCHEMA)
-            # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
-            have = {r["name"] for r in self._db.execute("PRAGMA table_info(photos)")}
-            cols = [("tag_state", "TEXT"), ("tag_issues", "TEXT"), ("file_time", "REAL"),
-                    ("rating", "TEXT")]
-            cols += [(c, "BLOB") for c in VEC_SEGS]
-            for col, typ in cols:
-                if col not in have:
-                    self._db.execute(f"ALTER TABLE photos ADD COLUMN {col} {typ}")
-            self._db.commit()
+            db = self._connect()
+            try:
+                self._db_setup(db)
+            except Exception as e:
+                # 建表失败也要连人带连接一起丢掉。留着的话下次进来
+                # self._db 非 None 直接返回，拿到的是一条没有表的连接，
+                # 之后每一句都报 no such table——把真正的原因盖得严严实实
+                db.close()
+                if isinstance(e, sqlite3.OperationalError):
+                    # 这几种都不是数据的问题，是文件系统的问题，光看
+                    # SQLite 那句原文没人知道该去查什么
+                    raise RuntimeError(
+                        f"打不开图库索引 {self.db_path}：{e}。"
+                        "多半是这个文件或它所在的目录对 AstrBot 进程不可写"
+                        "（属主不对、挂载成了只读、或磁盘满）。容器里 "
+                        "ls -ln 看属主，跟 id -u 对一下。"
+                    ) from e
+                raise
+            self._db = db
         return self._db
+
+    def _connect(self) -> sqlite3.Connection:
+        """连库。工作线程要自己的连接，所以单拎出来。
+
+        连之前先把写位补上：SQLite 在 connect 那一刻就按当时的权限决定
+        这条连接是只读还是读写，之后再 chmod 也救不回已经打开的句柄。
+        """
+        if self.db_path.exists():
+            self._ensure_writable(self.db_path)
+        db = sqlite3.connect(self.db_path)
+        db.row_factory = sqlite3.Row
+        return db
+
+    @staticmethod
+    def _db_setup(db: sqlite3.Connection) -> None:
+        """建表 + 给老库补列。幂等，任何一条连接进来都可以先跑一遍。"""
+        db.executescript(GALLERY_SCHEMA)
+        # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
+        have = {r["name"] for r in db.execute("PRAGMA table_info(photos)")}
+        cols = [("tag_state", "TEXT"), ("tag_issues", "TEXT"), ("file_time", "REAL"),
+                ("rating", "TEXT")]
+        cols += [(c, "BLOB") for c in VEC_SEGS]
+        for col, typ in cols:
+            if col not in have:
+                db.execute(f"ALTER TABLE photos ADD COLUMN {col} {typ}")
+        db.commit()
 
     def _gallery_root(self) -> Path | None:
         raw = (self.conf.get("gallery_dir") or "").strip()
@@ -849,10 +962,11 @@ class TgPresence(Star):
 
         # 这个方法通过 asyncio.to_thread 跑在工作线程里——扫几万个文件要几十秒，
         # 不能占着事件循环。但 SQLite 连接不许跨线程用，所以开一条本线程自己的，
-        # 用完就关。建表由主线程的 self.db() 负责，这里只管读写。
-        db = sqlite3.connect(self.db_path)
-        db.row_factory = sqlite3.Row
+        # 用完就关。自己建一次表：插件起来后第一条命令就是 /gallery scan 的话，
+        # 主线程的 db() 还一次都没被调过，表根本不存在。
+        db = self._connect()
         try:
+            self._db_setup(db)
             return self._scan_into(db, root)
         finally:
             db.close()
@@ -867,9 +981,9 @@ class TgPresence(Star):
         root = self._gallery_root()
         if not root:
             return 0, 0
-        db = sqlite3.connect(self.db_path)
-        db.row_factory = sqlite3.Row
+        db = self._connect()
         try:
+            self._db_setup(db)
             gone = [
                 r["id"] for r in db.execute("SELECT id, path FROM photos")
                 if not (root / r["path"]).is_file()
@@ -1946,7 +2060,11 @@ class TgPresence(Star):
             suffix = src.suffix.lower() or ".jpg"
             dst = store / f"{int(time.time() * 1000)}_{len(saved)}{suffix}"
             try:
-                shutil.copy2(src, dst)
+                # copyfile 而不是 copy2：后者连源文件的权限位一起复制，
+                # 平台临时目录里的图是只读的话副本就跟着只读，之后想覆盖
+                # 想删都得先 chmod。这里只要内容，权限按本进程的 umask 来
+                shutil.copyfile(src, dst)
+                self._ensure_writable(dst)
             except OSError as e:
                 logger.warning(f"[tg_presence] 附带图片保存失败: {e}")
                 continue
