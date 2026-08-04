@@ -485,8 +485,7 @@ CMD_HELP: dict[str, tuple[str, list[tuple[str, str]], str]] = {
     "noreply": ("让她先别回话", [
         ("/noreply", "一直静默，直到 /reply"),
         ("/noreply 30", "静默 30 分钟后自动恢复"),
-    ], "这期间你说的仍然记进她的记忆，解除后她全知道。"
-       "图片除外——静默期发的图不会被登记"),
+    ], "这期间你说的话、发的图都照常进她的记忆，解除后她全知道"),
     "reply": ("解除静默，她重新开口", [
         ("/reply", "现在就恢复"),
     ], "静默期间攒下的话她都看得到"),
@@ -4887,6 +4886,46 @@ class TgPresence(Star):
             return (self.state.get("director_target") or "").strip()
         return event.unified_msg_origin
 
+    async def _stash_event_photos(self, event: AstrMessageEvent) -> list[str]:
+        """把这条消息里的图片存档、登记编号、派发视觉解析，返回编号。
+
+        静默期专用。正常那条路（register_context_photos）是从 LLM 请求的
+        base64 上下文里取图的，而静默期压根不调 LLM——图只存在于事件本身。
+
+        这里把文件读回 base64 再走同一个 _stash_photo，不另起一套哈希：
+        编号是按 base64 的 sha256 算的，两条路必须算出同一个值，否则同一
+        张图会拿到两个编号。
+        """
+        if not self._vision_ready() and (
+            int(self.conf.get("max_context_images", 0) or 0) <= 0
+        ):
+            return []                     # 两样都不需要，就别白占磁盘
+        import astrbot.api.message_components as Comp
+
+        store = self.data_dir / "context_photos"
+        store.mkdir(parents=True, exist_ok=True)
+        seen: list[str] = []
+        for seg in event.get_messages():
+            if not isinstance(seg, Comp.Image):
+                continue
+            try:
+                src = Path(await seg.convert_to_file_path())
+                raw = src.read_bytes()
+            except Exception as e:
+                logger.warning(f"[tg_presence] 静默期存图失败：{e}")
+                continue
+            mime = mimetypes.guess_type(src.name)[0] or "image/jpeg"
+            url = f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+            if pid := self._stash_photo(url, store):
+                if pid not in seen:
+                    seen.append(pid)
+                # 这条路上没有 LLM 上下文可以推时间，就用收到的时刻
+                self.state.setdefault("photo_time", {}).setdefault(pid, time.time())
+        if seen:
+            self._save_state()
+        self._dispatch_vision(seen)
+        return seen
+
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def hold_when_silent(self, event: AstrMessageEvent):
         """静默期里，他说的话只进历史，不惊动她。
@@ -4903,10 +4942,12 @@ class TgPresence(Star):
         # 指令一律放行。吞掉的话 /reply 也进不来，静默就再没法解除了
         if text.startswith("/"):
             return
-        # 图片在这条路上留不下来：登记和解析都挂在 on_llm_request 上，
-        # 而这一轮压根不调 LLM。留个占位，至少历史是连贯的
-        if not text and event.get_messages():
-            text = "[图片]"
+        # 图照样存档、编号、送去解析，只是她当下不看。占位写成 [图片 #N]，
+        # 跟折叠出来的那种一个格式——解除静默后她能 inspect_photo 查画面、
+        # recall_photo 取回原图，跟正常收到的图没有区别
+        if pids := await self._stash_event_photos(event):
+            tag = " ".join(f"[图片 #{p}]" for p in pids)
+            text = f"{text} {tag}".strip()
         if text:
             await self._append_user(umo, text)
         event.should_call_llm(True)
@@ -6073,8 +6114,10 @@ class TgPresence(Star):
         )
         yield event.plain_result(
             f"她先不回话了，{when}。\n"
-            "这期间你说的仍然会记进她的记忆，解除之后她全知道。\n"
-            "⚠️ 图片是个例外：这期间发的图不会被登记，历史里只留个 [图片]。"
+            "这期间你说的话、发的图都照常进她的记忆——图也存档编号、"
+            "送去解析，解除后问她「刚才那张」她查得到。\n"
+            "只有一样补不回来：她当时没看见，说不出「这是你加班时拍的」"
+            "那种带上下文的话。"
         )
 
     @filter.command("reply")
