@@ -1331,7 +1331,10 @@ class TgPresence(Star):
         "跨度大"而是判错了，按更重的那一档收——把露骨的记成日常，
         代价是聊日常时翻出露点图，反过来只是少几张候选。
         """
-        for raw in reversed((descr or "").splitlines()):
+        # 两头都找：标签行放开头还是放末尾都认。先顺着扫，因为正文里
+        # 出现「首段恰好完整等于某个档名」的行概率极低，扫到就是它
+        lines = (descr or "").splitlines()
+        for raw in lines + lines[::-1]:
             s = raw.strip()
             if "---" not in s:
                 continue
@@ -1423,6 +1426,8 @@ class TgPresence(Star):
         marks = [m for m in LAYER_RE.finditer(descr) if m.group(1) in LAYER_NUM]
         if len(marks) < 4:  # 连四层都找不到，格式对不上，别硬切
             return {}
+        # 第一个层标题之前的东西不属于任何一层（标签行放开头时就在这儿），
+        # 切分从第一个标题开始，前面的原样丢掉
         layers: dict[int, str] = {}
         for i, m in enumerate(marks):
             end = marks[i + 1].start() if i + 1 < len(marks) else len(descr)
@@ -1451,6 +1456,11 @@ class TgPresence(Star):
             txt = "\n".join(x for x in (layers.get(n, "") for n in nums) if x).strip()
             if txt:
                 out[col] = txt
+        # 标签行是关键词密度最高的一段，必须进动作段。它跟在最后一层
+        # 后面时天然就被带上了，但放到开头之后就落在所有层之外——
+        # 不显式拼回来，语义检索会丢掉最该抓住的那些词
+        if (tag := TgPresence._tag_line(descr)) and tag not in out.get("vec_act", ""):
+            out["vec_act"] = (out.get("vec_act", "") + "\n" + tag).strip()
         return out
 
     def _load_matrix(self, col: str = "vec"):
