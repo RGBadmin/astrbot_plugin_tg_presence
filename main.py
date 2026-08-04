@@ -114,6 +114,43 @@ RATING_SYNONYMS = {
     "重口": ("露点", "淫荡"), "露骨": ("露点", "淫荡"),
 }
 
+# 这身打扮适合什么季节穿出去——按室外环境和衣着厚薄判断，不是拍摄日期。
+# 大热天翻出一身深秋穿搭发给他，比发错尺度还出戏
+SEASON_ORDER = ("春", "夏", "秋", "冬")
+# 室内、特写、看不出季节的，任何时候发都不违和
+SEASON_ANY = "四季"
+SEASON_ALIAS = {
+    "四季皆可": SEASON_ANY, "通用": SEASON_ANY, "不明": SEASON_ANY,
+    "看不出": SEASON_ANY, "无法判断": SEASON_ANY, "室内": SEASON_ANY,
+    "春季": "春", "夏季": "夏", "秋季": "秋", "冬季": "冬",
+    "初春": "春", "早春": "春", "暮春": "春",
+    "初夏": "夏", "盛夏": "夏", "仲夏": "夏",
+    "初秋": "秋", "深秋": "秋", "晚秋": "秋",
+    "初冬": "冬", "深冬": "冬", "隆冬": "冬", "严冬": "冬",
+}
+# 跟分级不同，季节不要求相邻——「春秋装」是最常见的说法之一，
+# 而春和秋在环上隔着两格。所以任意组合都收，只是排序时按集合取交
+SEASON_RE = re.compile(
+    "|".join(sorted(SEASON_ORDER + (SEASON_ANY,) + tuple(SEASON_ALIAS),
+                    key=len, reverse=True))
+)
+# 他随口说的时令词。「现在这个季节」这类不在这儿，那走 season=now
+SEASON_SYNONYMS = {
+    "春": ("春",), "春天": ("春",), "开春": ("春",), "春装": ("春",),
+    "夏": ("夏",), "夏天": ("夏",), "盛夏": ("夏",), "夏装": ("夏",),
+    "热": ("夏",), "炎热": ("夏",), "大热天": ("夏",),
+    "秋": ("秋",), "秋天": ("秋",), "秋装": ("秋",),
+    "冬": ("冬",), "冬天": ("冬",), "冬装": ("冬",),
+    "冷": ("冬",), "寒冷": ("冬",), "大冬天": ("冬",),
+    "春秋": ("春", "秋"), "春秋装": ("春", "秋"),
+    "换季": ("春", "秋"), "过渡": ("春", "秋"),
+}
+# 月份 → 季节。跨半球或者当地气候特殊的话，这张表可以按需改
+SEASON_OF_MONTH = {
+    3: "春", 4: "春", 5: "春", 6: "夏", 7: "夏", 8: "夏",
+    9: "秋", 10: "秋", 11: "秋", 12: "冬", 1: "冬", 2: "冬",
+}
+
 # 标签行里超过这个汉字数的段，实测几乎全是模型硬拼的字堆。
 # 正常标签 87% 在四字以内、97% 在六字以内，十字往上就是垃圾了
 JUNK_SEG_MIN = 10
@@ -241,6 +278,9 @@ CREATE TABLE IF NOT EXISTS photos (
     vec_act   BLOB,                    -- 动作段（互动动作 + 体液痕迹 + 关键词行）
     tag_state  TEXT,                   -- ok / 无标签 / 段数不齐 / 有问题
     tag_issues TEXT,                   -- 上面那个的具体说明，给 /gallery audit 看
+    season  TEXT,                      -- 这身打扮适合什么季节穿出去，按室外
+                                       --   环境和衣着厚薄判断，不是拍摄日期。
+                                       --   春/夏/秋/冬 的任意组合，或「四季」
     rating  TEXT                       -- 六档之一，或相邻两档（生活/OOTD/性感/
                                        --   诱惑/露点/淫荡，如「性感+诱惑」）。
                                        --   从标签行首段解析出来
@@ -844,7 +884,7 @@ class TgPresence(Star):
         # 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
         have = {r["name"] for r in db.execute("PRAGMA table_info(photos)")}
         cols = [("tag_state", "TEXT"), ("tag_issues", "TEXT"), ("file_time", "REAL"),
-                ("rating", "TEXT")]
+                ("rating", "TEXT"), ("season", "TEXT")]
         cols += [(c, "BLOB") for c in VEC_SEGS]
         for col, typ in cols:
             if col not in have:
@@ -1468,6 +1508,73 @@ class TgPresence(Star):
             return RATING_TIER_ORDER[idx[-1]]
         return ""
 
+    @staticmethod
+    def _col(row, name: str, default=None):
+        """取一列。SELECT 没选到、或老库还没补上这一列时给默认值。
+
+        sqlite3.Row 取不存在的列抛 IndexError，而不是像 dict 那样返回
+        None——季节这种后加的列，四处判空会到处踩这个坑。
+        """
+        try:
+            return row[name]
+        except (IndexError, KeyError, TypeError):
+            return default
+
+    @staticmethod
+    def _season_of(descr: str) -> str:
+        """从标签行第二段取季节，取不到返回空。
+
+        新标签行是「分级---季节---水印---遮挡---关键词…」，老的没有季节
+        这一项、第二段是水印。所以要验第二段整个由季节词组成——水印那项
+        的值跟季节词不重合，验一下就能把两代标签分开，老库不必重跑。
+
+        季节不要求相邻：「春秋装」是最常见的说法之一，而春和秋在环上
+        隔着两格。四季全中或明写「四季」的，归成四季皆可。
+        """
+        lines = (descr or "").splitlines()
+        for raw in lines + lines[::-1]:
+            s = raw.strip()
+            if s.count("---") < 2:
+                continue
+            segs = s.split("---")
+            head = segs[0].strip().replace(" ", "")
+            head = re.sub(r"ootd", "OOTD", head, flags=re.I)
+            # 先确认这确实是标签行：首段只由档位词和连接符组成
+            tiers = {RATING_ALIAS.get(x, x) for x in RATING_RE.findall(head)}
+            if not tiers or RATING_RE.sub("", head).strip(RATING_SEPS):
+                continue
+            # 标签行整篇只有一条，认准了就别再往下找
+            sec = segs[1].strip().replace(" ", "")
+            found = SEASON_RE.findall(sec)
+            if not found or SEASON_RE.sub("", sec).strip(RATING_SEPS):
+                return ""          # 是标签行，但第二段不是季节——老格式
+            got = {SEASON_ALIAS.get(x, x) for x in found}
+            if SEASON_ANY in got or got >= set(SEASON_ORDER):
+                return SEASON_ANY
+            return "+".join(x for x in SEASON_ORDER if x in got)
+        return ""
+
+    @staticmethod
+    def _season_tiers(raw: str) -> set[str]:
+        """把「夏天」「春秋装」这类说法转成季节集合，认不出返回空集。"""
+        s = (raw or "").strip()
+        if not s:
+            return set()
+        got: set[str] = set()
+        for word, seasons in SEASON_SYNONYMS.items():
+            if word in s:
+                got.update(seasons)
+        for x in SEASON_RE.findall(s):
+            v = SEASON_ALIAS.get(x, x)
+            if v == SEASON_ANY:
+                return set(SEASON_ORDER)
+            got.add(v)
+        return got & set(SEASON_ORDER)
+
+    def _now_season(self) -> str:
+        """当下是什么季节。按月份切，跨半球的话改 SEASON_OF_MONTH。"""
+        return SEASON_OF_MONTH[datetime.now(self._tz()).month]
+
     def _polish(self, descr: str) -> str:
         """入库前把描述过一遍：标签行去掉硬拼的长段，主体名归一。
 
@@ -1737,7 +1844,8 @@ class TgPresence(Star):
         return None
 
     def _rerank(
-        self, rows: list[sqlite3.Row], prefer_sent: str = "", around: str = ""
+        self, rows: list[sqlite3.Row], prefer_sent: str = "", around: str = "",
+        season: str = "",
     ) -> list[sqlite3.Row]:
         """对粗筛结果重排。纯计算，不调模型。
 
@@ -1761,6 +1869,46 @@ class TgPresence(Star):
         # 必须全部排在前面，不能因为某张更新、恰好又没发过就被顶上来
         told_pref = bool(pref) and not ignore_sent
 
+        # 季节。他明说要哪季就按那个，没说而且开了当季偏好就按当下——
+        # 大热天翻出一身深秋穿搭发过去，比发错尺度还出戏
+        raw_season = (season or "").strip()
+        told_season = bool(raw_season)
+        # 要的是不是「当下这个季节」。它跟「明确要冬天」得分开：前者
+        # 四季皆可的图随时能发、算合适，后者他点名要冬装，看不出季节的
+        # 就不该顶在真冬装前面
+        want_now = False
+        if raw_season.lower() in ("now", "现在", "当季", "当下", "这个季节", "当前"):
+            want_season, want_now = {self._now_season()}, True
+        else:
+            want_season = self._season_tiers(raw_season)
+            told_season = told_season and bool(want_season)
+        if not told_season and self.conf.get("season_prefer", True):
+            want_season, want_now = {self._now_season()}, True
+        elif not told_season:
+            want_season = set()
+
+        def season_rank(r: sqlite3.Row) -> int:
+            """0 合季 / 1 不确定 / 2 明显不合季。
+
+            三档而不是两档：没标出季节的图（老库、模型漏写、纯特写）
+            不该跟冬装在夏天一起被打入冷宫——不知道不等于不合适。
+
+            「四季」这一档两种场景下含义不同：要当下时令的图时它随时
+            能发，算合适；他点名要春秋装时，看不出季节的并不是春秋装，
+            得让真标着春秋的排在前面。
+            """
+            if not want_season:
+                return 0
+            s = (self._col(r, "season") or "").strip()
+            if not s:
+                return 1
+            got = set(s.split("+"))
+            if got & want_season:
+                return 0
+            if SEASON_ANY in got:
+                return 0 if want_now else 1
+            return 2
+
         def key(r: sqlite3.Row):
             # 图片自身的时间优先用文件修改时间；老库还没回填就退回入库时间
             ft = float(r["file_time"] or r["added"] or 0)
@@ -1777,8 +1925,15 @@ class TgPresence(Star):
                 else:
                     default += 1
 
-            # 明说的条件 > 默认偏好 > 匹配度 > 新的优先 > id 兜底
-            return (-told, -default, -float(r["score"] or 0), -ft, int(r["id"]))
+            # 季节有三个层次，塞不进上面那套布尔加减，单开一个键。
+            # 他明说要哪季时压过默认偏好，只是"当季优先"时让在默认偏好后面
+            sr = season_rank(r)
+            s_told = sr if told_season else 0
+            s_default = 0 if told_season else sr
+
+            # 明说的条件 > 明说的季节 > 默认偏好 > 当季 > 匹配度 > 新的 > id
+            return (-told, s_told, -default, s_default,
+                    -float(r["score"] or 0), -ft, int(r["id"]))
 
         return sorted(rows, key=key)
 
@@ -3447,8 +3602,9 @@ class TgPresence(Star):
             # 不清的话 embed 那边「descr 有、vec 空」的条件选不中它，
             # 新描述会一直配着旧向量，检索错得毫无痕迹
             f"UPDATE photos SET descr = ?, {VEC_NULLS}, fails = 0, tag_state = ?, "
-            "tag_issues = ?, rating = ? WHERE id = ?",
-            (text, verdict, "; ".join(issues[:8]), self._rating_of(text) or None, row_id),
+            "tag_issues = ?, rating = ?, season = ? WHERE id = ?",
+            (text, verdict, "; ".join(issues[:8]), self._rating_of(text) or None,
+             self._season_of(text) or None, row_id),
         )
         db.commit()
         if verdict not in ("ok", "无标签"):
@@ -3722,7 +3878,7 @@ class TgPresence(Star):
     async def browse_gallery(
         self, event: AstrMessageEvent, keywords: str = "", want: str = "",
         folder: str = "", prefer_sent: str = "", around: str = "",
-        rating: str = "", **_extra
+        rating: str = "", season: str = "", **_extra
     ):
         """在你自己的相册里翻，找一张想发给他的照片。想给他看点什么、或者他描述了某个画面让你找的时候用。返回一批候选，你自己挑一张，再用 send_photo 发出去。
 
@@ -3732,6 +3888,7 @@ class TgPresence(Star):
             folder(string): 可选，限定某个相册分类
             prefer_sent(string): 他要的是最近发过的那张就填 recent，要没发过的新图就填 fresh，听不出来就留空（默认 fresh，免得老发同一张）
             around(string): 他提到某个月份就填，格式 YYYY-MM 或 MM，例如「三月那会儿的」填 03。那个月的图会整体排到前面。没提就留空
+            season(string): 季节。默认就会挑合当下时令的，所以通常留空即可。他明说要别的时候的就填——「去年冬天那张」填 冬，「换季那阵子」填 春秋；他强调「现在这个季节」填 now。填的是画面里那身打扮适合什么季节穿，不是拍摄日期
             rating(string): 尺度，六档由轻到重：生活（吃饭逛街风景自拍）、OOTD（拍的是这身穿搭）、性感（衣服还能出门但在展示身材）、诱惑（内衣泳装情趣内衣、身体特写、明显在勾人，还没露点）、露点（露出性器官或乳头）、淫荡（性行为、自慰、体液）。填档名只翻那一档；也可以按平常说话的词来填——日常/平时（=生活）、穿搭（=OOTD）、勾人/诱人/撩（=性感+诱惑）、骚/骚货/母狗（=露点+淫荡）。留空则六档都会出现。注意这是你的选择而不是限制——想用一张露的去逗他，那就主动填
         """
         pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
@@ -3748,7 +3905,7 @@ class TgPresence(Star):
             return "没找到合适的。换几个词再翻翻，或者把想找的画面整句说出来。"
 
         # 召回之后按固定逻辑重排。纯计算，同一段词每次结果都一样
-        ranked = self._rerank(rows, prefer_sent, around)
+        ranked = self._rerank(rows, prefer_sent, around, season)
         top = max(1, int(self.conf.get("rank_return", 10) or 10))
         picked, by_model = ranked[:top], False
 
@@ -3825,10 +3982,12 @@ class TgPresence(Star):
         「发过没发过」的排序和她的记忆。
         """
         tag = self._tag_line(row["descr"] or "")
+        se = self._col(row, "season")
         cap = "\n".join(x for x in (
             f"g{row['id']} · {path.name}",
             f"[{self._folder_label(row['folder']) or '根目录'}]"
             + (f" · {row['rating']}" if row["rating"] else "")
+            + (f" · {se}" if se else "")
             + (f" · 发过 {row['sent']} 次" if row["sent"] else ""),
             tag[:600] if tag else "",
         ) if x)[:CAPTION_MAX]
@@ -5959,9 +6118,9 @@ class TgPresence(Star):
             # 清洗规则是纯字符串操作，存量数据也能补做，不用重跑索引
             db = self.db()
             rows = db.execute(
-                "SELECT id, descr, rating FROM photos WHERE descr IS NOT NULL"
+                "SELECT id, descr, rating, season FROM photos WHERE descr IS NOT NULL"
             ).fetchall()
-            n_tag = n_name = n_rate = 0
+            n_tag = n_name = n_rate = n_season = 0
             for r in rows:
                 fixed = self._polish(r["descr"])
                 # rating 是从描述里解析出来的，描述改完要重新解一遍；
@@ -5971,6 +6130,13 @@ class TgPresence(Star):
                     n_rate += 1
                     db.execute("UPDATE photos SET rating = ? WHERE id = ?",
                                (new_rate, r["id"]))
+                # 季节是后加的一项，早先索引的图库里是空的。描述里只要
+                # 有这一段就能就地补上，不用花钱重跑
+                new_season = self._season_of(fixed) or None
+                if new_season != self._col(r, "season"):
+                    n_season += 1
+                    db.execute("UPDATE photos SET season = ? WHERE id = ?",
+                               (new_season, r["id"]))
                 if fixed == r["descr"]:
                     continue
                 if self._fix_subject(r["descr"]) != r["descr"]:
@@ -5989,6 +6155,7 @@ class TgPresence(Star):
                 f"清洗完毕，扫过 {len(rows)} 张。\n"
                 f"标签行删掉硬拼长段：{n_tag} 张\n"
                 + (f"分级重新解析：{n_rate} 张\n" if n_rate else "")
+                + (f"季节补上或更正：{n_season} 张\n" if n_season else "")
                 + (f"泛称改成「{name}」：{n_name} 张\n" if name
                    else "主体角色名没配，泛称没动。\n")
                 + ("动过的图向量已作废，`/gallery embed auto` 重转一遍。"
@@ -6364,6 +6531,7 @@ class TgPresence(Star):
                 lines.append(
                     f"g{r['id']} {r['score']:.3f} [{mark}] {detail}"
                     + (f" {r['rating']}" if r.get("rating") else "")
+                    + (f" {r.get('season')}" if r.get("season") else "")
                     + (f" ⟨{' '.join(hit)}⟩" if hit else "")
                     + f"\n   {snippet}"
                 )
