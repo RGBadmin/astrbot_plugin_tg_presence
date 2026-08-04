@@ -121,6 +121,9 @@ SUBJECT_ALIASES = (
     "一名女性", "该女性", "这名女性", "此女性", "画面主体",
     "一位女性", "女子", "该女子",
 )
+# 定量批次跑到一半时多久报一次。太密会刷屏，太稀就跟没有一样——
+# 一分钟正好是「开始怀疑是不是卡死了」的心理阈值
+PROGRESS_GAP = 60
 MEDIA_GROUP_MAX = 10  # Telegram 一组媒体最多 10 张
 CAPTION_MAX = 1024  # 图片 caption 上限；纯文字消息上限是 4096
 SIGNATURE_MAX = 120  # setMyShortDescription 的上限
@@ -3007,7 +3010,7 @@ class TgPresence(Star):
             )
         return note
 
-    async def _index_batch(self, batch: int) -> tuple[int, int, str]:
+    async def _index_batch(self, batch: int, note=None) -> tuple[int, int, str]:
         """跑一批待索引的图，返回 (成功数, 这批取到几张, 花费说明)。
 
         取到 0 张就是全库索引完了。fatal 异常往外抛，让调用方中止整批。
@@ -3035,7 +3038,19 @@ class TgPresence(Star):
                 )
         db.commit()
 
-        results = await asyncio.gather(*jobs, return_exceptions=True)
+        # 用 as_completed 而不是 gather：要在跑的过程中报进度。
+        # 十几分钟一声不吭的话，人分不清是在跑还是卡死了
+        results: list = []
+        last_note = time.time()
+        for fut in asyncio.as_completed(jobs):
+            try:
+                results.append(await fut)
+            except Exception as e:
+                results.append(e)
+            if note and time.time() - last_note >= PROGRESS_GAP:
+                last_note = time.time()
+                await note(len(results), len(rows),
+                           sum(1 for x in results if x is True))
         for x in results:
             if isinstance(x, VisionError) and x.fatal:
                 raise x
@@ -3047,7 +3062,7 @@ class TgPresence(Star):
             logger.info(f"[tg_presence] 本批 {len(rows)} 张，{note}")
         return sum(1 for x in results if x is True), len(rows), note
 
-    async def _embed_once(self, todo: int) -> dict:
+    async def _embed_once(self, todo: int, note=None) -> dict:
         """转一批向量。返回这批的统计，不打印、不发消息。
 
         一次性指令和后台循环共用这一段——两边各写一遍的话，改了限流
@@ -3073,6 +3088,7 @@ class TgPresence(Star):
         batch = max(1, min(int(self.conf.get("embed_batch", 32) or 32), 256))
         ok = fail = dry = 0
         err = ""
+        last_note = time.time()
         for i in range(0, len(jobs), batch):
             chunk = jobs[i : i + batch]
             try:
@@ -3100,6 +3116,10 @@ class TgPresence(Star):
                 db.executemany(f"UPDATE photos SET {col} = ? WHERE id = ?", pairs)
             db.commit()
             ok += len(chunk)
+            # 报在落库之后：一批还没写进去就说「已完成」是假的
+            if note and time.time() - last_note >= PROGRESS_GAP:
+                last_note = time.time()
+                await note(ok, len(jobs))
         self._vec_cache.clear()  # 有新向量，下次检索重建内存矩阵
         return {"pics": len(rows), "ok": ok, "fail": fail,
                 "jobs": len(jobs), "segs": len(jobs) - len(rows), "err": err}
@@ -3115,8 +3135,6 @@ class TgPresence(Star):
         向量接口比视觉接口更容易撞限流——分段之后请求数翻四倍，而这类
         接口常按文本条数算配额。所以一批全挂不立刻放弃，拉长间隔守着。
         """
-        from astrbot.core.message.message_event_result import MessageChain
-
         batch = max(1, min(int(self.conf.get("embed_auto_batch", 200) or 200), 2000))
         gap = max(60, int(self.conf.get("index_report_gap", 600) or 600))
         max_dry = max(1, int(self.conf.get("index_max_dry", 12) or 12))
@@ -3124,10 +3142,7 @@ class TgPresence(Star):
         done = dry = 0
 
         async def say(text: str) -> None:
-            try:
-                await self.context.send_message(umo, MessageChain().message(text))
-            except Exception as e:
-                logger.warning(f"[tg_presence] 转向量进度回报失败：{e}")
+            await self._say_to(umo, text)
 
         try:
             while True:
@@ -3187,8 +3202,6 @@ class TgPresence(Star):
         守着，最多守到 max_dry 轮才收工。上游恢复了自动接上，进度全在库里，
         随时停随时续。
         """
-        from astrbot.core.message.message_event_result import MessageChain
-
         batch = max(1, min(int(self.conf.get("index_auto_batch", 30) or 30), 200))
         gap = max(60, int(self.conf.get("index_report_gap", 600) or 600))
         max_dry = max(1, int(self.conf.get("index_max_dry", 12) or 12))
@@ -3198,10 +3211,7 @@ class TgPresence(Star):
             self._api_calls, self._api_blocked, self._api_saved, self._api_hard)
 
         async def say(text: str) -> None:
-            try:
-                await self.context.send_message(umo, MessageChain().message(text))
-            except Exception as e:  # 回报失败不能连累索引本身
-                logger.warning(f"[tg_presence] 索引进度回报失败：{e}")
+            await self._say_to(umo, text)
 
         try:
             while True:
@@ -5223,6 +5233,24 @@ class TgPresence(Star):
             logger.warning(f"[tg_presence] 控制台 {method} 出错：{e}")
             return None
 
+    async def _say_to(self, umo: str, text: str) -> None:
+        """把消息发到指定会话。后台任务回报进度都走这儿。
+
+        控制台的 UMO 长成 console:FriendMessage:12345，AstrBot 的平台
+        系统不认识它——那是插件自己造的假身份。所以要分流到控制台自己
+        那条 Bot API，否则在控制台里开的后台任务一条进度都收不到。
+        """
+        if not umo:
+            return
+        try:
+            if umo.startswith("console:"):
+                await self._console_say(umo.rsplit(":", 1)[-1], text)
+                return
+            from astrbot.core.message.message_event_result import MessageChain
+            await self.context.send_message(umo, MessageChain().message(text))
+        except Exception as e:  # 回报失败不能连累正事
+            logger.warning(f"[tg_presence] 进度回报失败（{umo}）：{e}")
+
     async def _console_say(self, chat_id, text: str) -> None:
         """回消息。超过 Telegram 单条上限就切开发。"""
         for i in range(0, len(text), 3800):
@@ -5923,7 +5951,12 @@ class TgPresence(Star):
             yield event.plain_result(
                 f"待转 {left_before} 张，这次做 {min(todo, left_before)} 张，每批 {batch}。"
             )
-            r = await self._embed_once(todo)
+            umo = event.unified_msg_origin
+
+            async def note(done, total):
+                await self._say_to(umo, f"转向量中：{done}/{total} 条文本…")
+
+            r = await self._embed_once(todo, note)
             left = self._vec_left()
             msg = [
                 f"完成 {r['ok']} 条文本"
@@ -6232,8 +6265,15 @@ class TgPresence(Star):
                 f"开始索引 {min(batch, stat['pending'])} 张（待索引共 {stat['pending']} 张），"
                 f"并发 {self.conf.get('vision_concurrency', 2)}，跑完再报。"
             )
+            umo = event.unified_msg_origin
+
+            async def note(done, total, good):
+                await self._say_to(
+                    umo, f"索引中：{done}/{total} 张已回，成功 {good} 张…"
+                )
+
             try:
-                ok, n, cost = await self._index_batch(batch)
+                ok, n, cost = await self._index_batch(batch, note)
             except VisionError as e:
                 yield event.plain_result(f"配置有问题，已中止：{e}")
                 return

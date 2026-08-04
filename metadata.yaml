@@ -1,7 +1,7 @@
 name: astrbot_plugin_tg_presence
 display_name: 角色 Telegram 存在感
 desc: 让角色自己发动态到频道、换头像、改签名、对消息点表情，并把上下文里的图片换成可检索的两层文字记忆（角色自述的一句话目录 + 独立视觉模型的画面细节），省 token 又不失忆。全部注册为 LLM 工具，同时保留手动指令入口。
-version: v0.28.0
+version: v0.28.1
 author: chine
 repo: https://github.com/RGBadmin/astrbot_plugin_tg_presence
 support_platforms:
