@@ -1,7 +1,7 @@
 name: astrbot_plugin_tg_presence
 display_name: 角色 Telegram 存在感
 desc: 给 Telegram 上的角色一层生活痕迹：把上万张图建成可检索的相册（视觉解析 + 分段语义向量）让她自己挑图发给你，往自己的频道发动态，换头像、改签名、对消息点表情，你不说话时主动找你；上下文里的图片折叠成可检索的两层文字记忆，省 token 又不失忆。全部注册为 LLM 工具，同时保留手动指令入口和一个独立的控制台 bot。
-version: v0.32.1
+version: v0.33.0
 author: chine
 repo: https://github.com/RGBadmin/astrbot_plugin_tg_presence
 support_platforms:

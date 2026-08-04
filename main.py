@@ -3892,13 +3892,200 @@ class TgPresence(Star):
 
     # --------------------------------------------------------------- 发图给对方
 
+    @filter.llm_tool(name="want_photo")
+    async def want_photo(self, event: AstrMessageEvent, reason: str = "", **_extra):
+        """你想发一张自己的照片给他。不用想关键词，只说你为什么想发——你在撩他、他让你拍一张、你想秀今天的穿搭、或者就是想让他看看你。说了之后我替你挑，你只负责最后看一眼选哪张。
+
+        Args:
+            reason(string): 可选，为什么想发，比如「他在挑逗我想看我湿没湿」「他让我去厕所拍一张」「想给他看今天的穿搭」。不写也行，我会从你们刚才的对话里判断
+        """
+        return await self._smart_pick(event, reason)
+
+    async def _smart_pick(self, event: AstrMessageEvent, reason: str = "") -> str:
+        """四步选图：分析场景 -> 向量召回 -> 主模型精选 -> 发出去。"""
+
+        # ---- A. 拿人设 + 历史 ----
+        umo = self._silence_target(event) or event.unified_msg_origin
+        cm = self.context.conversation_manager
+        cid = await cm.get_curr_conversation_id(umo)
+        conv = await cm.get_conversation(umo, cid) if cid else None
+
+        persona_text = await self._persona_of(umo, conv)
+
+        history: list = []
+        if conv:
+            try:
+                history = json.loads(conv.history or "[]")
+            except json.JSONDecodeError:
+                history = []
+        last_100 = history[-100:] if isinstance(history, list) else []
+
+        # 格式化历史：只取 role + 文本内容
+        hist_lines: list[str] = []
+        for turn in last_100:
+            role = turn.get("role", "?")
+            parts = turn.get("content", "")
+            if isinstance(parts, list):
+                text_bits = [
+                    p.get("text", "") for p in parts
+                    if isinstance(p, dict) and p.get("type") in ("text", None)
+                ]
+                text = " ".join(t for t in text_bits if t)
+            else:
+                text = str(parts)
+            if text.strip():
+                hist_lines.append(f"{role}: {text.strip()[:300]}")
+        formatted_history = "\n".join(hist_lines[-60:])  # 最多 60 条保证不超窗口
+
+        # ---- B. 调分析 AI（视觉模型，纯文本） ----
+        reason_line = f"她说她想发照片的原因是：{reason}" if reason.strip() else ""
+        analysis_prompt = (
+            "你是一个场景分析助手。下面是一段对话记录和角色的人设。\n"
+            "请根据对话的最新走向，判断她现在应该发一张什么样的照片给对方。\n\n"
+            "输出要求：\n"
+            "- 描述这张照片应该是什么场景、什么衣着、什么姿态、什么尺度\n"
+            "- 用自然语言写，像在描述一张你脑海中的画面\n"
+            "- 150字以内\n\n"
+            f"人设：\n{(persona_text or '无')[:2000]}\n\n"
+            f"最近的对话：\n{formatted_history}\n\n"
+            f"{reason_line}"
+        )
+
+        analysis_text = ""
+        cfg = self._vision_conf()
+        if cfg:
+            try:
+                ana_cfg = dict(
+                    cfg,
+                    max_tokens=300,
+                    stream=False,
+                    system="你是一个场景分析助手。根据对话和人设判断应该发什么照片。只输出照片描述，150字以内。",
+                )
+                payload = self._text_payload(ana_cfg, analysis_prompt)
+                timeout_obj = aiohttp.ClientTimeout(total=30)
+                url = self._vision_url(ana_cfg)
+                headers = self._vision_headers(ana_cfg)
+                async with aiohttp.ClientSession(timeout=timeout_obj) as sess:
+                    async with sess.post(url, json=payload, headers=headers) as r:
+                        if r.status == 200:
+                            data = json.loads(await r.text())
+                            analysis_text = self._resp_text(ana_cfg["fmt"], data).strip()
+                        else:
+                            body = await r.text()
+                            logger.warning(
+                                f"[tg_presence] want_photo 分析AI HTTP {r.status}: "
+                                f"{body[:200]}"
+                            )
+            except Exception as e:
+                logger.warning(f"[tg_presence] want_photo 分析AI调用失败：{e}")
+        else:
+            logger.info("[tg_presence] want_photo 视觉API未配置，用 reason 直接检索")
+
+        if analysis_text:
+            logger.info(f"[tg_presence] want_photo 分析结果：{analysis_text[:200]}")
+        else:
+            # 分析 AI 失败，退回到 reason 或对话最后几句
+            analysis_text = reason.strip() if reason.strip() else " ".join(
+                line.split(": ", 1)[-1] for line in hist_lines[-5:]
+            )
+            logger.info("[tg_presence] want_photo 分析AI未返回结果，用备选文本检索")
+
+        if not analysis_text.strip():
+            return "没有足够的对话上下文来判断该发什么照片。试试用 browse_gallery 手动指定关键词。"
+
+        # ---- C. 向量召回 + 关键词兜底 ----
+        pool = max(10, int(self.conf.get("want_photo_pool", 30) or 30))
+
+        vec_hits = await self._vector_search(analysis_text, pool)
+
+        # 关键词兜底：从分析文本里提几个词做 gallery_search
+        kw_rows = self.gallery_search(analysis_text, "", limit=pool)
+
+        # 合并，语义优先
+        by_id: dict[int, dict] = {}
+        for r in kw_rows:
+            by_id[int(r["id"])] = dict(r)
+        missing = [i for i in vec_hits if i not in by_id]
+        if missing:
+            marks = ",".join("?" * len(missing))
+            extra = self.db().execute(
+                f"SELECT *, 0 AS score FROM photos WHERE id IN ({marks})", missing
+            ).fetchall()
+            for r in extra:
+                by_id[int(r["id"])] = dict(r)
+
+        vw = float(self.conf.get("vector_weight", 0.4) or 0)
+        for pid, row in by_id.items():
+            kw = min(1.0, max(0.0, float(row.get("score") or 0)))
+            sim = vec_hits.get(pid)
+            row["kw_score"], row["sim_score"] = kw, sim
+            row["score"] = kw * (1 - vw) + sim * vw if sim is not None and vw > 0 else kw
+
+        candidates = sorted(
+            by_id.values(), key=lambda r: (-float(r["score"]), int(r["id"]))
+        )[:pool]
+
+        if not candidates:
+            stat = self.gallery_stat()
+            if not stat["indexed"]:
+                return "相册还没建好索引，现在挑不了。"
+            return "没找到合适的照片。试试用 browse_gallery 手动指定关键词。"
+
+        # ---- D. 主模型精选 ----
+        cand_lines: list[str] = []
+        for r in candidates:
+            tag = f"[{self._folder_label(r['folder'])}] " if r.get("folder") else ""
+            rating_val = self._rating_of(r.get("descr") or "")
+            season_val = self._season_of(r.get("descr") or "")
+            descr_snip = " ".join((r.get("descr") or "").split())[:200]
+            cand_lines.append(
+                f"g{r['id']} {tag}{rating_val} {season_val} -- {descr_snip}"
+            )
+        candidates_text = "\n".join(cand_lines)
+
+        pick_prompt = (
+            "你想发一张照片给他。下面是候选，每张都有编号和描述摘要。\n"
+            "结合你们刚才的对话，选一张最合适的。\n\n"
+            "只输出编号，比如 g123。不要解释。\n\n"
+            f"{candidates_text}"
+        )
+
+        chosen_id = ""
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(umo)
+            pick_ctx = last_100[-40:] if len(last_100) > 40 else last_100
+            resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=persona_text or "",
+                contexts=pick_ctx,
+                prompt=pick_prompt,
+            )
+            raw_pick = (getattr(resp, "completion_text", "") or "").strip()
+            m = re.search(r"g(\d+)", raw_pick)
+            if m:
+                chosen_id = f"g{m.group(1)}"
+            else:
+                logger.warning(
+                    f"[tg_presence] want_photo 主模型选图未返回有效编号：{raw_pick[:80]}"
+                )
+        except Exception as e:
+            logger.warning(f"[tg_presence] want_photo 主模型选图失败：{e}")
+
+        if not chosen_id:
+            # 主模型选不出来，取第一张
+            chosen_id = f"g{candidates[0]['id']}"
+            logger.info(f"[tg_presence] want_photo 退回到第一张候选 {chosen_id}")
+
+        # ---- E. 发送 ----
+        return await self._do_send_photo(event, chosen_id, "")
+
     @filter.llm_tool(name="browse_gallery")
     async def browse_gallery(
         self, event: AstrMessageEvent, keywords: str = "", want: str = "",
         folder: str = "", prefer_sent: str = "", around: str = "",
         rating: str = "", season: str = "", **_extra
     ):
-        """在你自己的相册里翻，找一张想发给他的照片。三种时候用：你想给他看点什么；他描述了某个画面让你找；他让你拍一张。特别注意第三种——他说「去厕所拍一张」「现在拍给我看」「让我看看」「拍张照发我」，这些都是要照片，你不用真的去拍，就是在相册里找一张符合他说的那个场景的发过去，正常聊天里这本来就是同一件事。返回一批候选，你自己挑一张，再用 send_photo 发出去。
+        """在你自己的相册里翻，找一张想发给他的照片。如果你只是想发张照片、不确定该搜什么，用 want_photo 更好——它会帮你想。这个工具适合你已经知道要什么、想精确控制检索词的时候。三种时候用：你想给他看点什么；他描述了某个画面让你找；他让你拍一张。特别注意第三种——他说「去厕所拍一张」「现在拍给我看」「让我看看」「拍张照发我」，这些都是要照片，你不用真的去拍，就是在相册里找一张符合他说的那个场景的发过去，正常聊天里这本来就是同一件事。返回一批候选，你自己挑一张，再用 send_photo 发出去。
 
         Args:
             keywords(string): 检索词，空格分隔，例如「酒店 灰丝 细高跟 M腿」。词尽量多给几个，命中越多排得越前，个别词没对上也不影响。从他刚说的话里把地点、姿势、身体部位、衣着、动作都抠出来当词——他说「去厕所拍一张」就带上 厕所 卫生间 隔间，问「是不是湿了」就带上 淫水 内裤 湿。刚才聊到的东西也算数，不只是最后那一句

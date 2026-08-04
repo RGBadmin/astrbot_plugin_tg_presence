@@ -310,6 +310,13 @@
             "default": 0.4,
             "hint": "最终匹配度 = 关键词命中率 × (1 - 这个值) + 语义相似度 × 这个值。调高更宽容、更能找到换了说法的图，调低更精确。只影响匹配度这一项，时间和发送条件仍然分层压在它上面。设成 0 等于关掉语义，/gallery search 会给出警告。"
           },
+          "want_photo_pool": {
+            "description": "智能选图候选数",
+            "type": "int",
+            "default": 30,
+            "hint": "want_photo 工具的向量召回 + 关键词兜底合并后取多少张送给主模型精选。调大选得更准但多花一次 LLM 调用的 token——30 张描述摘要约 6000~8000 字。这一步是纯计算 + 一次 API 调用，不贵。",
+            "obvious_hint": true
+          },
           "rank_pool": {
             "description": "参与权重计算的候选数",
             "type": "int",
