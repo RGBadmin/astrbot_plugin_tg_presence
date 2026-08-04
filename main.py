@@ -72,24 +72,45 @@ AVATAR_EXTS = {".jpg", ".jpeg"}  # Telegram 头像接口只收 JPEG
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 # 博主目录里会躺一个这个后缀的文件，用来标出"这一级的目录名就是博主名"
 ARCHIVE_EXT = ".archive"
-# 尺度不是三选一，是两个独立判断：衣服能不能穿出门（SFW）、
-# 是不是奔着身体和性感去的（软NSFW）。两个都成立就都标上——
-# 穿着能出门的衣服摆勾人姿势，聊穿搭时该翻得到，想撩他时也该翻得到。
-# 露了点则一切归 硬NSFW，不再与前两个并存。
-# 于是库里只可能出现下面这四个值：
-RATING_VALUES = ("SFW", "软NSFW", "SFW+软NSFW", "硬NSFW")
-# 上面每个值实际包含哪几档，供筛选时反查
-RATING_TIERS = {
-    "SFW": {"SFW"},
-    "软NSFW": {"软NSFW"},
-    "SFW+软NSFW": {"SFW", "软NSFW"},
-    "硬NSFW": {"硬NSFW"},
+# 尺度是一条由轻到重的光谱，六档。一张图可以同时占两档，但必须相邻——
+# 「OOTD+性感」讲得通，「生活+露点」讲不通，那是判错了而不是跨度大。
+#
+# 为什么不用 SFW / NSFW：那套命名里 SFW 是 NSFW 的子串，关键词搜 SFW 时
+# LIKE '%SFW%' 会把三档全捞出来。这六个词两两之间没有包含关系。
+RATING_TIER_ORDER = ("生活", "OOTD", "性感", "诱惑", "露点", "淫荡")
+# 同一档的另一种叫法。第一档「生活」和「日常」是一回事，模型写哪个都行，
+# 检索时也互相顶替——搜「日常」要能翻到标着「生活」的图，反之亦然
+RATING_ALIAS = {"日常": "生活"}
+# 库里只可能出现这 11 个值：6 个单档 + 5 个相邻组合
+RATING_VALUES = RATING_TIER_ORDER + tuple(
+    f"{a}+{b}" for a, b in zip(RATING_TIER_ORDER, RATING_TIER_ORDER[1:])
+)
+# 每个值实际覆盖哪几档，供筛选时反查
+RATING_TIERS = {v: set(v.split("+")) for v in RATING_VALUES}
+# 从标签行首段挑出档位词。别名也要认，长词优先（免得 OOTD 被拆开）
+RATING_RE = re.compile(
+    "|".join(sorted(RATING_TIER_ORDER + tuple(RATING_ALIAS), key=len, reverse=True))
+)
+RATING_SEPS = "+＋/、,，&和"  # 模型写双档时可能用的连接符
+# 档名是给库用的，人嘴里说的往往是别的——「发张勾人的」「来点骚的」。
+# 一个说法可以横跨两档：勾人 = 性感+诱惑，骚 = 露点+淫荡。
+# 只用在「想要哪几档」这个判断上，不影响关键词检索本身
+RATING_SYNONYMS = {
+    "生活": ("生活",), "日常": ("生活",), "平时": ("生活",),
+    "正常": ("生活",), "普通": ("生活",), "随手拍": ("生活",),
+    "OOTD": ("OOTD",), "穿搭": ("OOTD",), "搭配": ("OOTD",),
+    "今日穿搭": ("OOTD",), "试衣": ("OOTD",), "换装": ("OOTD",),
+    "性感": ("性感",), "身材": ("性感", "诱惑"), "曲线": ("性感",),
+    "诱惑": ("诱惑",), "勾人": ("性感", "诱惑"), "诱人": ("性感", "诱惑"),
+    "勾引": ("性感", "诱惑"), "撩": ("性感", "诱惑"),
+    "撩人": ("性感", "诱惑"), "挑逗": ("性感", "诱惑"),
+    "露点": ("露点",), "淫荡": ("淫荡",),
+    "骚": ("露点", "淫荡"), "好骚": ("露点", "淫荡"),
+    "骚货": ("露点", "淫荡"), "母狗": ("露点", "淫荡"),
+    "婊子": ("露点", "淫荡"), "浪货": ("露点", "淫荡"),
+    "发骚": ("露点", "淫荡"), "下流": ("露点", "淫荡"),
+    "重口": ("露点", "淫荡"), "露骨": ("露点", "淫荡"),
 }
-# 从末行首段里挑出档位词。SFW 前面必须不是 软/硬/N——否则二分级时期
-# 留下的 'NSFW' 会被当成 'SFW'，一批露点图直接混进日常照里
-RATING_RE = re.compile(r"硬NSFW|软NSFW|(?<![软硬N])SFW")
-RATING_SEPS = "+＋/、,，&和"  # 模型写复合值时可能用的连接符
-RATING_TIER_ORDER = ("SFW", "软NSFW", "硬NSFW")  # 由轻到重，只用于显示
 
 # 标签行里超过这个汉字数的段，实测几乎全是模型硬拼的字堆。
 # 正常标签 87% 在四字以内、97% 在六字以内，十字往上就是垃圾了
@@ -215,8 +236,9 @@ CREATE TABLE IF NOT EXISTS photos (
     vec_act   BLOB,                    -- 动作段（互动动作 + 体液痕迹 + 关键词行）
     tag_state  TEXT,                   -- ok / 无标签 / 段数不齐 / 有问题
     tag_issues TEXT,                   -- 上面那个的具体说明，给 /gallery audit 看
-    rating  TEXT                       -- SFW / 软NSFW / SFW+软NSFW / 硬NSFW，
-                                       --   从描述末行标记解析出来，前两档能并存
+    rating  TEXT                       -- 六档之一，或相邻两档（生活/OOTD/性感/
+                                       --   诱惑/露点/淫荡，如「性感+诱惑」）。
+                                       --   从标签行首段解析出来
 );
 CREATE INDEX IF NOT EXISTS idx_folder  ON photos(folder);
 CREATE INDEX IF NOT EXISTS idx_pending ON photos(fails) WHERE descr IS NULL;
@@ -1044,30 +1066,37 @@ class TgPresence(Star):
         return weights, sum(weights) or 1.0
 
     @staticmethod
-    def _rating_tiers(raw: str) -> set[str]:
-        """把筛选词翻成想要的档位集合。空集 = 不限。
+    def _rating_tiers(raw: str, strict: bool = False) -> set[str]:
+        """把说法翻成想要的档位集合。空集 = 不限。
 
-        nsfw 这个词故意涵盖软硬两档：说"想看点涩的"时两种都该翻得到，
-        真要精确到某一档就写 soft / hard。
+        strict=True 时只认档名本身（含 OOTD 的大小写和「日常」这个别名），
+        给 /gallery search 用——那儿要把分级词从检索词里摘出来，认得太宽
+        会把「骚」这种正文里也常见的词误当成筛选条件，人搜「骚」多半是
+        想搜描述里的骚逼，不是想筛档。
         """
-        s = (raw or "").strip().upper().replace(" ", "")
-        if s in ("SFW", "安全", "日常", "正常", "CLEAN", "SAFE"):
-            return {"SFW"}
-        if s in ("软NSFW", "软", "SOFT", "SOFTNSFW", "微涩", "半脱"):
-            return {"软NSFW"}
-        if s in ("硬NSFW", "硬", "HARD", "HARDNSFW", "R18", "露点", "露骨"):
-            return {"硬NSFW"}
-        if s in ("NSFW", "涩", "色", "成人", "不安全"):
-            return {"软NSFW", "硬NSFW"}
-        return set()
+        s = (raw or "").strip().replace(" ", "")
+        if not s:
+            return set()
+        # OOTD 是英文档名，大小写怎么写都得认
+        low = s.upper()
+        s = low if low in RATING_TIER_ORDER else s
+        if (fixed := RATING_ALIAS.get(s, s)) in RATING_TIER_ORDER:
+            return {fixed}
+        if strict:
+            return set()
+        if got := RATING_SYNONYMS.get(s):
+            return set(got)
+        # 多个档名连写也认：「性感诱惑」「露点+淫荡」
+        found = {RATING_ALIAS.get(x, x) for x in RATING_RE.findall(s)}
+        return found if found and not RATING_RE.sub("", s).strip(RATING_SEPS) else set()
 
     @classmethod
     def _rating_filter(cls, raw: str) -> list[str]:
         """把筛选词翻成库里允许的 rating 取值。空列表 = 不限。
 
-        档位和存的值不是一回事：SFW+软NSFW 那张两个档都占，所以筛 sfw
-        和筛 soft 都得把它捞出来。这里把「想要哪些档」展开成「哪些存值
-        含有这些档」，调用方照旧一句 rating IN (...) 就够了。
+        档位和存的值不是一回事：「性感+诱惑」那张两档都占，筛「性感」
+        和筛「诱惑」都得把它捞出来。这里把「想要哪些档」展开成
+        「哪些存值含有这些档」，调用方照旧一句 rating IN (...) 就够了。
         """
         want = cls._rating_tiers(raw)
         if not want:
@@ -1076,7 +1105,7 @@ class TgPresence(Star):
 
     @classmethod
     def _rating_label(cls, raw: str) -> str:
-        """筛选词的人话回显，例如 nsfw -> 「软NSFW / 硬NSFW」。认不出返回空。"""
+        """筛选词的人话回显，例如 nsfw -> 「性感 / 诱惑 / 露点 / 淫荡」。"""
         want = cls._rating_tiers(raw)
         return " / ".join(t for t in RATING_TIER_ORDER if t in want)
 
@@ -1289,29 +1318,34 @@ class TgPresence(Star):
 
     @staticmethod
     def _rating_of(descr: str) -> str:
-        """从描述末行标记里取分级，规范成 RATING_VALUES 之一，取不到返回空。
+        """从标签行首段取分级，规范成 RATING_VALUES 之一，取不到返回空。
 
-        末行格式是「分级---水印---遮挡」。从后往前找第一个首段认得出
-        分级的行——正文里偶尔也会出现 --- ，认首段的内容比认行号可靠。
+        标签行格式是「分级---水印---遮挡---关键词…」。从后往前找第一个
+        首段认得出分级的行——正文里偶尔也会出现 --- ，认首段的内容
+        比认行号可靠。
 
-        首段可能是 SFW+软NSFW 这种复合值，连接符不强求是 +：模型手一滑
-        写成顿号、斜杠、逗号都是同一个意思，一并认下来。
+        两档必须相邻。模型偶尔会写出「日常+露点」这种跳级的，那不是
+        "跨度大"而是判错了，按更重的那一档收——把露骨的记成日常，
+        代价是聊日常时翻出露点图，反过来只是少几张候选。
         """
         for raw in reversed((descr or "").splitlines()):
             s = raw.strip()
             if "---" not in s:
                 continue
-            head = s.split("---", 1)[0].strip().upper().replace(" ", "")
-            tiers = set(RATING_RE.findall(head))
-            # 认下来之前先确认这一段只由档位词和连接符组成，不然正文里
-            # 一句带 --- 又碰巧提到 SFW 的话就会被当成末行标记
+            head = s.split("---", 1)[0].strip().replace(" ", "")
+            # OOTD 是英文档名，模型写小写也得认
+            head = re.sub(r"ootd", "OOTD", head, flags=re.I)
+            tiers = {RATING_ALIAS.get(x, x) for x in RATING_RE.findall(head)}
+            # 首段必须只由档位词和连接符组成，否则正文里带 --- 又碰巧
+            # 提到「日常」的一行就会被当成标签行
             if not tiers or RATING_RE.sub("", head).strip(RATING_SEPS):
                 continue
-            # 露了点就一切归硬——模型偶尔会写成 SFW+硬NSFW，那不是
-            # "既日常又露点"，是它把两问的答案都写上了，以露点为准
-            if "硬NSFW" in tiers:
-                return "硬NSFW"
-            return "SFW+软NSFW" if len(tiers) > 1 else next(iter(tiers))
+            idx = sorted(RATING_TIER_ORDER.index(x) for x in tiers)
+            if len(idx) == 1:
+                return RATING_TIER_ORDER[idx[0]]
+            if idx[-1] - idx[0] == 1:
+                return f"{RATING_TIER_ORDER[idx[0]]}+{RATING_TIER_ORDER[idx[1]]}"
+            return RATING_TIER_ORDER[idx[-1]]
         return ""
 
     def _polish(self, descr: str) -> str:
@@ -3565,7 +3599,7 @@ class TgPresence(Star):
             folder(string): 可选，限定某个相册分类
             prefer_sent(string): 他要的是最近发过的那张就填 recent，要没发过的新图就填 fresh，听不出来就留空（默认 fresh，免得老发同一张）
             around(string): 他提到某个月份就填，格式 YYYY-MM 或 MM，例如「三月那会儿的」填 03。那个月的图会整体排到前面。没提就留空
-            rating(string): 尺度，三档。sfw = 衣服能穿出门、没露点，聊今天干嘛了、穿搭、自拍时用（姿势撩不撩不影响，穿着正常衣服勾他的那种也在里面）；soft = 奔着身体和性感去的——内衣泳装情趣内衣、身体特写、明显在勾人的姿势，没露点，想撩他一下就填这个；hard = 露点或者更进一步的。想要软硬都行可以填 nsfw，留空则三档都会出现。两档兼具的图两边都翻得到。注意这是你的选择而不是限制——想用一张露的去逗他，那就主动填
+            rating(string): 尺度，六档由轻到重：生活（吃饭逛街风景自拍）、OOTD（拍的是这身穿搭）、性感（衣服还能出门但在展示身材）、诱惑（内衣泳装情趣内衣、身体特写、明显在勾人，还没露点）、露点（露出性器官或乳头）、淫荡（性行为、自慰、体液）。填档名只翻那一档；也可以按平常说话的词来填——日常/平时（=生活）、穿搭（=OOTD）、勾人/诱人/撩（=性感+诱惑）、骚/骚货/母狗（=露点+淫荡）。留空则六档都会出现。注意这是你的选择而不是限制——想用一张露的去逗他，那就主动填
         """
         pool = max(10, int(self.conf.get("rank_pool", 60) or 60))
         rows = await self._recall(keywords, want, folder, pool, rating)
@@ -5591,29 +5625,37 @@ class TgPresence(Star):
                 f"已索引：{stat['indexed']} 张 · 待索引：{stat['pending']} 张",
             ]
             marks = ",".join("?" * len(RATING_VALUES))
+            cols = ", ".join(
+                "SUM(rating IN ({})) t{}".format(
+                    ",".join("?" * len([v for v in RATING_VALUES if tier in RATING_TIERS[v]])),
+                    k,
+                )
+                for k, tier in enumerate(RATING_TIER_ORDER)
+            )
+            args = [v for tier in RATING_TIER_ORDER
+                    for v in RATING_VALUES if tier in RATING_TIERS[v]]
             rt = self.db().execute(
-                # 各档的数字是「筛这一档能翻到几张」，SFW+软NSFW 那批
-                # 两边都算进去，所以三个数加起来会超过已索引总数
-                "SELECT SUM(rating IN ('SFW','SFW+软NSFW')) s, "
-                "SUM(rating IN ('软NSFW','SFW+软NSFW')) m, "
-                "SUM(rating = 'SFW+软NSFW') both, "
-                "SUM(rating = '硬NSFW') n, "
-                # 认不出的一律算「未标」——老库里二分级时期的 'NSFW'
-                # 也落在这里，看见它就该整表重跑一遍索引
+                # 每档的数字是「筛这一档能翻到几张」，跨两档的图两边都算，
+                # 所以六个数加起来会超过已索引总数
+                f"SELECT {cols}, "
+                "SUM(instr(rating, '+') > 0) both, "
+                # 认不出的一律算「未标」——老库里 SFW/NSFW 那套留下的值
+                # 也落在这里，看见它就该跑一次 /gallery polish
                 f"SUM(descr IS NOT NULL AND COALESCE(rating,'') NOT IN ({marks})) u "
-                "FROM photos", RATING_VALUES
+                "FROM photos",
+                args + list(RATING_VALUES),
             ).fetchone()
-            if sum(rt[k] or 0 for k in ("s", "m", "n", "u")):
+            got = [(RATING_TIER_ORDER[k], rt[f"t{k}"] or 0)
+                   for k in range(len(RATING_TIER_ORDER))]
+            if sum(n for _, n in got) + (rt["u"] or 0):
                 lines.append(
-                    f"分级：    SFW {rt['s'] or 0} · 软NSFW {rt['m'] or 0}"
-                    f" · 硬NSFW {rt['n'] or 0}"
+                    "分级：    " + " · ".join(f"{tier} {n}" for tier, n in got)
                     + (f" · 未标 {rt['u']}（老描述没这一行，重跑索引才有）"
                        if rt["u"] else "")
                 )
                 if rt["both"]:
                     lines.append(
-                        f"          其中 {rt['both']} 张同属 SFW 和 软NSFW，"
-                        "两边都翻得到"
+                        f"          其中 {rt['both']} 张跨两档，两边都翻得到"
                     )
             if stat["stuck"]:
                 lines.append(f"失败跳过：{stat['stuck']} 张（`/gallery retry` 重来）")
@@ -5725,11 +5767,18 @@ class TgPresence(Star):
             # 清洗规则是纯字符串操作，存量数据也能补做，不用重跑索引
             db = self.db()
             rows = db.execute(
-                "SELECT id, descr FROM photos WHERE descr IS NOT NULL"
+                "SELECT id, descr, rating FROM photos WHERE descr IS NOT NULL"
             ).fetchall()
-            n_tag = n_name = 0
+            n_tag = n_name = n_rate = 0
             for r in rows:
                 fixed = self._polish(r["descr"])
+                # rating 是从描述里解析出来的，描述改完要重新解一遍；
+                # 换过分级命名之后老值也靠这一步就地更正
+                new_rate = self._rating_of(fixed) or None
+                if new_rate != r["rating"]:
+                    n_rate += 1
+                    db.execute("UPDATE photos SET rating = ? WHERE id = ?",
+                               (new_rate, r["id"]))
                 if fixed == r["descr"]:
                     continue
                 if self._fix_subject(r["descr"]) != r["descr"]:
@@ -5747,9 +5796,10 @@ class TgPresence(Star):
             yield event.plain_result(
                 f"清洗完毕，扫过 {len(rows)} 张。\n"
                 f"标签行删掉硬拼长段：{n_tag} 张\n"
+                + (f"分级重新解析：{n_rate} 张\n" if n_rate else "")
                 + (f"泛称改成「{name}」：{n_name} 张\n" if name
                    else "主体角色名没配，泛称没动。\n")
-                + ("动过的图向量已作废，`/gallery embed` 重转一遍。"
+                + ("动过的图向量已作废，`/gallery embed auto` 重转一遍。"
                    if n_tag or n_name else "没有需要动的。")
             )
             return
@@ -6060,8 +6110,12 @@ class TgPresence(Star):
             # 剩下的才是检索词
             terms, pick, pick_label = [], "", ""
             for w in rest.split():
-                if got := self._rating_label(w):
-                    pick, pick_label = w, got
+                # 严格模式：只有档名本身才当筛选条件。「骚」「勾人」这些
+                # 说法在正文里也常见，摘走了反而搜不到想搜的东西
+                if got := self._rating_tiers(w, strict=True):
+                    pick = w
+                    pick_label = " / ".join(
+                        x for x in RATING_TIER_ORDER if x in got)
                 else:
                     terms.append(w)
             rest = " ".join(terms)
