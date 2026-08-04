@@ -3553,13 +3553,8 @@ class TgPresence(Star):
         )
         return head + "\n" + "\n".join(lines) + tail
 
-    @filter.llm_tool(name="inspect_photo")
-    async def inspect_photo(self, event: AstrMessageEvent, photo_id: str, **_extra):
-        """查一张图的画面细节记录。当你想知道某张图里的具体东西（画面里有什么、什么颜色、写了什么字），而这张图现在不在你眼前时用这个。它只给你文字记录，不会把图重新塞进来，比 recall_photo 省得多。确实需要亲眼再看一遍原图才用 recall_photo。
-
-        Args:
-            photo_id(string): 图片编号，比如 12
-        """
+    def _inspect_context_photo(self, photo_id: str) -> str:
+        """查聊天里出现过的那张图的细节记录（编号形如 #12）。"""
         pid = photo_id.strip().lstrip("#")
         detail = self.vision.get(pid)
         mine = (self.state.get("photo_desc") or {}).get(pid)
@@ -3660,14 +3655,21 @@ class TgPresence(Star):
 
     @filter.llm_tool(name="inspect_photo")
     async def inspect_photo(self, event: AstrMessageEvent, photo_id: str = "", **_extra):
-        """调出相册里某张照片的完整描述。browse_gallery 给的是摘要，拿不准哪张更合适、或者想确认某个细节在不在画面里的时候用这个细看。
+        """查一张图的画面细节。想知道某张图里的具体东西（有什么、什么颜色、写了什么字），而它不在你眼前时用这个——只给文字记录，不会把图重新塞进来，比 recall_photo 省得多。相册里的图用它细看：browse_gallery 给的是摘要，拿不准哪张合适、或者想确认某个细节在不在画面里，就用这个。
 
         Args:
-            photo_id(string): 相册编号，browse_gallery 列出来的那个 g123
+            photo_id(string): 图片编号。聊天里出现过的图填 12 或 #12；相册里的填 browse_gallery 列出来的那个 g123
         """
-        raw = (photo_id or "").strip().lstrip("gG")
-        if not raw.isdigit():
-            return "编号得是 browse_gallery 给的那种 g123。"
+        raw = (photo_id or "").strip()
+        # 编号形态本身就分得清来源：g 打头的是相册，其余是聊天里出现过的
+        if not (raw.lower().startswith("g") and raw[1:].isdigit()):
+            # 两种形态都不像的话直接说清楚，别让它掉进「找不到 #abc」——
+            # 那句提示不告诉它还有另一种编号，它只会换个词再问一遍
+            if not raw.lstrip("#").isdigit():
+                return ("编号得是聊天里那张图的 12（或 #12），"
+                        "或者 browse_gallery 给的 g123。")
+            return self._inspect_context_photo(raw)
+        raw = raw.lstrip("gG")
         row = self.db().execute(
             "SELECT id, folder, descr, sent, last_sent FROM photos WHERE id = ?",
             (int(raw),),
@@ -3718,7 +3720,8 @@ class TgPresence(Star):
         if umo.startswith("console:"):
             chat = umo.rsplit(":", 1)[-1]
             ok = await self._tg_upload(
-                "sendPhoto", "photo", path, chat_id=chat, caption=cap
+                "sendPhoto", "photo", path, chat_id=chat,
+                caption=self._tg_html(cap), parse_mode="HTML",
             )
             return "" if ok else "控制台发不出这张图，看日志。"
 
@@ -5261,10 +5264,43 @@ class TgPresence(Star):
         except Exception as e:  # 回报失败不能连累正事
             logger.warning(f"[tg_presence] 进度回报失败（{umo}）：{e}")
 
+    @staticmethod
+    def _tg_html(text: str) -> str:
+        """把 `xxx` 转成 <code>xxx</code>，其余做 HTML 转义。
+
+        不走 Markdown 模式：那边正文里任何落单的 * _ [ 都会让整条消息
+        400 失败，而这些消息里有 UMO、路径、文件名，防不胜防。
+        HTML 只要转义三个字符，可控得多。
+        反引号落单时（数量为奇数）最后一段按普通文本处理，不吞内容。
+        """
+        parts = (text or "").split("`")
+        # 反引号成对时段数是奇数，夹在中间的（下标为奇）才是代码。
+        # 落单时段数变偶数，最后一段其实没有闭合，按普通文本处理
+        closed = len(parts) % 2 == 1
+        out = []
+        for i, seg in enumerate(parts):
+            esc = (seg.replace("&", "&amp;")
+                      .replace("<", "&lt;").replace(">", "&gt;"))
+            is_code = i % 2 == 1 and (closed or i < len(parts) - 1)
+            out.append(f"<code>{esc}</code>" if is_code else esc)
+        # split 把分隔符吃掉了。反引号落单时它不该消失——那多半是正文
+        # 自带的字符，不是想标代码
+        if not closed and len(out) >= 2:
+            out[-1] = "`" + out[-1]
+        return "".join(out)
+
     async def _console_say(self, chat_id, text: str) -> None:
-        """回消息。超过 Telegram 单条上限就切开发。"""
+        """回消息。超过 Telegram 单条上限就切开发。
+
+        带 parse_mode 才会渲染——不带的话反引号原样显示成 `xxx`。
+        按 3800 切段时可能把一对反引号劈开，所以切完再逐段转 HTML，
+        每段各自闭合。
+        """
         for i in range(0, len(text), 3800):
-            await self._tg_api("sendMessage", chat_id=chat_id, text=text[i : i + 3800])
+            await self._tg_api(
+                "sendMessage", chat_id=chat_id,
+                text=self._tg_html(text[i : i + 3800]), parse_mode="HTML",
+            )
 
     @staticmethod
     def _bind_args(func, rest: str) -> tuple[list, dict]:
