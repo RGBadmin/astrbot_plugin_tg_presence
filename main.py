@@ -327,6 +327,11 @@ DEFAULT_IMP_AVATAR = (
     "现在只是挑，还没到换的时候。\n\n"
     "回一个类别名就行，从上面那些里选，不要解释，不要加标点。"
 )
+# /act 只会让她说话。让她「拍一张」时得提醒一句去用 /photo，否则你
+# 等的是图，收到的是一句「拍好啦」
+PHOTO_WORDS = re.compile(
+    "拍一张|拍张|拍个|拍照|拍几张|照片|自拍|发图|发张|发几张|给我看看|让我看看|看看你"
+)
 DEFAULT_IMP_PHOTO = (
     "你在想给他发一张自己的照片，正在回忆要挑什么样的——"
     "什么场景、穿什么、什么姿态、露到什么程度。"
@@ -467,10 +472,12 @@ CMD_HELP: dict[str, tuple[str, list[tuple[str, str]], str]] = {
         ("/act", "不给方向，她自己想说什么就说什么"),
     ], "发出去的内容会进她的上下文，她记得自己说过"),
     "photo": ("以她的身份发张照片", [
+        ("/photo 在前台拍一张", "给个方向，她按这个挑"),
         ("/photo g123", "发指定的那张"),
         ("/photo g123 今天穿这个", "带一句附言"),
         ("/photo", "让她自己挑一张、自己配话"),
-    ], "编号用 `/gallery search` 或 `/gallery show` 找"),
+    ], "编号用 `/gallery search` 或 `/gallery show` 找。"
+       "要图就用这条——`/act` 只会让她说话，不发图"),
     "moment": ("让她发条动态到频道", [
         ("/moment 今天天气真好", "发这条内容"),
         ("/moment", "让她自己想发什么"),
@@ -4105,13 +4112,22 @@ class TgPresence(Star):
         if self.conf.get("admin_only_commands", True) and event.role != "admin":
             yield event.plain_result("只有管理员能用这个指令。发 `/whoami` 看是哪儿没对上。")
             return
-        if not photo_id:
-            yield event.plain_result("让她自己挑…")
-            picked, said = await self._improvise_photo()
+        # g123 / #3 / 纯数字是编号，其余当成「想要什么样的」那句话。
+        # 中文没空格，整句多半落在 photo_id 上；带了空格才会溢到 caption，
+        # 所以两段都要拼回去才是完整的方向
+        if not re.fullmatch(r"[gG]?\d+|#\d+", (photo_id or "").strip()):
+            brief = " ".join(x for x in ((photo_id or "").strip(),
+                                         (caption or "").strip()) if x)
+            yield event.plain_result(
+                f"让她按「{brief}」挑…" if brief else "让她自己挑…"
+            )
+            picked, said = await self._improvise_photo(brief)
             if not picked:
-                yield event.plain_result(said or "她没挑出来。直接指定：`/photo g123` [附言]")
+                yield event.plain_result(
+                    said or "她没挑出来。直接指定：`/photo g123` [附言]"
+                )
                 return
-            photo_id, caption = picked, (caption or said)
+            photo_id, caption = picked, said
             yield event.plain_result(f"她挑了 {picked}" + (f"，配文：{said}" if said else ""))
         yield event.plain_result(
             await self._do_send_photo(event, photo_id, caption)
@@ -5006,18 +5022,24 @@ class TgPresence(Star):
             return "", "模型返回了空内容（可能是拒答，或者上下文里有它处理不了的东西）"
         return text, ""
 
-    async def _improvise_photo(self) -> tuple[str, str]:
+    async def _improvise_photo(self, brief: str = "") -> tuple[str, str]:
         """让她自己从相册里挑一张，顺带写句配文。返回 (gN, 配文)。
 
         分两步：先让她说想发什么样的（几个短语），拿这些词去检索，
         取排最前的那张。不直接把候选列表塞给她——那要先检索一遍才有
         候选，而检索本身就需要她先说出想要什么。
+
+        brief 是你给的方向（`/photo 在前台拍一张`）。留空就她自己想。
         """
         if not self.gallery_stat()["indexed"]:
             return "", "相册还没建索引，挑不了。先 `/gallery index auto`。"
-        raw, err = await self._improvise(
-            self._prompt_of("improvise_photo", DEFAULT_IMP_PHOTO)
-        )
+        tpl = self._prompt_of("improvise_photo", DEFAULT_IMP_PHOTO)
+        if brief and tpl:
+            # 自定义提示词里写了占位符就填进去，没写就垫在最前面——
+            # 这一项是开放配置的，不能因为加了个方向就把人家改过的作废
+            tpl = (tpl.replace("{brief}", brief) if "{brief}" in tpl
+                   else f"这次要发的是这样一张：{brief}\n\n{tpl}")
+        raw, err = await self._improvise(tpl)
         if not raw:
             return "", f"没想出来：{err}"
         parts = [x.strip() for x in raw.splitlines() if x.strip()]
@@ -5935,6 +5957,15 @@ class TgPresence(Star):
         if not brief:
             yield event.plain_result("给个方向，比如：`/act` 跟他说你今天加班到很晚，有点累")
             return
+
+        # /act 这条链路没给她挂工具（收尾约束里明写了不许调），所以只出
+        # 文字。让她「拍一张」的话她只会写一句「拍好啦」，图一张不发——
+        # 那是 /photo 的活儿，提醒一句，别让人对着空气等图
+        if PHOTO_WORDS.search(brief):
+            yield event.plain_result(
+                f"⚠️ 这条只会让她说话，不会发图。要图用 "
+                f"`/photo {brief}`。\n继续按 /act 生成…"
+            )
 
         yield event.plain_result("让她想想…")
         try:
